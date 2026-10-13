@@ -1,0 +1,262 @@
+/* Libadwaita Authentic Stylesheet for Volna Player */
+:root {
+  --adw-window-bg: #242424;
+  --adw-view-bg: #1e1e1e;
+  --adw-card-bg: rgba(255, 255, 255, 0.06);
+  --adw-card-hover: rgba(255, 255, 255, 0.1);
+  --adw-border: rgba(255, 255, 255, 0.08);
+  --adw-border-strong: rgba(255, 255, 255, 0.14);
+  --adw-accent: #3584e4;
+  --adw-accent-hover: #4a90e8;
+  --adw-accent-active: #226bca;
+  --adw-destructive: #e01b24;
+  --adw-success: #26a269;
+  --adw-text: #ffffff;
+  --adw-text-secondary: rgba(255, 255, 255, 0.72);
+  --adw-text-dim: rgba(255, 255, 255, 0.42);
+  --adw-headerbar-bg: #282828;
+  --adw-sidebar-bg: #222222;
+  --adw-playerbar-bg: #1d1d1d;
+  --adw-radius-window: 14px;
+  --adw-radius-card: 12px;
+  --adw-radius-pill: 9999px;
+  --adw-radius-btn: 8px;
+  --font-family: -apple-system, BlinkMacSystemFont, "Cantarell", "Ubuntu", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+body {
+  font-family: var(--font-family);
+  background-color: var(--adw-window-bg);
+  color: var(--adw-text);
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+/* Scrollbars in GNOME style */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+/* HeaderBar */
+.adw-headerbar {
+  height: 48px;
+  background-color: var(--adw-headerbar-bg);
+  border-bottom: 1px solid var(--adw-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  z-index: 10;
+  position: relative;
+}
+
+.adw-window-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.adw-win-btn {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--adw-text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.adw-win-btn:hover {
+  background: rgba(255, 255, 255, 0.22);
+  color: #fff;
+}
+.adw-win-btn.close:hover {
+  background: var(--adw-destructive);
+}
+
+/* Buttons & Pills */
+.adw-btn {
+  background: var(--adw-card-bg);
+  border: 1px solid var(--adw-border);
+  color: var(--adw-text);
+  padding: 6px 14px;
+  border-radius: var(--adw-radius-btn);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+  outline: none;
+}
+.adw-btn:hover {
+  background: var(--adw-card-hover);
+  border-color: var(--adw-border-strong);
+}
+.adw-btn:active {
+  transform: scale(0.98);
+}
+
+.adw-btn.pill {
+  border-radius: var(--adw-radius-pill);
+  padding: 6px 16px;
+}
+
+.adw-btn.suggested-action {
+  background: var(--adw-accent);
+  border-color: var(--adw-accent);
+  color: #fff;
+}
+.adw-btn.suggested-action:hover {
+  background: var(--adw-accent-hover);
+}
+
+.adw-btn.flat {
+  background: transparent;
+  border-color: transparent;
+}
+.adw-btn.flat:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.adw-btn.circular {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.adw-btn.circular.large {
+  width: 48px;
+  height: 48px;
+}
+
+/* ViewSwitcher Capsule */
+.adw-view-switcher {
+  display: inline-flex;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 3px;
+  border-radius: var(--adw-radius-pill);
+  border: 1px solid var(--adw-border);
+}
+.adw-switcher-btn {
+  background: transparent;
+  border: none;
+  color: var(--adw-text-secondary);
+  padding: 5px 14px;
+  border-radius: var(--adw-radius-pill);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+.adw-switcher-btn:hover {
+  color: #fff;
+}
+.adw-switcher-btn.active {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+}
+
+/* Sliders (GtkScale) */
+.adw-scale {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.16);
+  outline: none;
+  cursor: pointer;
+  transition: height 0.15s ease;
+}
+.adw-scale:hover {
+  height: 6px;
+}
+.adw-scale::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+  transition: transform 0.1s;
+}
+.adw-scale:hover::-webkit-slider-thumb {
+  transform: scale(1.2);
+}
+
+/* Badge */
+.adw-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--adw-text-secondary);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.adw-badge.accent {
+  background: rgba(53, 132, 228, 0.25);
+  color: #78aeed;
+  border: 1px solid rgba(53, 132, 228, 0.4);
+}
+
+/* Toast Notification */
+.adw-toast {
+  position: fixed;
+  bottom: 86px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: #333333;
+  color: #fff;
+  padding: 8px 18px;
+  border-radius: 20px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  font-size: 13px;
+  pointer-events: none;
+  opacity: 0;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 1000;
+  border: 1px solid var(--adw-border);
+}
+.adw-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}

@@ -1,0 +1,190 @@
+/* Волна — Wave-First & Fluid CSS */
+
+/* Фоновое оформление окна */
+.volna-main-window {
+    background-color: #141414;
+    color: #ffffff;
+}
+
+.ambient-backdrop {
+    background: radial-gradient(circle at 50% 32%, rgba(255, 107, 74, 0.18) 0%, rgba(156, 39, 176, 0.08) 50%, #161616 100%);
+}
+
+/* Верхняя панель */
+.fluid-header {
+    background: rgba(22, 22, 22, 0.75);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.brand-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 9999px;
+    background-color: rgba(255, 107, 74, 0.22);
+    color: #ff9d85;
+    border: 1px solid rgba(255, 107, 74, 0.35);
+    letter-spacing: 0.4px;
+}
+
+/* Центральный экран «Моя волна» */
+.hero-container {
+    padding: 20px 24px 110px 24px;
+}
+
+.hero-track-title {
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -0.5px;
+    color: #ffffff;
+}
+
+.hero-track-artist {
+    font-size: 15px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.65);
+}
+
+/* Круглая центральная кнопка волны */
+.hero-play-badge {
+    min-width: 68px;
+    min-height: 68px;
+    border-radius: 9999px;
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    color: #ffffff;
+    box-shadow: 0 6px 26px rgba(0, 0, 0, 0.45);
+    transition: all 200ms ease;
+}
+
+.hero-play-badge:hover {
+    background: rgba(255, 255, 255, 0.28);
+    border-color: rgba(255, 255, 255, 0.6);
+}
+
+/* Чипы настроений */
+.fluid-pill-bar {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 9999px;
+    padding: 4px 8px;
+}
+
+.fluid-pill {
+    background: transparent;
+    border: none;
+    color: rgba(255, 255, 255, 0.7);
+    padding: 6px 14px;
+    border-radius: 9999px;
+    font-size: 13px;
+    font-weight: 500;
+    transition: all 180ms ease;
+}
+
+.fluid-pill:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.fluid-pill:checked, .fluid-pill.active {
+    background-color: #ffffff;
+    color: #111111;
+    font-weight: 600;
+    box-shadow: 0 4px 14px rgba(255, 255, 255, 0.28);
+}
+
+/* Парящий остров-плеер (Floating Island) */
+.floating-island-player {
+    background-color: rgba(28, 28, 28, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 22px;
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.75), 0 2px 8px rgba(0, 0, 0, 0.4);
+    padding: 8px 18px;
+    margin-bottom: 22px;
+    min-height: 70px;
+}
+
+/* Круглая обложка трека */
+.circular-cover {
+    border-radius: 9999px;
+    min-width: 44px;
+    min-height: 44px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+/* Метаданные трека в капсуле */
+.island-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #ffffff;
+}
+
+.island-artist {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.time-label {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.5);
+    font-feature-settings: "tnum";
+    min-width: 34px;
+}
+
+/* Кнопки реакций Лайк/Дизлайк */
+.reaction-btn {
+    border-radius: 9999px;
+    padding: 6px;
+    color: rgba(255, 255, 255, 0.6);
+    background: transparent;
+    border: none;
+}
+
+.reaction-btn:hover {
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.reaction-btn.liked {
+    color: #ff4081;
+}
+
+.reaction-btn.disliked {
+    color: #e53935;
+}
+
+/* Бейдж качества LOSSLESS */
+.lossless-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background-color: rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+    letter-spacing: 0.5px;
+}
+
+/* Полноэкранный караоке / текст песни */
+.karaoke-sheet {
+    background-color: #121212;
+    color: #ffffff;
+}
+
+.karaoke-line {
+    font-size: 22px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.35);
+    padding: 8px 16px;
+    border-radius: 12px;
+}
+
+.karaoke-line.active {
+    color: #ffffff;
+    font-size: 26px;
+    background-color: rgba(255, 107, 74, 0.15);
+}
+
+/* Слайдер громкости и перемотки */
+scale.adw-scale highlight {
+    background-color: #ff6b4a;
+}

@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Волна — Вариант 1: GNOME Native Classic</title>
+  <link rel="stylesheet" href="libadwaita.css">
+  <style>
+    .app-window {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      width: 100vw;
+      background: var(--adw-window-bg);
+    }
+
+    /* Main Split View */
+    .split-view {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      width: 250px;
+      min-width: 250px;
+      background: var(--adw-sidebar-bg);
+      border-right: 1px solid var(--adw-border);
+      display: flex;
+      flex-direction: column;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      overflow-y: auto;
+    }
+    .sidebar.collapsed {
+      margin-left: -250px;
+    }
+
+    .sidebar-header {
+      padding: 12px;
+      border-bottom: 1px solid var(--adw-border);
+    }
+    .search-input-box {
+      display: flex;
+      align-items: center;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: var(--adw-radius-btn);
+      padding: 6px 10px;
+      gap: 8px;
+      border: 1px solid transparent;
+      transition: all 0.15s;
+    }
+    .search-input-box:focus-within {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: var(--adw-accent);
+    }
+    .search-input-box input {
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-size: 13px;
+      outline: none;
+      width: 100%;
+    }
+    .search-input-box input::placeholder {
+      color: var(--adw-text-dim);
+    }
+
+    .nav-section {
+      padding: 10px 8px 4px 8px;
+    }
+    .nav-section-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--adw-text-dim);
+      padding: 4px 10px;
+      letter-spacing: 0.6px;
+      text-transform: uppercase;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: var(--adw-radius-btn);
+      color: var(--adw-text-secondary);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      margin-bottom: 2px;
+    }
+    .nav-item:hover {
+      background: rgba(255, 255, 255, 0.06);
+      color: #fff;
+    }
+    .nav-item.active {
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+      font-weight: 600;
+    }
+    .nav-item svg {
+      width: 18px;
+      height: 18px;
+      fill: currentColor;
+      opacity: 0.85;
+    }
+    .nav-item.active svg {
+      color: var(--adw-accent);
+      opacity: 1;
+    }
+
+    /* Content Area */
+    .content-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--adw-view-bg);
+      overflow-y: auto;
+      position: relative;
+    }
+
+    .adw-clamp {
+      max-width: 680px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 30px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    /* Wave Sphere Visualization */
+    .wave-sphere-wrapper {
+      position: relative;
+      width: 250px;
+      height: 250px;
+      margin: 15px 0 25px 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .wave-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+    }
+    .wave-center-btn {
+      position: relative;
+      z-index: 2;
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      background: rgba(0, 0, 0, 0.45);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+    }
+    .wave-sphere-wrapper:hover .wave-center-btn {
+      transform: scale(1.08);
+      background: rgba(53, 132, 228, 0.6);
+      border-color: rgba(255, 255, 255, 0.4);
+    }
+    .wave-center-btn svg {
+      width: 32px;
+      height: 32px;
+      fill: currentColor;
+    }
+
+    .wave-heading {
+      text-align: center;
+      margin-bottom: 24px;
+    }
+    .wave-heading h2 {
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: -0.3px;
+      margin-bottom: 6px;
+    }
+    .wave-heading p {
+      color: var(--adw-text-secondary);
+      font-size: 14px;
+    }
+
+    /* Filter Groups */
+    .filter-card {
+      width: 100%;
+      background: var(--adw-card-bg);
+      border: 1px solid var(--adw-border);
+      border-radius: var(--adw-radius-card);
+      padding: 18px;
+      margin-bottom: 20px;
+    }
+    .filter-group {
+      margin-bottom: 14px;
+    }
+    .filter-group:last-child {
+      margin-bottom: 0;
+    }
+    .filter-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--adw-text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .chips-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .chip {
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid var(--adw-border);
+      color: var(--adw-text-secondary);
+      padding: 6px 14px;
+      border-radius: var(--adw-radius-pill);
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .chip:hover {
+      background: rgba(255, 255, 255, 0.14);
+      color: #fff;
+    }
+    .chip.active {
+      background: var(--adw-accent);
+      border-color: var(--adw-accent);
+      color: #fff;
+      font-weight: 500;
+      box-shadow: 0 2px 8px rgba(53, 132, 228, 0.35);
+    }
+
+    /* Bottom Player Bar */
+    .player-bar {
+      height: 76px;
+      background: var(--adw-playerbar-bg);
+      border-top: 1px solid var(--adw-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      z-index: 20;
+    }
+    .player-track-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 280px;
+      min-width: 200px;
+    }
+    .track-art {
+      width: 52px;
+      height: 52px;
+      border-radius: 8px;
+      object-fit: cover;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+      background: #333;
+    }
+    .track-meta {
+      overflow: hidden;
+    }
+    .track-title {
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #fff;
+    }
+    .track-artist {
+      font-size: 12px;
+      color: var(--adw-text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      cursor: pointer;
+    }
+    .track-artist:hover {
+      text-decoration: underline;
+    }
+    .track-reactions {
+      display: flex;
+      gap: 4px;
+    }
+    .reaction-btn {
+      background: transparent;
+      border: none;
+      color: var(--adw-text-dim);
+      cursor: pointer;
+      padding: 6px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+    }
+    .reaction-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+    }
+    .reaction-btn.liked {
+      color: var(--adw-destructive);
+    }
+    .reaction-btn.disliked {
+      color: #f66151;
+    }
+    .reaction-btn svg {
+      width: 18px;
+      height: 18px;
+      fill: currentColor;
+    }
+
+    /* Player Controls Center */
+    .player-center {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      flex: 1;
+      max-width: 540px;
+    }
+    .transport-controls {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .progress-bar-container {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+    }
+    .time-label {
+      font-size: 11px;
+      color: var(--adw-text-dim);
+      font-variant-numeric: tabular-nums;
+      min-width: 34px;
+    }
+
+    /* Right Player Controls */
+    .player-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 280px;
+      justify-content: flex-end;
+    }
+    .volume-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 120px;
+    }
+
+    /* Synced Lyrics Sheet */
+    .lyrics-sheet {
+      position: absolute;
+      top: 0;
+      right: -360px;
+      width: 360px;
+      height: 100%;
+      background: #202020;
+      border-left: 1px solid var(--adw-border);
+      box-shadow: -4px 0 24px rgba(0,0,0,0.4);
+      transition: right 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 30;
+      display: flex;
+      flex-direction: column;
+    }
+    .lyrics-sheet.open {
+      right: 0;
+    }
+    .lyrics-header {
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--adw-border);
+    }
+    .lyrics-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .lyrics-line {
+      font-size: 16px;
+      line-height: 1.5;
+      color: var(--adw-text-dim);
+      transition: all 0.2s;
+      cursor: pointer;
+    }
+    .lyrics-line:hover {
+      color: var(--adw-text-secondary);
+    }
+    .lyrics-line.active {
+      color: #fff;
+      font-weight: 700;
+      font-size: 18px;
+      transform: scale(1.02);
+      transform-origin: left;
+    }
+  </style>
+</head>
+<body>
+  <div class="app-window">
+    <!-- AdwHeaderBar -->
+    <header class="adw-headerbar">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <button class="adw-btn flat" id="toggle-sidebar" title="Скрыть/показать боковую панель">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/>
+          </svg>
+        </button>
+        <span style="font-weight: 700; font-size: 14px; letter-spacing: -0.2px;">Волна</span>
+        <span class="adw-badge accent">Libadwaita Classic</span>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 6px;">
+        <span style="color: var(--adw-text-dim); font-size: 12px;" id="current-view-title">Моя волна</span>
+      </div>
+
+      <div class="adw-window-controls">
+        <button class="adw-btn flat circular" id="btn-settings" title="Настройки">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+          </svg>
+        </button>
+        <button class="adw-win-btn" title="Свернуть">─</button>
+        <button class="adw-win-btn" title="Развернуть">□</button>
+        <button class="adw-win-btn close" title="Закрыть">✕</button>
+      </div>
+    </header>
+
+    <!-- Split View -->
+    <div class="split-view">
+      <!-- Sidebar -->
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+          <div class="search-input-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="opacity: 0.6;">
+              <path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
+            </svg>
+            <input type="text" placeholder="Поиск в коллекции...">
+          </div>
+        </div>
+
+        <div class="nav-section">
+          <div class="nav-section-title">Главное</div>
+          <div class="nav-item active" data-view="wave">
+            <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+            <span>Моя волна</span>
+          </div>
+          <div class="nav-item" data-view="liked">
+            <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+            <span>Любимые треки</span>
+          </div>
+          <div class="nav-item" data-view="history">
+            <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+            <span>История</span>
+          </div>
+        </div>
+
+        <div class="nav-section">
+          <div class="nav-section-title">Медиатека</div>
+          <div class="nav-item" data-view="tracks">
+            <svg viewBox="0 0 24 24"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg>
+            <span>Треки (4 182)</span>
+          </div>
+          <div class="nav-item" data-view="albums">
+            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 14.5c-2.49 0-4.5-2.01-4.5-4.5S9.51 7.5 12 7.5s4.5 2.01 4.5 4.5-2.01 4.5-4.5 4.5zm0-5.5c-.55 0-1 .45-1 1s.45 1 1 1 1-.45 1-1-.45-1-1-1z"/></svg>
+            <span>Альбомы</span>
+          </div>
+          <div class="nav-item" data-view="artists">
+            <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+            <span>Исполнители</span>
+          </div>
+        </div>
+
+        <div class="nav-section" style="margin-top: auto; border-top: 1px solid var(--adw-border); padding-top: 8px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; padding-right: 8px;">
+            <div class="nav-section-title">Плейлисты</div>
+            <button class="adw-btn flat circular" style="width:24px; height:24px;" title="Создать плейлист">+</button>
+          </div>
+          <div class="nav-item"><span>✨ Плейлист дня</span></div>
+          <div class="nav-item"><span>🔥 Премьера</span></div>
+          <div class="nav-item"><span>☕ Вечерний чилл</span></div>
+          <div class="nav-item"><span>🚀 Синтвейв кодинг</span></div>
+        </div>
+      </aside>
+
+      <!-- Content Area -->
+      <main class="content-area">
+        <div class="adw-clamp">
+          <!-- Wave Sphere -->
+          <div class="wave-heading">
+            <h2>Моя волна</h2>
+            <p>Бесконечный персональный поток музыки под ваш вкус</p>
+          </div>
+
+          <div class="wave-sphere-wrapper" id="wave-sphere" title="Нажмите, чтобы включить/приостановить поток">
+            <canvas id="waveCanvas" class="wave-canvas" width="250" height="250"></canvas>
+            <div class="wave-center-btn" id="wave-play-trigger">
+              <svg id="sphere-icon-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+              <svg id="sphere-icon-pause" viewBox="0 0 24 24" style="display: none;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+            </div>
+          </div>
+
+          <!-- Filter Preferences Group -->
+          <div class="filter-card">
+            <!-- Mood -->
+            <div class="filter-group">
+              <div class="filter-label">
+                <span>Настроение</span>
+                <span id="active-mood-text" style="color: var(--adw-accent);">Бодрое</span>
+              </div>
+              <div class="chips-row" id="mood-chips">
+                <button class="chip" data-val="Любое">Любое</button>
+                <button class="chip active" data-val="Бодрое">⚡ Бодрое</button>
+                <button class="chip" data-val="Спокойное">☕ Спокойное</button>
+                <button class="chip" data-val="Весёлое">🎉 Весёлое</button>
+                <button class="chip" data-val="Грустное">🌧 Грустное</button>
+              </div>
+            </div>
+
+            <!-- Character -->
+            <div class="filter-group">
+              <div class="filter-label">
+                <span>Характер потока</span>
+                <span id="active-char-text" style="color: var(--adw-accent);">Любимое</span>
+              </div>
+              <div class="chips-row" id="char-chips">
+                <button class="chip active" data-val="Любимое">❤️ Любимое</button>
+                <button class="chip" data-val="Незнакомое">🧭 Незнакомое</button>
+                <button class="chip" data-val="Популярное">🔥 Популярное</button>
+              </div>
+            </div>
+
+            <!-- Language -->
+            <div class="filter-group">
+              <div class="filter-label">
+                <span>Язык треков</span>
+                <span id="active-lang-text" style="color: var(--adw-accent);">Любой</span>
+              </div>
+              <div class="chips-row" id="lang-chips">
+                <button class="chip active" data-val="Любой">🌐 Любой</button>
+                <button class="chip" data-val="Русский">🇷🇺 Русский</button>
+                <button class="chip" data-val="Иностранный">🌍 Иностранный</button>
+                <button class="chip" data-val="Без слов">🎹 Без слов</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Slide-over Lyrics Sheet -->
+        <div class="lyrics-sheet" id="lyrics-sheet">
+          <div class="lyrics-header">
+            <span style="font-weight: 600; font-size: 15px;">Текст песни</span>
+            <button class="adw-btn flat circular" id="close-lyrics" style="width: 28px; height: 28px;">✕</button>
+          </div>
+          <div class="lyrics-content" id="lyrics-lines">
+            <div class="lyrics-line">I can't keep on losing you</div>
+            <div class="lyrics-line">Over complications</div>
+            <div class="lyrics-line active">Gone too long, someone please</div>
+            <div class="lyrics-line">Take the wheel and drive</div>
+            <div class="lyrics-line">Now I see the reason why</div>
+            <div class="lyrics-line">I'm still locked inside your mind</div>
+            <div class="lyrics-line">Instant crush, don't let it fade</div>
+            <div class="lyrics-line">We will meet another day</div>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- Bottom Player Bar -->
+    <footer class="player-bar">
+      <!-- Track Info -->
+      <div class="player-track-info">
+        <img src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' viewBox='0 0 100 100'><rect fill='%233584e4' width='100' height='100'/><circle cx='50' cy='50' r='35' fill='%231e1e1e'/><circle cx='50' cy='50' r='14' fill='%23e5a50a'/></svg>" class="track-art" id="current-cover" alt="Art">
+        <div class="track-meta">
+          <div class="track-title" id="track-title">Instant Crush</div>
+          <div class="track-artist" id="track-artist">Daft Punk ft. Julian Casablancas</div>
+        </div>
+        <div class="track-reactions">
+          <button class="reaction-btn" id="btn-dislike" title="Не нравится (исключить)">
+            <svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.58-6.59c.37-.36.59-.86.59-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>
+          </button>
+          <button class="reaction-btn" id="btn-like" title="Нравится (сохранить)">
+            <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Controls Center -->
+      <div class="player-center">
+        <div class="transport-controls">
+          <button class="adw-btn flat circular" id="btn-shuffle" title="Перемешать">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
+          </button>
+          <button class="adw-btn flat circular" id="btn-prev" title="Предыдущий трек">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+          </button>
+          <button class="adw-btn circular suggested-action large" id="btn-play-pause" title="Воспроизведение / Пауза">
+            <svg id="icon-play" width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+            <svg id="icon-pause" width="22" height="22" viewBox="0 0 24 24" fill="currentColor" style="display: none;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+          </button>
+          <button class="adw-btn flat circular" id="btn-next" title="Следующий трек">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+          </button>
+          <button class="adw-btn flat circular" id="btn-repeat" title="Повтор">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+          </button>
+        </div>
+
+        <div class="progress-bar-container">
+          <span class="time-label" id="time-current">01:24</span>
+          <input type="range" class="adw-scale" id="seek-bar" min="0" max="337" value="84">
+          <span class="time-label" id="time-total">05:37</span>
+        </div>
+      </div>
+
+      <!-- Right Controls -->
+      <div class="player-right">
+        <button class="adw-btn flat circular" id="btn-lyrics-toggle" title="Текст песни">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+        </button>
+        <span class="adw-badge accent" title="Поток 320 kbps AAC">HQ 320k</span>
+        <div class="volume-box">
+          <button class="adw-btn flat circular" id="btn-mute" style="padding:0; width:28px; height:28px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+          </button>
+          <input type="range" class="adw-scale" id="volume-bar" min="0" max="100" value="80">
+        </div>
+      </div>
+    </footer>
+
+    <!-- Toast -->
+    <div class="adw-toast" id="toast">Настройка волны обновлена</div>
+  </div>
+
+  <script>
+    // State
+    let isPlaying = true;
+    let isLiked = false;
+    let isDisliked = false;
+    let currentTime = 84;
+    const duration = 337;
+
+    // Canvas Wave Animation
+    const canvas = document.getElementById('waveCanvas');
+    const ctx = canvas.getContext('2d');
+    let wavePhase = 0;
+    let waveColor = '#3584e4';
+
+    function drawWave() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const centerX = canvas.width / 2;
+      const centerY = canvas.height / 2;
+      const baseRadius = 85;
+
+      if (isPlaying) {
+        wavePhase += 0.04;
+      }
+
+      // Outer glowing waves
+      for (let i = 3; i >= 1; i--) {
+        const pulse = Math.sin(wavePhase + i * 1.2) * 8;
+        const r = baseRadius + i * 22 + pulse;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, Math.max(10, r), 0, Math.PI * 2);
+        ctx.strokeStyle = waveColor;
+        ctx.lineWidth = 2;
+        ctx.globalAlpha = 0.15 / i;
+        ctx.stroke();
+      }
+
+      // Inner Core Gradient Sphere
+      const gradient = ctx.createRadialGradient(
+        centerX - 15, centerY - 15, 10,
+        centerX, centerY, baseRadius
+      );
+      gradient.addColorStop(0, '#5ea1f4');
+      gradient.addColorStop(0.6, waveColor);
+      gradient.addColorStop(1, '#1b3b64');
+
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, baseRadius + (isPlaying ? Math.sin(wavePhase * 2) * 4 : 0), 0, Math.PI * 2);
+      ctx.fillStyle = gradient;
+      ctx.globalAlpha = 0.9;
+      ctx.shadowColor = waveColor;
+      ctx.shadowBlur = isPlaying ? 25 : 10;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1.0;
+
+      requestAnimationFrame(drawWave);
+    }
+    drawWave();
+
+    // Elements
+    const btnPlayPause = document.getElementById('btn-play-pause');
+    const spherePlayTrigger = document.getElementById('wave-sphere');
+    const iconPlay = document.getElementById('icon-play');
+    const iconPause = document.getElementById('icon-pause');
+    const sphereIconPlay = document.getElementById('sphere-icon-play');
+    const sphereIconPause = document.getElementById('sphere-icon-pause');
+    const seekBar = document.getElementById('seek-bar');
+    const timeCurrent = document.getElementById('time-current');
+    const toast = document.getElementById('toast');
+
+    function showToast(msg) {
+      toast.innerText = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2000);
+    }
+
+    function togglePlayback() {
+      isPlaying = !isPlaying;
+      iconPlay.style.display = isPlaying ? 'none' : 'block';
+      iconPause.style.display = isPlaying ? 'block' : 'none';
+      sphereIconPlay.style.display = isPlaying ? 'none' : 'block';
+      sphereIconPause.style.display = isPlaying ? 'block' : 'none';
+      showToast(isPlaying ? 'Воспроизведение возобновлено' : 'Пауза');
+    }
+
+    btnPlayPause.addEventListener('click', togglePlayback);
+    spherePlayTrigger.addEventListener('click', togglePlayback);
+
+    // Sidebar Toggle
+    const toggleSidebarBtn = document.getElementById('toggle-sidebar');
+    const sidebar = document.getElementById('sidebar');
+    toggleSidebarBtn.addEventListener('click', () => {
+      sidebar.classList.toggle('collapsed');
+    });
+
+    // Time Formatting
+    function formatTime(sec) {
+      const m = Math.floor(sec / 60);
+      const s = Math.floor(sec % 60);
+      return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+    }
+
+    // Timer Tick
+    setInterval(() => {
+      if (isPlaying) {
+        currentTime++;
+        if (currentTime > duration) currentTime = 0;
+        seekBar.value = currentTime;
+        timeCurrent.innerText = formatTime(currentTime);
+      }
+    }, 1000);
+
+    seekBar.addEventListener('input', (e) => {
+      currentTime = parseInt(e.target.value);
+      timeCurrent.innerText = formatTime(currentTime);
+    });
+
+    // Likes & Dislikes
+    const btnLike = document.getElementById('btn-like');
+    const btnDislike = document.getElementById('btn-dislike');
+
+    btnLike.addEventListener('click', () => {
+      isLiked = !isLiked;
+      btnLike.classList.toggle('liked', isLiked);
+      if (isLiked) {
+        isDisliked = false;
+        btnDislike.classList.remove('disliked');
+        showToast('Добавлено в «Любимые треки» ❤️');
+      } else {
+        showToast('Удалено из любимых');
+      }
+    });
+
+    btnDislike.addEventListener('click', () => {
+      isDisliked = !isDisliked;
+      btnDislike.classList.toggle('disliked', isDisliked);
+      if (isDisliked) {
+        isLiked = false;
+        btnLike.classList.remove('liked');
+        showToast('Трек исключен из Моей волны 👎');
+      }
+    });
+
+    // Chips selection
+    function setupChipGroup(containerId, labelId, moodColor) {
+      const container = document.getElementById(containerId);
+      const label = document.getElementById(labelId);
+      container.querySelectorAll('.chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          container.querySelectorAll('.chip').forEach(c => c.classList.remove('active'));
+          chip.classList.add('active');
+          const val = chip.getAttribute('data-val');
+          label.innerText = val;
+          if (moodColor) {
+            if (val === 'Бодрое') waveColor = '#3584e4';
+            else if (val === 'Спокойное') waveColor = '#26a269';
+            else if (val === 'Весёлое') waveColor = '#e5a50a';
+            else if (val === 'Грустное') waveColor = '#9141ac';
+            else waveColor = '#3584e4';
+          }
+          showToast(`Волна: фильтр «${val}» применён`);
+        });
+      });
+    }
+    setupChipGroup('mood-chips', 'active-mood-text', true);
+    setupChipGroup('char-chips', 'active-char-text', false);
+    setupChipGroup('lang-chips', 'active-lang-text', false);
+
+    // Lyrics Panel Toggle
+    const btnLyrics = document.getElementById('btn-lyrics-toggle');
+    const lyricsSheet = document.getElementById('lyrics-sheet');
+    const closeLyrics = document.getElementById('close-lyrics');
+
+    btnLyrics.addEventListener('click', () => {
+      lyricsSheet.classList.toggle('open');
+    });
+    closeLyrics.addEventListener('click', () => {
+      lyricsSheet.classList.remove('open');
+    });
+
+    // Skip Buttons
+    const btnNext = document.getElementById('btn-next');
+    const btnPrev = document.getElementById('btn-prev');
+    const trackTitle = document.getElementById('track-title');
+    const trackArtist = document.getElementById('track-artist');
+
+    const sampleTracks = [
+      { title: 'Instant Crush', artist: 'Daft Punk ft. Julian Casablancas' },
+      { title: 'Midnight City', artist: 'M83' },
+      { title: 'Genesis', artist: 'Justice' },
+      { title: 'Resonance', artist: 'HOME' },
+      { title: 'Nightcall', artist: 'Kavinsky' }
+    ];
+    let trackIdx = 0;
+
+    function loadTrack(idx) {
+      trackIdx = (idx + sampleTracks.length) % sampleTracks.length;
+      trackTitle.innerText = sampleTracks[trackIdx].title;
+      trackArtist.innerText = sampleTracks[trackIdx].artist;
+      currentTime = 0;
+      seekBar.value = 0;
+      timeCurrent.innerText = "00:00";
+      showToast(`Играет: ${sampleTracks[trackIdx].title}`);
+    }
+
+    btnNext.addEventListener('click', () => loadTrack(trackIdx + 1));
+    btnPrev.addEventListener('click', () => loadTrack(trackIdx - 1));
+  </script>
+</body>
+</html>

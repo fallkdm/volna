@@ -34,9 +34,38 @@
 
 ---
 
+## 🏛 Архитектура проекта
+
+Кодовая база спроектирована по модульному принципу с разделением интерфейса, звукового конвейера и сетевой логики:
+
+- **`src/api/`** — Асинхронный клиент к Яндекс Музыке (`reqwest`, `serde`, `md-5`):
+  - `client.rs` — генерация очереди треков станции `user:onyourwave`, расчет прямого URL через соленый MD5-хеш, отправка событий обратной связи (`trackStarted`, `trackFinished`, `skip`, `like`, `dislike`).
+  - `models.rs` — строго типизированные структуры треков, артистов, альбомов и ротора.
+  - `auth.rs` — управление токеном авторизации (`~/.config/volna/config.json`).
+- **`src/player/`** — Высокопроизводительный звуковой бэкенд на базе **GStreamer**:
+  - `audio.rs` — потоковый плеер (`gstreamer-play`) с буферизацией в реальном времени без выгрузки всего файла в RAM.
+  - `manager.rs` — менеджер очереди и событий обратной связи станции.
+- **`src/ui/`** — Нативный интерфейс **Libadwaita / GTK4** по утвержденному концепту **«Wave-First & Fluid»**:
+  - `wave_view.rs` — экран «Моя волна» с интерактивным органическим визуализатором волны (`DrawingArea` + Cairo), элементами фильтров потока и крупной кнопкой воспроизведения.
+  - `floating_island.rs` — адаптивный парящий остров-плеер (`GtkOverlay`) со скруглением 24px, круглой обложкой, слайдером времени, реакциями и регулировкой громкости.
+  - `search_view.rs` / `library_view.rs` — поиск и пользовательская медиатека.
+  - `preferences_dialog.rs` — диалог настройки фильтров характера/настроения и токена Яндекса.
+  - `style.css` — стилизация GNOME Dark, амбиентные радиальные градиенты и эффекты скруглений.
+
+---
+
+## 🎨 Дизайн и макеты
+
+В директории [`mockups/`](mockups/) разработаны и протестированы автономные интерактивные прототипы:
+- **Витрина концептов:** [`mockups/index.html`](mockups/index.html)
+- **Утвержденный макет Wave-First & Fluid:** [`mockups/variant2_fluid.html`](mockups/variant2_fluid.html)
+- **Скриншоты адаптивности и QA-тестирования:** [`mockups/screenshots/`](mockups/screenshots/)
+
+---
+
 ## 🛠 Сборка и запуск
 
-### Зависимости (Arch Linux / Manjaro):
+### Системные зависимости (Arch Linux / Manjaro):
 ```bash
 sudo pacman -S gtk4 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad
 ```
@@ -50,7 +79,14 @@ cargo build --release
 
 ### Запуск:
 ```bash
-cargo run --release
+./target/release/volna
+```
+
+Токен авторизации можно ввести через меню «Настройки» (`Preferences`) либо сохранить в `~/.config/volna/config.json`:
+```json
+{
+  "token": "y0_AgAAAA..."
+}
 ```
 
 ---

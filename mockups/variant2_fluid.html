@@ -1,0 +1,1135 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Волна — Вариант 2: Wave-First & Fluid (Исправленный)</title>
+  <link rel="stylesheet" href="libadwaita.css">
+  <style>
+    :root {
+      --fluid-accent: #ff6b4a;
+      --fluid-accent-secondary: #9c27b0;
+      --fluid-bg-grad: radial-gradient(circle at 50% 32%, rgba(255, 107, 74, 0.18) 0%, rgba(156, 39, 176, 0.08) 50%, #161616 100%);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #141414;
+      color: #ffffff;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      width: 100vw;
+      font-family: var(--font-family);
+      transition: background 0.8s ease;
+      position: relative;
+    }
+
+    /* Ambient Backdrop */
+    .ambient-backdrop {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--fluid-bg-grad);
+      pointer-events: none;
+      z-index: 0;
+      transition: background 0.8s ease;
+    }
+
+    /* Minimalist Adaptive Header */
+    .fluid-header {
+      height: 50px;
+      min-height: 50px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      position: relative;
+      z-index: 20;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      background: rgba(22, 22, 22, 0.65);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      gap: 10px;
+    }
+
+    .brand-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      font-size: 14px;
+      letter-spacing: -0.3px;
+      flex-shrink: 0;
+    }
+    .brand-title svg {
+      width: 20px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .brand-badge {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: var(--adw-radius-pill);
+      background: rgba(255, 107, 74, 0.22);
+      color: #ff9d85;
+      border: 1px solid rgba(255, 107, 74, 0.35);
+      letter-spacing: 0.4px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    /* Adaptive ViewSwitcher */
+    .header-center {
+      display: flex;
+      justify-content: center;
+      flex: 1;
+      max-width: 440px;
+    }
+
+    .adw-view-switcher {
+      display: inline-flex;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 3px;
+      border-radius: var(--adw-radius-pill);
+      border: 1px solid var(--adw-border);
+      max-width: 100%;
+      overflow: hidden;
+    }
+
+    .adw-switcher-btn {
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    /* Hero Main Area with Responsive Scaling */
+    .hero-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      z-index: 5;
+      padding: 10px 16px 105px 16px; /* 105px bottom padding prevents collision with floating player */
+      overflow-y: auto;
+      overflow-x: hidden;
+      min-height: 0;
+    }
+
+    /* Hero Canvas Visualizer */
+    .hero-canvas-wrap {
+      position: relative;
+      width: clamp(180px, 36vh, 310px);
+      height: clamp(180px, 36vh, 310px);
+      max-width: 80vw;
+      max-height: 80vw;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      margin: 0 auto;
+      flex-shrink: 0;
+    }
+
+    #fluidWaveCanvas {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+    }
+
+    .hero-play-badge {
+      position: relative;
+      z-index: 4;
+      width: clamp(56px, 9vh, 76px);
+      height: clamp(56px, 9vh, 76px);
+      border-radius: 50%;
+      background: rgba(255, 255, 255, 0.15);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 6px 26px rgba(0, 0, 0, 0.45);
+    }
+    .hero-canvas-wrap:hover .hero-play-badge {
+      transform: scale(1.1);
+      background: rgba(255, 255, 255, 0.25);
+      border-color: rgba(255, 255, 255, 0.55);
+    }
+    .hero-play-badge svg {
+      width: 44%;
+      height: 44%;
+      fill: currentColor;
+    }
+
+    /* Track typography */
+    .hero-track-info {
+      text-align: center;
+      margin-top: clamp(8px, 2vh, 18px);
+      margin-bottom: clamp(10px, 2.2vh, 20px);
+      max-width: 90%;
+      flex-shrink: 0;
+    }
+    .hero-track-title {
+      font-size: clamp(20px, 4vw, 28px);
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      margin-bottom: 4px;
+      background: linear-gradient(135deg, #ffffff 40%, rgba(255,255,255,0.78) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 600px;
+    }
+    .hero-track-artist {
+      font-size: clamp(13px, 2.2vw, 15px);
+      color: var(--adw-text-secondary);
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 500px;
+    }
+
+    /* Quick Fluid Mood Carousel (Scrollable & Responsive) */
+    .fluid-pill-scroll-wrapper {
+      width: 100%;
+      max-width: 680px;
+      display: flex;
+      justify-content: center;
+      position: relative;
+      flex-shrink: 0;
+    }
+    .fluid-pill-bar {
+      display: flex;
+      gap: 8px;
+      padding: 6px 12px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: var(--adw-radius-pill);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      overflow-x: auto;
+      scrollbar-width: none; /* Firefox */
+      -ms-overflow-style: none; /* IE */
+      max-width: 100%;
+    }
+    .fluid-pill-bar::-webkit-scrollbar {
+      display: none; /* Chrome/Safari */
+    }
+
+    .fluid-pill {
+      background: transparent;
+      border: none;
+      color: var(--adw-text-secondary);
+      padding: 7px 16px;
+      border-radius: var(--adw-radius-pill);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .fluid-pill:hover {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.1);
+    }
+    .fluid-pill.active {
+      background: #ffffff;
+      color: #111111;
+      font-weight: 600;
+      box-shadow: 0 4px 14px rgba(255, 255, 255, 0.28);
+    }
+
+    /* Floating Island Player (Completely Adaptive) */
+    .floating-island-player {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: calc(100% - 32px);
+      max-width: 780px;
+      min-height: 70px;
+      background: rgba(28, 28, 28, 0.92);
+      backdrop-filter: blur(26px);
+      -webkit-backdrop-filter: blur(26px);
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 22px;
+      box-shadow: 0 12px 38px rgba(0, 0, 0, 0.65), 0 2px 8px rgba(0, 0, 0, 0.35);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      z-index: 30;
+      transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .floating-island-player:hover {
+      border-color: rgba(255, 255, 255, 0.26);
+      box-shadow: 0 16px 44px rgba(0, 0, 0, 0.75);
+    }
+
+    /* Island Left */
+    .island-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 0 1 230px;
+      min-width: 140px;
+      overflow: hidden;
+    }
+    .circular-cover-wrap {
+      position: relative;
+      width: 44px;
+      height: 44px;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+    .island-art {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      object-fit: cover;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.45);
+      display: block;
+    }
+
+    .island-meta {
+      overflow: hidden;
+      flex: 1;
+    }
+    .island-title {
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #fff;
+    }
+    .island-artist {
+      font-size: 11px;
+      color: var(--adw-text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .island-reactions {
+      display: flex;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+
+    /* Island Center */
+    .island-center {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      flex: 1 1 320px;
+      min-width: 160px;
+      padding: 0 8px;
+    }
+    .island-controls {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .progress-bar-container {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      max-width: 320px;
+    }
+    .time-label {
+      font-size: 11px;
+      color: var(--adw-text-dim);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      min-width: 32px;
+      text-align: center;
+    }
+
+    /* Island Right */
+    .island-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 1 180px;
+      justify-content: flex-end;
+      flex-shrink: 0;
+    }
+
+    /* Volume container */
+    .island-volume-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Modal Preferences Dialog (AdwPreferencesDialog Style) */
+    .modal-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      z-index: 150;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+      padding: 16px;
+    }
+    .modal-backdrop.open {
+      display: flex !important;
+      opacity: 1 !important;
+    }
+
+    .modal-window {
+      background: #252525;
+      border: 1px solid var(--adw-border-strong);
+      border-radius: var(--adw-radius-window);
+      width: 100%;
+      max-width: 480px;
+      max-height: 85vh;
+      box-shadow: 0 16px 50px rgba(0, 0, 0, 0.8);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      opacity: 1 !important;
+      transform: scale(1) !important;
+    }
+
+    .modal-header {
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--adw-border);
+      background: #2a2a2a;
+    }
+    .modal-title {
+      font-weight: 700;
+      font-size: 15px;
+    }
+    .modal-body {
+      padding: 18px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .pref-group {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--adw-border);
+      border-radius: var(--adw-radius-card);
+      padding: 14px;
+    }
+    .pref-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--adw-text-dim);
+      margin-bottom: 8px;
+    }
+    .modal-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    /* Isolated Karaoke Overlay */
+    .karaoke-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: #111111; /* Completely opaque to prevent background bleed-through */
+      z-index: 200;
+      display: none;
+      flex-direction: column;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+    }
+    .karaoke-overlay.active {
+      display: flex;
+      opacity: 1;
+    }
+    .karaoke-ambient {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: radial-gradient(circle at 50% 40%, rgba(255, 107, 74, 0.2) 0%, #111111 85%);
+      pointer-events: none;
+    }
+    .karaoke-topbar {
+      height: 54px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      background: rgba(20, 20, 20, 0.9);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      position: relative;
+      z-index: 5;
+    }
+    .karaoke-scroll {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 20px;
+      gap: 22px;
+      position: relative;
+      z-index: 5;
+    }
+    .karaoke-line {
+      font-size: clamp(20px, 3.5vw, 32px);
+      font-weight: 700;
+      color: rgba(255, 255, 255, 0.28);
+      cursor: pointer;
+      transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+      text-align: center;
+      max-width: 680px;
+      line-height: 1.35;
+    }
+    .karaoke-line:hover {
+      color: rgba(255, 255, 255, 0.65);
+    }
+    .karaoke-line.sung {
+      color: rgba(255, 255, 255, 0.5);
+    }
+    .karaoke-line.current {
+      color: #ffffff;
+      font-size: clamp(24px, 4.2vw, 38px);
+      transform: scale(1.04);
+      text-shadow: 0 0 28px rgba(255, 107, 74, 0.85);
+    }
+
+    /* ------------------------------------------------------------- */
+    /* RESPONSIVE MEDIA QUERIES (BREAKPOINTS)                        */
+    /* ------------------------------------------------------------- */
+
+    /* Medium screens (900px and below) */
+    @media (max-width: 900px) {
+      .floating-island-player {
+        max-width: calc(100% - 32px);
+        padding: 0 14px;
+      }
+      .island-volume-wrap input {
+        width: 50px;
+      }
+    }
+
+    /* Compact screens (720px and below) */
+    @media (max-width: 720px) {
+      .fluid-header {
+        padding: 0 10px;
+      }
+      .brand-badge {
+        display: none; /* Hide secondary badge to avoid header crushing */
+      }
+      .island-left {
+        flex: 0 1 170px;
+        min-width: 120px;
+      }
+      .island-reactions {
+        display: none; /* Hide Like/Dislike in main row, show in popover/alt */
+      }
+      .island-right .adw-badge {
+        display: none; /* Hide LOSSLESS badge to free up width for seekbar */
+      }
+      .island-volume-wrap input {
+        display: none; /* Hide volume slider track, leave icon button */
+      }
+      .island-right {
+        flex: 0 0 auto;
+        gap: 4px;
+      }
+      .floating-island-player {
+        bottom: 14px;
+        min-height: 66px;
+      }
+    }
+
+    /* Narrow / Mobile screens (520px and below) */
+    @media (max-width: 520px) {
+      .fluid-header {
+        height: 46px;
+        min-height: 46px;
+      }
+      .brand-title span {
+        display: none; /* Show only wave icon */
+      }
+      .adw-switcher-btn span.tab-text {
+        display: none; /* Compact icon-only tabs */
+      }
+      .adw-switcher-btn {
+        padding: 5px 10px;
+      }
+
+      /* Floating Island Mobile Mode */
+      .floating-island-player {
+        bottom: 10px;
+        width: calc(100% - 16px);
+        min-height: 60px;
+        padding: 0 10px;
+        border-radius: 18px;
+      }
+      .island-left {
+        flex: 1 1 auto;
+        max-width: 140px;
+        min-width: 100px;
+        gap: 8px;
+      }
+      .circular-cover-wrap {
+        width: 38px;
+        height: 38px;
+      }
+      .island-art {
+        width: 38px;
+        height: 38px;
+      }
+      .island-title {
+        font-size: 12px;
+      }
+      .island-artist {
+        font-size: 10px;
+      }
+
+      /* Switch center controls to clean mobile layout */
+      .island-center {
+        flex: 0 0 auto;
+        min-width: 0;
+        padding: 0 4px;
+      }
+      .island-center .progress-bar-container {
+        display: none; /* Hide horizontal slider inside capsule */
+      }
+      .island-controls {
+        gap: 8px;
+      }
+      .island-controls button {
+        width: 32px !important;
+        height: 32px !important;
+      }
+      #island-prev {
+        display: none; /* Hide Prev track button on mobile, keep Play and Next */
+      }
+
+      .island-right {
+        display: flex;
+        gap: 2px;
+      }
+      .island-volume-wrap {
+        display: none;
+      }
+
+      /* Integrated hairline top progress bar for mobile */
+      .mobile-hairline-progress {
+        display: block !important;
+        position: absolute;
+        top: 0;
+        left: 14px;
+        right: 14px;
+        height: 3px;
+        background: rgba(255, 255, 255, 0.15);
+        border-radius: 2px;
+        overflow: hidden;
+      }
+      .mobile-hairline-fill {
+        height: 100%;
+        background: var(--fluid-accent);
+        width: 55%;
+        border-radius: 2px;
+      }
+
+      .hero-container {
+        padding-bottom: 85px;
+      }
+    }
+
+    /* Vertical screen height constraint (< 650px) */
+    @media (max-height: 650px) {
+      .hero-container {
+        padding-top: 6px;
+        padding-bottom: 85px;
+      }
+      .hero-canvas-wrap {
+        width: clamp(140px, 28vh, 200px);
+        height: clamp(140px, 28vh, 200px);
+      }
+      .hero-track-info {
+        margin-top: 6px;
+        margin-bottom: 8px;
+      }
+      .hero-track-title {
+        font-size: 18px;
+      }
+      .hero-track-artist {
+        font-size: 12px;
+      }
+      .fluid-pill {
+        padding: 5px 12px;
+        font-size: 12px;
+      }
+      .floating-island-player {
+        bottom: 8px;
+        min-height: 58px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- Ambient Gradient Background -->
+  <div class="ambient-backdrop" id="ambientBg"></div>
+
+  <!-- Minimal Adw Header -->
+  <header class="fluid-header">
+    <div class="brand-title">
+      <svg viewBox="0 0 24 24" fill="#ff6b4a">
+        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+      </svg>
+      <span>Волна</span>
+      <span class="brand-badge">Wave-First</span>
+    </div>
+
+    <!-- View Switcher Capsule -->
+    <div class="header-center">
+      <div class="adw-view-switcher">
+        <button class="adw-switcher-btn active" id="tab-wave">
+          <span class="tab-icon">🌊</span> <span class="tab-text">Моя волна</span>
+        </button>
+        <button class="adw-switcher-btn" id="tab-search">
+          <span class="tab-icon">🔍</span> <span class="tab-text">Поиск</span>
+        </button>
+        <button class="adw-switcher-btn" id="tab-library">
+          <span class="tab-icon">📚</span> <span class="tab-text">Медиатека</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="adw-window-controls">
+      <button class="adw-win-btn" title="Свернуть">─</button>
+      <button class="adw-win-btn" title="Развернуть">□</button>
+      <button class="adw-win-btn close" title="Закрыть">✕</button>
+    </div>
+  </header>
+
+  <!-- Hero Main Area -->
+  <main class="hero-container" id="heroArea">
+    <!-- Fluid Wave Canvas -->
+    <div class="hero-canvas-wrap" id="fluidWaveWrap" title="Включить / Приостановить поток">
+      <canvas id="fluidWaveCanvas" width="340" height="340"></canvas>
+      <div class="hero-play-badge" id="heroPlayBtn">
+        <svg id="heroIconPlay" viewBox="0 0 24 24" style="display: none;"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="heroIconPause" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+      </div>
+    </div>
+
+    <!-- Track Heading -->
+    <div class="hero-track-info">
+      <div class="hero-track-title" id="heroTitle">Midnight City</div>
+      <div class="hero-track-artist" id="heroArtist">M83 • Hurry Up, We're Dreaming</div>
+    </div>
+
+    <!-- Quick Mood Carousel (Horizontally Scrollable) -->
+    <div class="fluid-pill-scroll-wrapper">
+      <div class="fluid-pill-bar" id="fluidPills">
+        <button class="fluid-pill active" data-color="#ff6b4a" data-mood="Энергичное">⚡ Энергичное</button>
+        <button class="fluid-pill" data-color="#3584e4" data-mood="Спокойное">☕ Спокойное</button>
+        <button class="fluid-pill" data-color="#26a269" data-mood="На русском">🇷🇺 На русском</button>
+        <button class="fluid-pill" data-color="#9c27b0" data-mood="Новое">✨ Новое</button>
+        <button class="fluid-pill" data-color="#e5a50a" data-mood="Вечеринка">🎉 Вечеринка</button>
+        <button class="fluid-pill" id="btn-custom-wave" title="Тонкая настройка всех параметров">⚙ Фильтры</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Floating Island Player -->
+  <div class="floating-island-player" id="floatingIsland">
+    <!-- Mobile Hairline Progress Bar -->
+    <div class="mobile-hairline-progress" style="display: none;">
+      <div class="mobile-hairline-fill" id="mobileProgressFill"></div>
+    </div>
+
+    <!-- Left -->
+    <div class="island-left">
+      <div class="circular-cover-wrap" id="coverClick" title="Открыть текст караоке">
+        <img src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' viewBox='0 0 100 100'><rect fill='%23ff6b4a' width='100' height='100'/><circle cx='50' cy='50' r='30' fill='%23222'/><polygon points='45,35 65,50 45,65' fill='%23fff'/></svg>" class="island-art" alt="Art">
+      </div>
+      <div class="island-meta">
+        <div class="island-title" id="islandTitle">Midnight City</div>
+        <div class="island-artist" id="islandArtist">M83</div>
+      </div>
+      <div class="island-reactions">
+        <button class="reaction-btn" id="island-dislike" title="Дислайк (👎)">
+          <svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.58-6.59c.37-.36.59-.86.59-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>
+        </button>
+        <button class="reaction-btn" id="island-like" title="Лайк (❤️)">
+          <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Center -->
+    <div class="island-center">
+      <div class="island-controls">
+        <button class="adw-btn flat circular" id="island-prev" title="Предыдущий" style="width:32px; height:32px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+        </button>
+        <button class="adw-btn circular suggested-action" id="island-play" style="width:38px; height:38px; background:#fff; color:#111;">
+          <svg id="islandIconPlay" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M8 5v14l11-7z"/></svg>
+          <svg id="islandIconPause" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+        </button>
+        <button class="adw-btn flat circular" id="island-next" title="Следующий" style="width:32px; height:32px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+        </button>
+      </div>
+
+      <div class="progress-bar-container">
+        <span class="time-label" id="islandTimeCurr">02:14</span>
+        <input type="range" class="adw-scale" id="islandSeekBar" min="0" max="243" value="134">
+        <span class="time-label" id="islandTimeTotal">04:03</span>
+      </div>
+    </div>
+
+    <!-- Right -->
+    <div class="island-right">
+      <button class="adw-btn flat circular" id="btn-karaoke-open" title="Полноэкранный текст песни">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+        </svg>
+      </button>
+      <span class="adw-badge accent" style="background: rgba(255, 255, 255, 0.1); color: #fff;">LOSSLESS</span>
+      <div class="island-volume-wrap">
+        <button class="adw-btn flat circular" style="width:28px; height:28px; padding:0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+        </button>
+        <input type="range" class="adw-scale" style="width: 65px;" min="0" max="100" value="85">
+      </div>
+    </div>
+  </div>
+
+  <!-- Preferences Modal Dialog (Фильтры Моей волны) -->
+  <div class="modal-backdrop" id="modalFilters">
+    <div class="modal-window">
+      <div class="modal-header">
+        <span class="modal-title">Настройки Моей волны</span>
+        <button class="adw-btn flat circular" id="btnCloseModal" style="width:28px; height:28px;">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="pref-group">
+          <div class="pref-title">Настроение</div>
+          <div class="modal-chips" id="mPrefMood">
+            <button class="chip active">⚡ Энергичное</button>
+            <button class="chip">☕ Спокойное</button>
+            <button class="chip">🎉 Весёлое</button>
+            <button class="chip">🌧 Грустное</button>
+          </div>
+        </div>
+
+        <div class="pref-group">
+          <div class="pref-title">Характер рекомендаций</div>
+          <div class="modal-chips" id="mPrefChar">
+            <button class="chip active">❤️ Любимое</button>
+            <button class="chip">🧭 Незнакомое</button>
+            <button class="chip">🔥 Популярное</button>
+          </div>
+        </div>
+
+        <div class="pref-group">
+          <div class="pref-title">Язык треков</div>
+          <div class="modal-chips" id="mPrefLang">
+            <button class="chip active">🌐 Любой</button>
+            <button class="chip">🇷🇺 Русский</button>
+            <button class="chip">🌍 Иностранный</button>
+            <button class="chip">🎹 Без слов</button>
+          </div>
+        </div>
+
+        <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:6px;">
+          <button class="adw-btn" id="btnResetFilters">Сбросить</button>
+          <button class="adw-btn suggested-action" id="btnApplyFilters">Применить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fullscreen Karaoke Overlay (Solid Backdrop) -->
+  <div class="karaoke-overlay" id="karaokeOverlay">
+    <div class="karaoke-ambient"></div>
+    <div class="karaoke-topbar">
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span style="font-size:16px; font-weight:700;">Синхронизированный текст</span>
+        <span class="adw-badge accent">LRC Karaoke</span>
+      </div>
+      <button class="adw-btn flat circular" id="btn-karaoke-close" style="width:34px; height:34px;">✕</button>
+    </div>
+    <div class="karaoke-scroll">
+      <div class="karaoke-line sung">Waiting in a car</div>
+      <div class="karaoke-line sung">Waiting for a ride in the dark</div>
+      <div class="karaoke-line sung">The night city grows</div>
+      <div class="karaoke-line current">Look and see her eyes, they look like fire</div>
+      <div class="karaoke-line">Waiting in a car</div>
+      <div class="karaoke-line">Waiting for a ride in the dark</div>
+      <div class="karaoke-line">The city is my church</div>
+      <div class="karaoke-line">It wraps me in the blinding twilight</div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="adw-toast" id="toast">Настройка волны обновлена</div>
+
+  <script>
+    let isPlaying = true;
+    let isLiked = false;
+    let isDisliked = false;
+    let currentTime = 134;
+    const duration = 243;
+    let primaryAccent = '#ff6b4a';
+
+    // Canvas fluid wave
+    const canvas = document.getElementById('fluidWaveCanvas');
+    const ctx = canvas.getContext('2d');
+    let angle = 0;
+
+    function renderFluidWave() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+
+      if (isPlaying) {
+        angle += 0.035;
+      }
+
+      for (let layer = 0; layer < 3; layer++) {
+        const points = 8;
+        const radius = 95 - layer * 18;
+        ctx.beginPath();
+
+        for (let i = 0; i <= points; i++) {
+          const theta = (i / points) * Math.PI * 2;
+          const offset = Math.sin(theta * 3 + angle * (1 + layer * 0.4)) * 14 * (isPlaying ? 1 : 0.3);
+          const r = radius + offset;
+          const x = cx + Math.cos(theta) * r;
+          const y = cy + Math.sin(theta) * r;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+
+        const grad = ctx.createRadialGradient(cx, cy, 20, cx, cy, 140);
+        if (layer === 0) {
+          grad.addColorStop(0, primaryAccent);
+          grad.addColorStop(1, 'rgba(156, 39, 176, 0.4)');
+          ctx.fillStyle = grad;
+          ctx.globalAlpha = 0.55;
+        } else if (layer === 1) {
+          grad.addColorStop(0, '#ffffff');
+          grad.addColorStop(1, primaryAccent);
+          ctx.fillStyle = grad;
+          ctx.globalAlpha = 0.4;
+        } else {
+          grad.addColorStop(0, '#fff');
+          grad.addColorStop(1, '#ff8f75');
+          ctx.fillStyle = grad;
+          ctx.globalAlpha = 0.7;
+        }
+        ctx.fill();
+      }
+
+      ctx.globalAlpha = 1.0;
+      requestAnimationFrame(renderFluidWave);
+    }
+    renderFluidWave();
+
+    // Toast
+    const toast = document.getElementById('toast');
+    function showToast(msg) {
+      toast.innerText = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2000);
+    }
+
+    // Playback
+    const heroPlayBtn = document.getElementById('heroPlayBtn');
+    const fluidWaveWrap = document.getElementById('fluidWaveWrap');
+    const heroIconPlay = document.getElementById('heroIconPlay');
+    const heroIconPause = document.getElementById('heroIconPause');
+    const islandPlay = document.getElementById('islandPlay');
+    const islandIconPlay = document.getElementById('islandIconPlay');
+    const islandIconPause = document.getElementById('islandIconPause');
+
+    function togglePlay() {
+      isPlaying = !isPlaying;
+      heroIconPlay.style.display = isPlaying ? 'none' : 'block';
+      heroIconPause.style.display = isPlaying ? 'block' : 'none';
+      islandIconPlay.style.display = isPlaying ? 'none' : 'block';
+      islandIconPause.style.display = isPlaying ? 'block' : 'none';
+      showToast(isPlaying ? 'Волна звучит' : 'Пауза');
+    }
+
+    heroPlayBtn.addEventListener('click', (e) => { e.stopPropagation(); togglePlay(); });
+    fluidWaveWrap.addEventListener('click', togglePlay);
+    islandPlay.addEventListener('click', togglePlay);
+
+    // Pill color extraction
+    const ambientBg = document.getElementById('ambientBg');
+    const pills = document.querySelectorAll('.fluid-pill[data-color]');
+
+    pills.forEach(pill => {
+      pill.addEventListener('click', () => {
+        pills.forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+        const color = pill.getAttribute('data-color');
+        const mood = pill.getAttribute('data-mood');
+        primaryAccent = color;
+        ambientBg.style.background = `radial-gradient(circle at 50% 32%, ${color}33 0%, rgba(20,20,20,0.6) 70%, #141414 100%)`;
+        showToast(`Поток: ${mood}`);
+      });
+    });
+
+    // Time ticker
+    function formatTime(s) {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${m < 10 ? '0' : ''}${m}:${sec < 10 ? '0' : ''}${sec}`;
+    }
+
+    const islandSeekBar = document.getElementById('islandSeekBar');
+    const islandTimeCurr = document.getElementById('islandTimeCurr');
+    const mobileProgressFill = document.getElementById('mobileProgressFill');
+
+    setInterval(() => {
+      if (isPlaying) {
+        currentTime++;
+        if (currentTime > duration) currentTime = 0;
+        islandSeekBar.value = currentTime;
+        islandTimeCurr.innerText = formatTime(currentTime);
+        mobileProgressFill.style.width = `${(currentTime / duration) * 100}%`;
+      }
+    }, 1000);
+
+    islandSeekBar.addEventListener('input', (e) => {
+      currentTime = parseInt(e.target.value);
+      islandTimeCurr.innerText = formatTime(currentTime);
+      mobileProgressFill.style.width = `${(currentTime / duration) * 100}%`;
+    });
+
+    // Likes & Dislikes
+    const islandLike = document.getElementById('island-like');
+    const islandDislike = document.getElementById('island-dislike');
+
+    islandLike.addEventListener('click', () => {
+      isLiked = !isLiked;
+      islandLike.classList.toggle('liked', isLiked);
+      if (isLiked) {
+        isDisliked = false;
+        islandDislike.classList.remove('disliked');
+        showToast('Понравилось в Волне ❤️');
+      }
+    });
+
+    islandDislike.addEventListener('click', () => {
+      isDisliked = !isDisliked;
+      islandDislike.classList.toggle('disliked', isDisliked);
+      if (isDisliked) {
+        isLiked = false;
+        islandLike.classList.remove('liked');
+        showToast('Исключено из потока 👎');
+      }
+    });
+
+    // Modal dialog
+    const btnCustomWave = document.getElementById('btn-custom-wave');
+    const modalFilters = document.getElementById('modalFilters');
+    const btnCloseModal = document.getElementById('btnCloseModal');
+    const btnApplyFilters = document.getElementById('btnApplyFilters');
+    const btnResetFilters = document.getElementById('btnResetFilters');
+
+    btnCustomWave.addEventListener('click', () => modalFilters.classList.add('open'));
+    btnCloseModal.addEventListener('click', () => modalFilters.classList.remove('open'));
+    btnApplyFilters.addEventListener('click', () => {
+      modalFilters.classList.remove('open');
+      showToast('Настройки потока сохранены');
+    });
+    btnResetFilters.addEventListener('click', () => {
+      showToast('Фильтры сброшены');
+      modalFilters.classList.remove('open');
+    });
+
+    // Karaoke overlay
+    const karaokeOverlay = document.getElementById('karaokeOverlay');
+    const btnKaraokeOpen = document.getElementById('btn-karaoke-open');
+    const btnKaraokeClose = document.getElementById('btn-karaoke-close');
+    const coverClick = document.getElementById('coverClick');
+
+    btnKaraokeOpen.addEventListener('click', () => karaokeOverlay.classList.add('active'));
+    coverClick.addEventListener('click', () => karaokeOverlay.classList.add('active'));
+    btnKaraokeClose.addEventListener('click', () => karaokeOverlay.classList.remove('active'));
+
+    // Track navigation
+    const tracks = [
+      { title: 'Midnight City', artist: 'M83 • Hurry Up, We\'re Dreaming', color: '#ff6b4a' },
+      { title: 'Star Guitar', artist: 'The Chemical Brothers • Come with Us', color: '#3584e4' },
+      { title: 'Resonance', artist: 'HOME • Odyssey', color: '#9c27b0' }
+    ];
+    let curTrack = 0;
+    const islandNext = document.getElementById('island-next');
+    const islandPrev = document.getElementById('island-prev');
+    const heroTitle = document.getElementById('heroTitle');
+    const heroArtist = document.getElementById('heroArtist');
+    const islandTitle = document.getElementById('islandTitle');
+    const islandArtist = document.getElementById('islandArtist');
+
+    function setTrack(idx) {
+      curTrack = (idx + tracks.length) % tracks.length;
+      const t = tracks[curTrack];
+      heroTitle.innerText = t.title;
+      heroArtist.innerText = t.artist;
+      islandTitle.innerText = t.title;
+      islandArtist.innerText = t.artist.split('•')[0].trim();
+      currentTime = 0;
+      islandSeekBar.value = 0;
+      islandTimeCurr.innerText = "00:00";
+      showToast(`Играет: ${t.title}`);
+    }
+
+    islandNext.addEventListener('click', () => setTrack(curTrack + 1));
+    islandPrev.addEventListener('click', () => setTrack(curTrack - 1));
+  </script>
+</body>
+</html>

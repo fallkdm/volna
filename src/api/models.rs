@@ -1,0 +1,273 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Вспомогательная функция для десериализации ID как строки из числа или строки
+fn deserialize_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        _ => Ok(v.to_string()),
+    }
+}
+
+/// Стандартный ответ Яндекс Музыки с полем `result`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YandexApiResponse<T> {
+    pub result: T,
+}
+
+/// Артист
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Artist {
+    #[serde(deserialize_with = "deserialize_id")]
+    pub id: String,
+    pub name: String,
+    pub cover: Option<ArtistCover>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArtistCover {
+    pub uri: Option<String>,
+}
+
+/// Альбом
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Album {
+    #[serde(deserialize_with = "deserialize_id")]
+    pub id: String,
+    pub title: Option<String>,
+    pub year: Option<u32>,
+    #[serde(rename = "coverUri")]
+    pub cover_uri: Option<String>,
+}
+
+/// Трек
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Track {
+    #[serde(deserialize_with = "deserialize_id")]
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub artists: Vec<Artist>,
+    #[serde(default)]
+    pub albums: Vec<Album>,
+    #[serde(rename = "durationMs")]
+    pub duration_ms: Option<u64>,
+    #[serde(rename = "coverUri")]
+    pub cover_uri: Option<String>,
+    #[serde(rename = "ogImage")]
+    pub og_image: Option<String>,
+    pub available: Option<bool>,
+}
+
+impl Track {
+    /// Возвращает имена артистов через запятую
+    pub fn artists_string(&self) -> String {
+        if self.artists.is_empty() {
+            "Неизвестный исполнитель".to_string()
+        } else {
+            self.artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    /// Формирует URL обложки с заданным размером (например, 200, 400)
+    pub fn cover_url(&self, size: u32) -> Option<String> {
+        let uri = self.cover_uri.as_ref().or(self.og_image.as_ref())?;
+        let size_str = format!("{}x{}", size, size);
+        let path = uri.replace("%%", &size_str);
+        if path.starts_with("http://") || path.starts_with("https://") {
+            Some(path)
+        } else {
+            Some(format!("https://{}", path))
+        }
+    }
+
+    /// Возвращает длительность в формате "MM:SS"
+    pub fn formatted_duration(&self) -> String {
+        let total_secs = self.duration_ms.unwrap_or(0) / 1000;
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        format!("{:02}:{:02}", mins, secs)
+    }
+}
+
+/// Идентификатор станции Ротора
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RotorStationId {
+    #[serde(rename = "type")]
+    pub station_type: String,
+    pub tag: String,
+}
+
+impl RotorStationId {
+    pub fn new(station_type: &str, tag: &str) -> Self {
+        Self {
+            station_type: station_type.to_string(),
+            tag: tag.to_string(),
+        }
+    }
+
+    pub fn to_station_string(&self) -> String {
+        format!("{}:{}", self.station_type, self.tag)
+    }
+}
+
+/// Иконка станции
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RotorIcon {
+    #[serde(rename = "backgroundColor")]
+    pub background_color: Option<String>,
+    #[serde(rename = "imageUrl")]
+    pub image_url: Option<String>,
+}
+
+/// Станция Ротора («Моя волна» и др.)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RotorStation {
+    pub id: RotorStationId,
+    pub name: Option<String>,
+    pub icon: Option<RotorIcon>,
+}
+
+/// Элемент последовательности треков в станции
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotorSequenceItem {
+    pub track: Track,
+    pub liked: Option<bool>,
+}
+
+/// Ответ списка треков станции
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotorStationTracks {
+    #[serde(rename = "batchId")]
+    pub batch_id: Option<String>,
+    pub sequence: Vec<RotorSequenceItem>,
+}
+
+/// Тип события обратной связи для станции
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotorFeedbackType {
+    TrackStarted,
+    TrackFinished,
+    Skip,
+    Like,
+    Dislike,
+}
+
+impl RotorFeedbackType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TrackStarted => "trackStarted",
+            Self::TrackFinished => "trackFinished",
+            Self::Skip => "skip",
+            Self::Like => "like",
+            Self::Dislike => "dislike",
+        }
+    }
+}
+
+impl Serialize for RotorFeedbackType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RotorFeedbackType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "trackStarted" => Ok(Self::TrackStarted),
+            "trackFinished" => Ok(Self::TrackFinished),
+            "skip" => Ok(Self::Skip),
+            "like" => Ok(Self::Like),
+            "dislike" => Ok(Self::Dislike),
+            _ => Err(serde::de::Error::custom(format!("Unknown feedback type: {}", s))),
+        }
+    }
+}
+
+/// Запрос обратной связи (Feedback)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotorFeedback {
+    #[serde(rename = "type")]
+    pub feedback_type: RotorFeedbackType,
+    #[serde(rename = "trackId")]
+    pub track_id: String,
+    pub timestamp: String,
+    #[serde(rename = "totalPlayedSeconds", skip_serializing_if = "Option::is_none")]
+    pub total_played_seconds: Option<f64>,
+    #[serde(rename = "batchId", skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    #[serde(rename = "from", skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+/// Информация о варианте скачивания трека
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadInfo {
+    pub codec: String,
+    #[serde(rename = "bitrateInKbps")]
+    pub bitrate_in_kbps: u32,
+    #[serde(rename = "downloadInfoUrl")]
+    pub download_info_url: String,
+    #[serde(default)]
+    pub direct: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_track_deserialization_and_helpers() {
+        let json_data = r#"{
+            "id": 1234567,
+            "title": "Спокойная ночь",
+            "artists": [{"id": "41126", "name": "Кино"}],
+            "albums": [{"id": 123, "title": "Группа крови", "year": 1988}],
+            "durationMs": 367000,
+            "coverUri": "avatars.yandex.net/get-music-content/12345/%%"
+        }"#;
+
+        let track: Track = serde_json::from_str(json_data).expect("Must deserialize track");
+        assert_eq!(track.id, "1234567");
+        assert_eq!(track.title, "Спокойная ночь");
+        assert_eq!(track.artists_string(), "Кино");
+        assert_eq!(track.formatted_duration(), "06:07");
+        assert_eq!(
+            track.cover_url(400),
+            Some("https://avatars.yandex.net/get-music-content/12345/400x400".to_string())
+        );
+    }
+
+    #[test]
+    fn test_feedback_serialization() {
+        let fb = RotorFeedback {
+            feedback_type: RotorFeedbackType::TrackStarted,
+            track_id: "123".to_string(),
+            timestamp: "2026-10-13T19:00:00Z".to_string(),
+            total_played_seconds: Some(42.5),
+            batch_id: Some("b1".to_string()),
+            from: Some("volna".to_string()),
+        };
+
+        let json = serde_json::to_string(&fb).unwrap();
+        assert!(json.contains("\"type\":\"trackStarted\""));
+        assert!(json.contains("\"trackId\":\"123\""));
+        assert!(json.contains("\"totalPlayedSeconds\":42.5"));
+    }
+}
+

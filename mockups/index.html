@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Волна — Интерактивная витрина вариантов дизайна (Rust + Libadwaita)</title>
+  <link rel="stylesheet" href="libadwaita.css">
+  <style>
+    body {
+      background: #181818;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Showcase Top Bar */
+    .showcase-header {
+      background: #242424;
+      border-bottom: 1px solid var(--adw-border);
+      padding: 10px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      z-index: 50;
+    }
+
+    .brand-section {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-icon {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #3584e4, #ff6b4a);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 12px rgba(53, 132, 228, 0.4);
+    }
+
+    /* Main Variant Tabs */
+    .variant-tabs {
+      display: flex;
+      background: rgba(0, 0, 0, 0.35);
+      padding: 4px;
+      border-radius: var(--adw-radius-pill);
+      border: 1px solid var(--adw-border);
+      gap: 2px;
+    }
+    .variant-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--adw-text-secondary);
+      padding: 7px 16px;
+      border-radius: var(--adw-radius-pill);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+    }
+    .variant-tab-btn:hover {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .variant-tab-btn.active {
+      background: var(--adw-accent);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(53, 132, 228, 0.4);
+    }
+
+    /* Viewport Resizer Controls */
+    .viewport-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .res-btn {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--adw-border);
+      color: var(--adw-text-secondary);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s;
+    }
+    .res-btn:hover {
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+    }
+    .res-btn.active {
+      background: rgba(255, 255, 255, 0.18);
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.3);
+    }
+
+    /* Main Showcase Canvas / Stage */
+    .showcase-stage {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #121212;
+      overflow: hidden;
+      position: relative;
+      padding: 16px;
+    }
+
+    /* Mockup IFrame Frame */
+    .frame-wrapper {
+      width: 100%;
+      height: 100%;
+      border-radius: var(--adw-radius-window);
+      overflow: hidden;
+      box-shadow: 0 16px 50px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.12);
+      transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+      background: #242424;
+    }
+
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #1e1e1e;
+    }
+
+    /* Mini-player Standalone Stage */
+    .mini-player-stage {
+      display: none;
+      width: 100%;
+      height: 100%;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 24px;
+    }
+    .mini-player-stage.active {
+      display: flex;
+    }
+
+    .mini-player-window {
+      width: 330px;
+      background: rgba(32, 32, 32, 0.95);
+      backdrop-filter: blur(20px);
+      border-radius: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.7);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      user-select: none;
+    }
+    .mini-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 8px;
+    }
+    .mini-track {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .mini-art {
+      width: 50px;
+      height: 50px;
+      border-radius: 8px;
+      background: #3584e4;
+      object-fit: cover;
+    }
+    .mini-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 6px;
+    }
+
+    /* Bottom Info Card */
+    .info-bar {
+      background: #1f1f1f;
+      border-top: 1px solid var(--adw-border);
+      padding: 8px 18px;
+      font-size: 12px;
+      color: var(--adw-text-secondary);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+  </style>
+</head>
+<body>
+  <!-- Top Showcase Navigation Bar -->
+  <header class="showcase-header">
+    <div class="brand-section">
+      <div class="brand-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="#fff">
+          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+        </svg>
+      </div>
+      <div>
+        <div style="font-weight:700; font-size:15px; display:flex; align-items:center; gap:8px;">
+          Волна (Volna)
+          <span class="adw-badge accent">Rust + GTK4 / Libadwaita</span>
+        </div>
+        <div style="font-size:11px; color:var(--adw-text-dim);">Цель: ~35 МБ RAM (vs 800+ МБ Electron)</div>
+      </div>
+    </div>
+
+    <!-- Variant Tabs -->
+    <div class="variant-tabs">
+      <button class="variant-tab-btn active" data-src="variant1_classic.html" data-desc="Вариант 1: Классический Libadwaita SplitView со сбалансированным сайдбаром и нативным медиабаром">
+        1. GNOME Classic
+      </button>
+      <button class="variant-tab-btn" data-src="variant2_fluid.html" data-desc="Вариант 2: Фокус на стриминг, органическая Hero-волна с шейдером, парящий остров-плеер и караоке">
+        2. Wave-First & Fluid
+      </button>
+      <button class="variant-tab-btn" data-src="variant3_studio.html" data-desc="Вариант 3: Трёхколоночный плотный вид, радар рекомендаций ML-Match, таблица треков и студийный медиабар">
+        3. Compact Studio
+      </button>
+      <button class="variant-tab-btn" data-mode="mini" data-desc="Режим мини-плеера (Picture-in-Picture виджет поверх всех окон 330x150px)">
+        🪟 Мини-плеер
+      </button>
+    </div>
+
+    <!-- Responsive Viewport Presets -->
+    <div class="viewport-controls" id="resControls">
+      <button class="res-btn active" data-w="100%" data-h="100%">🖥 100%</button>
+      <button class="res-btn" data-w="1024px" data-h="680px">💻 1024×680</button>
+      <button class="res-btn" data-w="740px" data-h="640px">📱 740×640</button>
+      <button class="res-btn" data-w="420px" data-h="600px">📳 420×600</button>
+      <a href="variant1_classic.html" target="_blank" class="res-btn" id="openExternalLink" title="Открыть в отдельной вкладке браузера">↗ Новая вкладка</a>
+    </div>
+  </header>
+
+  <!-- Showcase Stage -->
+  <main class="showcase-stage">
+    <!-- IFrame Wrapper -->
+    <div class="frame-wrapper" id="frameWrapper">
+      <iframe src="variant1_classic.html" id="previewIframe" title="Mockup Preview"></iframe>
+    </div>
+
+    <!-- Mini-player Standalone Preview Stage -->
+    <div class="mini-player-stage" id="miniPlayerStage">
+      <div class="mini-player-window">
+        <div class="mini-header">
+          <div style="display:flex; align-items:center; gap:6px;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="#3584e4"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+            <span style="font-size:12px; font-weight:700;">Волна Мини-плеер</span>
+          </div>
+          <div style="display:flex; gap:6px;">
+            <button class="adw-win-btn" style="width:18px; height:18px; font-size:9px;" title="Поверх всех окон">📌</button>
+            <button class="adw-win-btn close" style="width:18px; height:18px; font-size:9px;" id="btnReturnFull">✕</button>
+          </div>
+        </div>
+
+        <div class="mini-track">
+          <img src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80' viewBox='0 0 80 80'><rect fill='%23ff6b4a' width='80' height='80'/><circle cx='40' cy='40' r='25' fill='%23222'/><polygon points='35,30 55,40 35,50' fill='%23fff'/></svg>" class="mini-art" id="mArt" alt="Art">
+          <div style="overflow:hidden; flex:1;">
+            <div style="font-size:13px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" id="mTitle">Midnight City</div>
+            <div style="font-size:11px; color:var(--adw-text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" id="mArtist">M83</div>
+            <div style="font-size:10px; color:var(--adw-accent); margin-top:2px;">Моя волна • HQ 320k</div>
+          </div>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-size:10px; color:var(--adw-text-dim);" id="mTimeCurr">02:14</span>
+          <input type="range" class="adw-scale" id="mSeekBar" min="0" max="243" value="134">
+          <span style="font-size:10px; color:var(--adw-text-dim);">04:03</span>
+        </div>
+
+        <div class="mini-controls">
+          <button class="reaction-btn" id="mDislike" title="Дислайк">
+            <svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.58-6.59c.37-.36.59-.86.59-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>
+          </button>
+          <button class="reaction-btn liked" id="mLike" title="Лайк">
+            <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+          </button>
+          <button class="adw-btn flat circular" id="mPrev" style="width:30px; height:30px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+          </button>
+          <button class="adw-btn circular suggested-action" id="mPlay" style="width:36px; height:36px;">
+            <svg id="mPlayIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M8 5v14l11-7z"/></svg>
+            <svg id="mPauseIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+          </button>
+          <button class="adw-btn flat circular" id="mNext" style="width:30px; height:30px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+          </button>
+        </div>
+      </div>
+      <div style="font-size:12px; color:var(--adw-text-dim); text-align:center;">
+        💡 Компактный режим для размещения поверх рабочих окон, кодинга или работы с документами.
+      </div>
+    </div>
+  </main>
+
+  <!-- Bottom Info Footer -->
+  <footer class="info-bar">
+    <div id="variantDescription">
+      Вариант 1: Классический Libadwaita SplitView со сбалансированным сайдбаром и нативным медиабаром
+    </div>
+    <div style="display:flex; gap:16px;">
+      <span>Память: <b>~28–35 МБ RAM</b></span>
+      <span>Движок: <b>GStreamer + Rust</b></span>
+      <span>Виджеты: <b>GTK4 + Libadwaita 1.5+</b></span>
+    </div>
+  </footer>
+
+  <script>
+    const tabBtns = document.querySelectorAll('.variant-tab-btn');
+    const iframe = document.getElementById('previewIframe');
+    const frameWrapper = document.getElementById('frameWrapper');
+    const miniPlayerStage = document.getElementById('miniPlayerStage');
+    const descEl = document.getElementById('variantDescription');
+    const extLink = document.getElementById('openExternalLink');
+    const resControls = document.getElementById('resControls');
+
+    tabBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        tabBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+
+        const mode = btn.getAttribute('data-mode');
+        const desc = btn.getAttribute('data-desc');
+        descEl.innerText = desc;
+
+        if (mode === 'mini') {
+          frameWrapper.style.display = 'none';
+          miniPlayerStage.classList.add('active');
+          resControls.style.display = 'none';
+        } else {
+          frameWrapper.style.display = 'flex';
+          miniPlayerStage.classList.remove('active');
+          resControls.style.display = 'flex';
+
+          const src = btn.getAttribute('data-src');
+          iframe.src = src;
+          extLink.href = src;
+        }
+      });
+    });
+
+    // Viewport presets
+    const resBtns = document.querySelectorAll('.res-btn[data-w]');
+    resBtns.forEach(rb => {
+      rb.addEventListener('click', () => {
+        resBtns.forEach(b => b.classList.remove('active'));
+        rb.classList.add('active');
+        const w = rb.getAttribute('data-w');
+        const h = rb.getAttribute('data-h');
+        frameWrapper.style.width = w;
+        frameWrapper.style.height = h;
+      });
+    });
+
+    // Mini-player interactive controls
+    let mPlaying = true;
+    let mCur = 134;
+    const mTotal = 243;
+    const mPlay = document.getElementById('mPlay');
+    const mPlayIcon = document.getElementById('mPlayIcon');
+    const mPauseIcon = document.getElementById('mPauseIcon');
+    const mSeekBar = document.getElementById('mSeekBar');
+    const mTimeCurr = document.getElementById('mTimeCurr');
+    const btnReturnFull = document.getElementById('btnReturnFull');
+
+    btnReturnFull.addEventListener('click', () => {
+      tabBtns[0].click();
+    });
+
+    mPlay.addEventListener('click', () => {
+      mPlaying = !mPlaying;
+      mPlayIcon.style.display = mPlaying ? 'none' : 'block';
+      mPauseIcon.style.display = mPlaying ? 'block' : 'none';
+    });
+
+    setInterval(() => {
+      if (mPlaying && miniPlayerStage.classList.contains('active')) {
+        mCur++;
+        if (mCur > mTotal) mCur = 0;
+        mSeekBar.value = mCur;
+        const m = Math.floor(mCur / 60);
+        const s = Math.floor(mCur % 60);
+        mTimeCurr.innerText = `0${m}:${s < 10 ? '0' : ''}${s}`;
+      }
+    }, 1000);
+
+    const mLike = document.getElementById('mLike');
+    const mDislike = document.getElementById('mDislike');
+    mLike.addEventListener('click', () => mLike.classList.toggle('liked'));
+    mDislike.addEventListener('click', () => mDislike.classList.toggle('disliked'));
+  </script>
+</body>
+</html>

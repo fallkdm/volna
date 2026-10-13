@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Волна — Вариант 3: Compact Studio / Hybrid Minimal</title>
+  <link rel="stylesheet" href="libadwaita.css">
+  <style>
+    body {
+      background: #1b1b1b;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* Top Studio Header */
+    .studio-header {
+      height: 44px;
+      background: #232323;
+      border-bottom: 1px solid var(--adw-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      z-index: 10;
+    }
+    .quick-search-box {
+      width: 280px;
+      display: flex;
+      align-items: center;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--adw-border);
+      border-radius: 6px;
+      padding: 4px 10px;
+      gap: 6px;
+    }
+    .quick-search-box input {
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-size: 12px;
+      width: 100%;
+      outline: none;
+    }
+
+    /* Three Column Studio Grid */
+    .studio-body {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Left Slim Rail Sidebar (60px) */
+    .slim-rail {
+      width: 58px;
+      min-width: 58px;
+      background: #1d1d1d;
+      border-right: 1px solid var(--adw-border);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 10px 0;
+      gap: 12px;
+    }
+    .rail-btn {
+      width: 42px;
+      height: 42px;
+      border-radius: 8px;
+      background: transparent;
+      border: none;
+      color: var(--adw-text-secondary);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      gap: 3px;
+      transition: all 0.15s ease;
+      font-size: 9px;
+      font-weight: 600;
+    }
+    .rail-btn:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+    }
+    .rail-btn.active {
+      background: var(--adw-accent);
+      color: #fff;
+    }
+    .rail-btn svg {
+      width: 18px;
+      height: 18px;
+      fill: currentColor;
+    }
+
+    /* Center Main Queue / Table Area */
+    .center-column {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: #1e1e1e;
+      overflow-y: auto;
+      border-right: 1px solid var(--adw-border);
+    }
+
+    .studio-toolbar-strip {
+      padding: 10px 16px;
+      background: #222;
+      border-bottom: 1px solid var(--adw-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .preset-chips {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* High Density Table (GtkColumnView) */
+    .track-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .track-table th {
+      text-align: left;
+      padding: 8px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--adw-text-dim);
+      border-bottom: 1px solid var(--adw-border);
+      position: sticky;
+      top: 0;
+      background: #1e1e1e;
+      z-index: 5;
+    }
+    .track-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+      color: var(--adw-text-secondary);
+    }
+    .track-row {
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+    .track-row:hover {
+      background: rgba(255, 255, 255, 0.05);
+      color: #fff;
+    }
+    .track-row.now-playing {
+      background: rgba(53, 132, 228, 0.15);
+      color: #fff;
+      font-weight: 600;
+    }
+    .track-row.now-playing td:first-child {
+      color: var(--adw-accent);
+    }
+
+    /* Right Studio Panel (Radar & Details) */
+    .right-studio-panel {
+      width: 320px;
+      min-width: 300px;
+      background: #191919;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 14px;
+      gap: 16px;
+    }
+    .studio-card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--adw-border);
+      border-radius: var(--adw-radius-card);
+      padding: 12px;
+    }
+    .card-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--adw-text-dim);
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .radar-canvas-wrap {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 180px;
+    }
+
+    .now-playing-mini-box {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .now-playing-mini-art {
+      width: 64px;
+      height: 64px;
+      border-radius: 8px;
+      background: #333;
+    }
+
+    .lyrics-stream-box {
+      font-size: 12px;
+      line-height: 1.6;
+      color: var(--adw-text-dim);
+      max-height: 140px;
+      overflow-y: auto;
+    }
+    .lyrics-stream-line.active {
+      color: #fff;
+      font-weight: 700;
+      font-size: 13px;
+    }
+
+    /* Dense Studio Bottom Player */
+    .studio-player-bar {
+      height: 64px;
+      background: #171717;
+      border-top: 1px solid var(--adw-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      z-index: 20;
+    }
+
+    .studio-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 250px;
+    }
+    .studio-center {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      flex: 1;
+      max-width: 520px;
+    }
+    .studio-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 280px;
+      justify-content: flex-end;
+    }
+
+    /* Modal EQ */
+    .eq-popup {
+      position: absolute;
+      bottom: 74px;
+      right: 20px;
+      width: 320px;
+      background: #242424;
+      border: 1px solid var(--adw-border);
+      border-radius: var(--adw-radius-card);
+      padding: 16px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+      display: none;
+      z-index: 100;
+    }
+    .eq-popup.open {
+      display: block;
+    }
+    .eq-sliders {
+      display: flex;
+      justify-content: space-between;
+      height: 120px;
+      margin: 12px 0;
+    }
+    .eq-col {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    .eq-col input[type="range"] {
+      writing-mode: vertical-lr;
+      direction: rtl;
+      width: 6px;
+      height: 90px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <header class="studio-header">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <span style="font-weight:700; font-size:14px;">Волна Studio</span>
+      <span class="adw-badge accent">Hybrid Minimal</span>
+    </div>
+
+    <div class="quick-search-box">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="opacity:0.6;"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+      <input type="text" placeholder="Быстрый поиск (Ctrl+K)">
+    </div>
+
+    <div class="adw-window-controls">
+      <button class="adw-win-btn" title="Свернуть">─</button>
+      <button class="adw-win-btn" title="Развернуть">□</button>
+      <button class="adw-win-btn close" title="Закрыть">✕</button>
+    </div>
+  </header>
+
+  <!-- Studio Body -->
+  <div class="studio-body">
+    <!-- Slim Rail (Left) -->
+    <nav class="slim-rail">
+      <button class="rail-btn active" title="Моя волна (Поток)">
+        <svg viewBox="0 0 24 24"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+        <span>Волна</span>
+      </button>
+      <button class="rail-btn" title="Очередь воспроизведения">
+        <svg viewBox="0 0 24 24"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg>
+        <span>Очередь</span>
+      </button>
+      <button class="rail-btn" title="Медиатека">
+        <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
+        <span>Коллекция</span>
+      </button>
+      <button class="rail-btn" id="btn-toggle-eq" title="10-полосный эквалайзер">
+        <svg viewBox="0 0 24 24"><path d="M10 18h4v-2h-4v2zM3 6v2h18V6H3zm3 7h12v-2H6v2z"/></svg>
+        <span>ЭКВ</span>
+      </button>
+    </nav>
+
+    <!-- Center Column (Track Flow & Controls) -->
+    <main class="center-column">
+      <div class="studio-toolbar-strip">
+        <div class="preset-chips">
+          <span style="font-size:12px; color:var(--adw-text-dim); margin-right:4px;">Пресеты Волны:</span>
+          <button class="adw-btn pill suggested-action" style="padding:4px 12px; font-size:12px;">👨‍💻 Кодинг</button>
+          <button class="adw-btn pill" style="padding:4px 12px; font-size:12px;">🏃 Спорт</button>
+          <button class="adw-btn pill" style="padding:4px 12px; font-size:12px;">🌙 Чилл</button>
+          <button class="adw-btn flat circular" style="width:26px; height:26px;" title="Добавить пресет">+</button>
+        </div>
+
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span class="adw-badge">Авто-микширование: 1.5s</span>
+          <button class="adw-btn flat" style="padding:4px 8px; font-size:12px;">Настройки потока ▾</button>
+        </div>
+      </div>
+
+      <!-- High Density Table -->
+      <table class="track-table">
+        <thead>
+          <tr>
+            <th style="width:30px;">#</th>
+            <th>Название</th>
+            <th>Исполнитель</th>
+            <th>Альбом</th>
+            <th>Битрейт</th>
+            <th style="width:60px;">Время</th>
+            <th style="width:40px;">Лайк</th>
+          </tr>
+        </thead>
+        <tbody id="trackTableBody">
+          <tr class="track-row now-playing" data-idx="0">
+            <td>▶</td>
+            <td>Star Guitar</td>
+            <td>The Chemical Brothers</td>
+            <td>Come with Us</td>
+            <td><span class="adw-badge accent">FLAC 16/44</span></td>
+            <td>03:59</td>
+            <td>❤️</td>
+          </tr>
+          <tr class="track-row" data-idx="1">
+            <td>2</td>
+            <td>Genesis</td>
+            <td>Justice</td>
+            <td>† (Cross)</td>
+            <td><span class="adw-badge">320 kbps</span></td>
+            <td>03:54</td>
+            <td>♡</td>
+          </tr>
+          <tr class="track-row" data-idx="2">
+            <td>3</td>
+            <td>Nightcall</td>
+            <td>Kavinsky</td>
+            <td>OutRun</td>
+            <td><span class="adw-badge accent">FLAC 16/44</span></td>
+            <td>04:19</td>
+            <td>❤️</td>
+          </tr>
+          <tr class="track-row" data-idx="3">
+            <td>4</td>
+            <td>Resonance</td>
+            <td>HOME</td>
+            <td>Odyssey</td>
+            <td><span class="adw-badge">320 kbps</span></td>
+            <td>03:32</td>
+            <td>♡</td>
+          </tr>
+          <tr class="track-row" data-idx="4">
+            <td>5</td>
+            <td>Midnight City</td>
+            <td>M83</td>
+            <td>Hurry Up, We're Dreaming</td>
+            <td><span class="adw-badge accent">FLAC 24/48</span></td>
+            <td>04:03</td>
+            <td>❤️</td>
+          </tr>
+          <tr class="track-row" data-idx="5">
+            <td>6</td>
+            <td>Instant Crush</td>
+            <td>Daft Punk</td>
+            <td>Random Access Memories</td>
+            <td><span class="adw-badge accent">FLAC 24/88</span></td>
+            <td>05:37</td>
+            <td>❤️</td>
+          </tr>
+        </tbody>
+      </table>
+    </main>
+
+    <!-- Right Column (Now Playing & Wave Radar) -->
+    <aside class="right-studio-panel">
+      <!-- Now Playing Card -->
+      <div class="studio-card">
+        <div class="card-title">
+          <span>Сейчас играет</span>
+          <span style="color:var(--adw-accent);">Моя волна</span>
+        </div>
+        <div class="now-playing-mini-box">
+          <img src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80' viewBox='0 0 80 80'><rect fill='%2326a269' width='80' height='80'/><circle cx='40' cy='40' r='25' fill='%23111'/><circle cx='40' cy='40' r='10' fill='%235ea1f4'/></svg>" class="now-playing-mini-art" alt="Art">
+          <div>
+            <div style="font-weight:700; font-size:14px;" id="stTrackTitle">Star Guitar</div>
+            <div style="font-size:12px; color:var(--adw-text-secondary);" id="stTrackArtist">The Chemical Brothers</div>
+            <div style="font-size:11px; color:var(--adw-text-dim); margin-top:2px;">FLAC 44.1kHz • 912 kbps</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recommendation Radar -->
+      <div class="studio-card">
+        <div class="card-title">
+          <span>Радар рекомендаций</span>
+          <span style="color:var(--adw-success);">ML-Match 96%</span>
+        </div>
+        <div class="radar-canvas-wrap">
+          <canvas id="radarCanvas" width="220" height="180"></canvas>
+        </div>
+        <div style="font-size:11px; color:var(--adw-text-secondary); line-height:1.4; border-top:1px solid var(--adw-border); padding-top:8px;">
+          💡 <b>Причина подбора:</b> Высокая гармония с Justice, Daft Punk и вашим плейлистом «Электроника для работы».
+        </div>
+      </div>
+
+      <!-- Live Lyrics Stream -->
+      <div class="studio-card">
+        <div class="card-title">
+          <span>Текст песни (Live)</span>
+          <span class="adw-badge">Синхронно</span>
+        </div>
+        <div class="lyrics-stream-box">
+          <div class="lyrics-stream-line">You should feel what I feel</div>
+          <div class="lyrics-stream-line active">▶ You should take what I take</div>
+          <div class="lyrics-stream-line">Maybe then you'd understand</div>
+          <div class="lyrics-stream-line">What it's like to be in love</div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Equalizer Popup -->
+  <div class="eq-popup" id="eqPopup">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="font-weight:700; font-size:13px;">10-полосный эквалайзер</span>
+      <button class="adw-btn flat circular" id="btn-close-eq" style="width:24px; height:24px;">✕</button>
+    </div>
+    <div class="eq-sliders">
+      <div class="eq-col"><input type="range" min="-12" max="12" value="3"><span style="font-size:9px;">32</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="4"><span style="font-size:9px;">64</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="2"><span style="font-size:9px;">125</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="0"><span style="font-size:9px;">250</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="-1"><span style="font-size:9px;">500</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="1"><span style="font-size:9px;">1k</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="3"><span style="font-size:9px;">2k</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="4"><span style="font-size:9px;">4k</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="5"><span style="font-size:9px;">8k</span></div>
+      <div class="eq-col"><input type="range" min="-12" max="12" value="6"><span style="font-size:9px;">16k</span></div>
+    </div>
+    <div style="display:flex; justify-content:space-between;">
+      <button class="adw-btn" style="font-size:11px; padding:4px 8px;">Сброс (Flat)</button>
+      <span style="font-size:11px; color:var(--adw-text-dim);">Пресет: Electronic Bass</span>
+    </div>
+  </div>
+
+  <!-- Studio Bottom Player Bar -->
+  <footer class="studio-player-bar">
+    <div class="studio-left">
+      <div style="overflow:hidden;">
+        <div style="font-size:13px; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" id="barTitle">Star Guitar</div>
+        <div style="font-size:11px; color:var(--adw-text-secondary);" id="barArtist">The Chemical Brothers</div>
+      </div>
+      <button class="reaction-btn" id="stDislike" title="Дислайк (D)">
+        <svg viewBox="0 0 24 24"><path d="M15 3H6c-.83 0-1.54.5-1.84 1.22l-3.02 7.05c-.09.23-.14.47-.14.73v2c0 1.1.9 2 2 2h6.31l-.95 4.57-.03.32c0 .41.17.79.44 1.06L9.83 23l6.58-6.59c.37-.36.59-.86.59-1.41V5c0-1.1-.9-2-2-2zm4 0v12h4V3h-4z"/></svg>
+      </button>
+      <button class="reaction-btn liked" id="stLike" title="Лайк (L)">
+        <svg viewBox="0 0 24 24"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      </button>
+    </div>
+
+    <!-- Center -->
+    <div class="studio-center">
+      <div style="display:flex; align-items:center; gap:14px;">
+        <button class="adw-btn flat circular" id="stPrev" style="width:28px; height:28px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg></button>
+        <button class="adw-btn circular suggested-action" id="stPlay" style="width:36px; height:36px;">
+          <svg id="stPlayIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M8 5v14l11-7z"/></svg>
+          <svg id="stPauseIcon" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+        </button>
+        <button class="adw-btn flat circular" id="stNext" style="width:28px; height:28px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg></button>
+      </div>
+
+      <div class="progress-bar-container">
+        <span class="time-label" id="stTimeCurr" style="min-width:48px;">01:12.4</span>
+        <input type="range" class="adw-scale" id="stSeekBar" min="0" max="239" value="72">
+        <span class="time-label" style="min-width:48px;">03:59.0</span>
+      </div>
+    </div>
+
+    <!-- Right -->
+    <div class="studio-right">
+      <button class="adw-btn flat" id="qualitySelector" style="font-size:11px; padding:3px 8px; border:1px solid var(--adw-border);">
+        FLAC (Lossless) ▾
+      </button>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <span style="font-size:11px; color:var(--adw-text-dim);" id="volLabel">85%</span>
+        <input type="range" class="adw-scale" id="stVolBar" min="0" max="100" value="85" style="width:70px;">
+      </div>
+    </div>
+  </footer>
+
+  <div class="adw-toast" id="toast">Действие выполнено</div>
+
+  <script>
+    let isPlaying = true;
+    let currentTime = 72;
+    const duration = 239;
+
+    // Toast
+    const toast = document.getElementById('toast');
+    function showToast(msg) {
+      toast.innerText = msg;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2000);
+    }
+
+    // Interactive Radar Chart Canvas
+    const radar = document.getElementById('radarCanvas');
+    const rCtx = radar.getContext('2d');
+    const attributes = [
+      { label: 'Энергия', val: 0.88 },
+      { label: 'Танец', val: 0.75 },
+      { label: 'Акустика', val: 0.15 },
+      { label: 'Инструмент.', val: 0.82 },
+      { label: 'Позитив', val: 0.65 }
+    ];
+
+    function drawRadar() {
+      rCtx.clearRect(0, 0, radar.width, radar.height);
+      const cx = radar.width / 2;
+      const cy = radar.height / 2 + 5;
+      const maxRadius = 60;
+      const numAxes = attributes.length;
+
+      // Draw web grid
+      for (let level = 1; level <= 3; level++) {
+        const r = (maxRadius / 3) * level;
+        rCtx.beginPath();
+        for (let i = 0; i <= numAxes; i++) {
+          const angle = (i / numAxes) * Math.PI * 2 - Math.PI / 2;
+          const x = cx + Math.cos(angle) * r;
+          const y = cy + Math.sin(angle) * r;
+          if (i === 0) rCtx.moveTo(x, y);
+          else rCtx.lineTo(x, y);
+        }
+        rCtx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+        rCtx.stroke();
+      }
+
+      // Draw Axes & Labels
+      rCtx.font = '9px system-ui';
+      rCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+      rCtx.textAlign = 'center';
+      for (let i = 0; i < numAxes; i++) {
+        const angle = (i / numAxes) * Math.PI * 2 - Math.PI / 2;
+        const x = cx + Math.cos(angle) * (maxRadius + 14);
+        const y = cy + Math.sin(angle) * (maxRadius + 14);
+        rCtx.fillText(attributes[i].label, x, y + 3);
+      }
+
+      // Draw Data Shape
+      rCtx.beginPath();
+      for (let i = 0; i < numAxes; i++) {
+        const angle = (i / numAxes) * Math.PI * 2 - Math.PI / 2;
+        const r = maxRadius * attributes[i].val;
+        const x = cx + Math.cos(angle) * r;
+        const y = cy + Math.sin(angle) * r;
+        if (i === 0) rCtx.moveTo(x, y);
+        else rCtx.lineTo(x, y);
+      }
+      rCtx.closePath();
+      rCtx.fillStyle = 'rgba(53, 132, 228, 0.35)';
+      rCtx.fill();
+      rCtx.strokeStyle = '#3584e4';
+      rCtx.lineWidth = 1.5;
+      rCtx.stroke();
+    }
+    drawRadar();
+
+    // Playback toggle
+    const stPlay = document.getElementById('stPlay');
+    const stPlayIcon = document.getElementById('stPlayIcon');
+    const stPauseIcon = document.getElementById('stPauseIcon');
+
+    function togglePlayback() {
+      isPlaying = !isPlaying;
+      stPlayIcon.style.display = isPlaying ? 'none' : 'block';
+      stPauseIcon.style.display = isPlaying ? 'block' : 'none';
+      showToast(isPlaying ? 'Воспроизведение' : 'Пауза');
+    }
+    stPlay.addEventListener('click', togglePlayback);
+
+    // Time ticker
+    const stSeekBar = document.getElementById('stSeekBar');
+    const stTimeCurr = document.getElementById('stTimeCurr');
+
+    setInterval(() => {
+      if (isPlaying) {
+        currentTime++;
+        if (currentTime > duration) currentTime = 0;
+        stSeekBar.value = currentTime;
+        const m = Math.floor(currentTime / 60);
+        const s = Math.floor(currentTime % 60);
+        stTimeCurr.innerText = `0${m}:${s < 10 ? '0' : ''}${s}.0`;
+      }
+    }, 1000);
+
+    // Track table row selection
+    const rows = document.querySelectorAll('.track-row');
+    const barTitle = document.getElementById('barTitle');
+    const barArtist = document.getElementById('barArtist');
+    const stTrackTitle = document.getElementById('stTrackTitle');
+    const stTrackArtist = document.getElementById('stTrackArtist');
+
+    rows.forEach(row => {
+      row.addEventListener('click', () => {
+        rows.forEach(r => {
+          r.classList.remove('now-playing');
+          r.cells[0].innerText = r.getAttribute('data-idx') === '0' ? '1' : parseInt(r.getAttribute('data-idx')) + 1;
+        });
+        row.classList.add('now-playing');
+        row.cells[0].innerText = '▶';
+        const title = row.cells[1].innerText;
+        const artist = row.cells[2].innerText;
+        barTitle.innerText = title;
+        barArtist.innerText = artist;
+        stTrackTitle.innerText = title;
+        stTrackArtist.innerText = artist;
+        currentTime = 0;
+        stSeekBar.value = 0;
+        showToast(`Выбран трек: ${title}`);
+      });
+    });
+
+    // Equalizer toggle
+    const eqBtn = document.getElementById('btn-toggle-eq');
+    const eqPopup = document.getElementById('eqPopup');
+    const eqClose = document.getElementById('btn-close-eq');
+    eqBtn.addEventListener('click', () => eqPopup.classList.toggle('open'));
+    eqClose.addEventListener('click', () => eqPopup.classList.remove('open'));
+
+    // Volume
+    const stVolBar = document.getElementById('stVolBar');
+    const volLabel = document.getElementById('volLabel');
+    stVolBar.addEventListener('input', (e) => {
+      volLabel.innerText = `${e.target.value}%`;
+    });
+
+    // Quality switch
+    const qualitySelector = document.getElementById('qualitySelector');
+    const qualities = ['FLAC (Lossless) ▾', '320 kbps (HQ) ▾', '192 kbps (Eco) ▾'];
+    let qIdx = 0;
+    qualitySelector.addEventListener('click', () => {
+      qIdx = (qIdx + 1) % qualities.length;
+      qualitySelector.innerText = qualities[qIdx];
+      showToast(`Качество: ${qualities[qIdx].replace(' ▾','')}`);
+    });
+  </script>
+</body>
+</html>
