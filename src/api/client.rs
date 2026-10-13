@@ -4,7 +4,8 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT}
 use std::fmt;
 
 use super::models::{
-    DownloadInfo, RotorFeedback, RotorFeedbackType, RotorStationTracks, YandexApiResponse,
+    AccountStatus, DownloadInfo, LikedTracksResult, RotorFeedback, RotorFeedbackType,
+    RotorStationTracks, SearchResult, Track, TrackSupplement, YandexApiResponse,
 };
 
 const BASE_API_URL: &str = "https://api.music.yandex.net";
@@ -63,6 +64,11 @@ impl YandexMusicClient {
         self.token = token;
     }
 
+    /// Получает текущий токен
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     /// Проверяет, установлен ли токен
     pub fn has_token(&self) -> bool {
         self.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false)
@@ -85,7 +91,33 @@ impl YandexMusicClient {
 
     /// Получает треки станции Ротора (по умолчанию «Моя волна» - "user:onyourwave")
     pub async fn get_station_tracks(&self, station_id: &str) -> Result<RotorStationTracks, ApiError> {
-        let url = format!("{}/rotor/station/{}/tracks", self.base_url, station_id);
+        self.get_station_tracks_with_params(station_id, None, None, None).await
+    }
+
+    /// Получает треки станции Ротора с фильтрами настроения, языка и характера
+    pub async fn get_station_tracks_with_params(
+        &self,
+        station_id: &str,
+        mood: Option<&str>,
+        language: Option<&str>,
+        character: Option<&str>,
+    ) -> Result<RotorStationTracks, ApiError> {
+        let mut url = format!("{}/rotor/station/{}/tracks", self.base_url, station_id);
+        let mut query_params = Vec::new();
+        if let Some(m) = mood {
+            query_params.push(format!("mood={}", m));
+        }
+        if let Some(l) = language {
+            query_params.push(format!("language={}", l));
+        }
+        if let Some(c) = character {
+            query_params.push(format!("diversity={}", c));
+        }
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
         let resp = self
             .client
             .get(&url)
@@ -139,7 +171,6 @@ impl YandexMusicClient {
             )));
         }
 
-        // Выбираем аудио лучшего качества (предпочтительно mp3 с наибольшим битрейтом)
         let best_info = download_infos
             .iter()
             .filter(|i| i.codec == "mp3")
@@ -147,7 +178,6 @@ impl YandexMusicClient {
             .or_else(|| download_infos.first())
             .ok_or_else(|| ApiError::MissingData("Не найден подходящий аудиопоток".into()))?;
 
-        // Запрашиваем метаданные потока (XML)
         let xml_resp = self
             .client
             .get(&best_info.download_info_url)
@@ -157,7 +187,6 @@ impl YandexMusicClient {
             .text()
             .await?;
 
-        // Извлекаем параметры из XML
         let host = extract_xml_tag(&xml_resp, "host")
             .ok_or_else(|| ApiError::XmlParse("Тег <host> не найден".into()))?;
         let path = extract_xml_tag(&xml_resp, "path")
@@ -167,7 +196,6 @@ impl YandexMusicClient {
         let s = extract_xml_tag(&xml_resp, "s")
             .ok_or_else(|| ApiError::XmlParse("Тег <s> не найден".into()))?;
 
-        // Вычисляем MD5 хэш: md5(SALT + path[1..] + s)
         let path_without_leading_slash = if path.starts_with('/') {
             &path[1..]
         } else {
@@ -180,9 +208,117 @@ impl YandexMusicClient {
         let sign_result = hasher.finalize();
         let sign_hex: String = sign_result.iter().map(|b| format!("{:02x}", b)).collect();
 
-        // Прямая ссылка для стриминга
         let direct_url = format!("https://{}/get-mp3/{}/{}{}", host, sign_hex, ts, path);
         Ok(direct_url)
+    }
+
+    /// Поиск треков по поисковому запросу
+    pub async fn search(&self, query: &str) -> Result<Vec<Track>, ApiError> {
+        let url = format!("{}/search?text={}&type=track&page=0", self.base_url, urlencoding_encode(query));
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+        }
+
+        let api_response: YandexApiResponse<SearchResult> = resp.json().await?;
+        let tracks = api_response.result.tracks.map(|t| t.items).unwrap_or_default();
+        Ok(tracks)
+    }
+
+    /// Получение статуса аккаунта пользователя (включая UID)
+    pub async fn get_account_status(&self) -> Result<AccountStatus, ApiError> {
+        let url = format!("{}/account/status", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+        }
+
+        let api_response: YandexApiResponse<AccountStatus> = resp.json().await?;
+        Ok(api_response.result)
+    }
+
+    /// Получение любимых треков («Мне нравится»)
+    pub async fn get_liked_tracks(&self, uid: &str) -> Result<Vec<Track>, ApiError> {
+        let url = format!("{}/users/{}/likes/tracks", self.base_url, uid);
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+        }
+
+        let liked_resp: YandexApiResponse<LikedTracksResult> = resp.json().await?;
+        let track_items = liked_resp.result.library.map(|l| l.tracks).unwrap_or_default();
+        if track_items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Запрашиваем первые 50 полных треков
+        let ids: Vec<String> = track_items.into_iter().take(50).map(|t| t.id).collect();
+        let ids_param = ids.join(",");
+
+        let tracks_url = format!("{}/tracks", self.base_url);
+        let form_body = format!("track-ids={}", ids_param);
+        let mut headers = self.headers();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+
+        let tracks_resp = self
+            .client
+            .post(&tracks_url)
+            .headers(headers)
+            .body(form_body)
+            .send()
+            .await?;
+
+        if !tracks_resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+
+        let full_tracks: YandexApiResponse<Vec<Track>> = tracks_resp.json().await?;
+        Ok(full_tracks.result)
+    }
+
+    /// Запрос синхронизированного текста песни (Караоке LRC)
+    pub async fn get_track_lyrics(&self, track_id: &str) -> Result<Option<String>, ApiError> {
+        let url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let supp: YandexApiResponse<TrackSupplement> = resp.json().await?;
+        Ok(supp.result.lyrics.and_then(|l| l.full_lyrics))
     }
 
     /// Отправляет событие обратной связи (Feedback) в станцию Ротора
@@ -305,6 +441,23 @@ impl YandexMusicClient {
     }
 }
 
+/// Простое URL кодирование строки
+fn urlencoding_encode(s: &str) -> String {
+    let mut encoded = String::new();
+    for b in s.as_bytes() {
+        match *b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*b as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                encoded.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    encoded
+}
+
 /// Извлекает содержимое внутри простого XML тега <tag>...</tag>
 fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     let open_tag = format!("<{}>", tag);
@@ -335,5 +488,10 @@ mod tests {
         assert_eq!(extract_xml_tag(sample_xml, "s"), Some("secret123"));
         assert_eq!(extract_xml_tag(sample_xml, "nonexistent"), None);
     }
-}
 
+    #[test]
+    fn test_urlencode() {
+        assert_eq!(urlencoding_encode("hello world"), "hello+world");
+        assert_eq!(urlencoding_encode("кино"), "%D0%BA%D0%B8%D0%BD%D0%BE");
+    }
+}

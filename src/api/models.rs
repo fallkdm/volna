@@ -1,7 +1,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Вспомогательная функция для десериализации ID как строки из числа или строки
-fn deserialize_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+pub fn deserialize_id<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -227,6 +227,103 @@ pub struct DownloadInfo {
     pub direct: bool,
 }
 
+// ================= Модели Поиска =================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchResultTracks {
+    #[serde(default)]
+    pub items: Vec<Track>,
+    pub total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearchResult {
+    pub tracks: Option<SearchResultTracks>,
+}
+
+// ================= Модели Аккаунта и Медиатеки =================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountStatus {
+    pub account: Option<AccountInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AccountInfo {
+    #[serde(deserialize_with = "deserialize_id")]
+    pub uid: String,
+    pub login: Option<String>,
+    #[serde(rename = "fullName")]
+    pub full_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LikedTrackItem {
+    #[serde(deserialize_with = "deserialize_id")]
+    pub id: String,
+    #[serde(rename = "albumId")]
+    pub album_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LikedTracksResult {
+    pub library: Option<LikedTracksLibrary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LikedTracksLibrary {
+    #[serde(default)]
+    pub tracks: Vec<LikedTrackItem>,
+}
+
+// ================= Модели Синхронизированных Текстов (Lyrics) =================
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrackSupplement {
+    pub lyrics: Option<LyricsInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LyricsInfo {
+    #[serde(rename = "syncType")]
+    pub sync_type: Option<String>,
+    #[serde(rename = "fullLyrics")]
+    pub full_lyrics: Option<String>,
+}
+
+/// Строка синхронизированного караоке
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LrcLine {
+    pub time_ms: u64,
+    pub text: String,
+}
+
+/// Парсит LRC текст формата `[mm:ss.xx] Текст`
+pub fn parse_lrc(lrc_text: &str) -> Vec<LrcLine> {
+    let mut lines = Vec::new();
+    for raw_line in lrc_text.lines() {
+        let trimmed = raw_line.trim();
+        if !trimmed.starts_with('[') {
+            continue;
+        }
+
+        if let Some(close_bracket) = trimmed.find(']') {
+            let time_part = &trimmed[1..close_bracket];
+            let text = trimmed[close_bracket + 1..].trim().to_string();
+
+            // mm:ss.xx
+            if let Some((min_str, sec_str)) = time_part.split_once(':') {
+                if let (Ok(mins), Ok(secs_f)) = (min_str.parse::<u64>(), sec_str.parse::<f64>()) {
+                    let time_ms = (mins * 60 * 1000) + (secs_f * 1000.0) as u64;
+                    lines.push(LrcLine { time_ms, text });
+                }
+            }
+        }
+    }
+    lines.sort_by_key(|l| l.time_ms);
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +366,15 @@ mod tests {
         assert!(json.contains("\"trackId\":\"123\""));
         assert!(json.contains("\"totalPlayedSeconds\":42.5"));
     }
-}
 
+    #[test]
+    fn test_parse_lrc() {
+        let sample = "[00:04.20] Waiting in a car\n[00:08.50] Waiting for a ride in the dark\n[00:15.10] The city is my church";
+        let parsed = parse_lrc(sample);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].time_ms, 4200);
+        assert_eq!(parsed[0].text, "Waiting in a car");
+        assert_eq!(parsed[1].time_ms, 8500);
+        assert_eq!(parsed[2].time_ms, 15100);
+    }
+}

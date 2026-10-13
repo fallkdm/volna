@@ -1,4 +1,6 @@
 pub mod api;
+pub mod cache;
+pub mod mpris;
 pub mod player;
 pub mod ui;
 
@@ -13,7 +15,7 @@ use crate::ui::VolnaWindow;
 const APP_ID: &str = "io.github.fallkdm.Volna";
 
 fn main() {
-    // Инициализируем многопоточный Tokio runtime для фоновых сетевых запросов
+    // Инициализируем многопоточный Tokio runtime для фоновых сетевых запросов и MPRIS D-Bus
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -29,17 +31,22 @@ fn main() {
         // Подключаем кастомные стили оформления
         ui::load_css();
 
-        // Загружаем токен и создаем клиент API
+        // Загружаем сохраненный токен и создаем клиент API
         let token = load_token();
         let client = YandexMusicClient::new(token);
 
-        // Создаем канал для передачи событий от аудио-движка в интерфейс
-        let (sender, receiver) = async_channel::unbounded();
+        // Создаем каналы событий для UI и для MPRIS D-Bus сервера
+        let (ui_tx, ui_rx) = async_channel::unbounded();
+        let (mpris_tx, mpris_rx) = async_channel::unbounded();
 
-        // Инициализируем плеер
-        match PlayerManager::new(client, sender) {
+        // Инициализируем плеер со связкой каналов
+        match PlayerManager::new(client, vec![ui_tx, mpris_tx]) {
             Ok(player) => {
-                let window = VolnaWindow::new(app, player, receiver);
+                // Запускаем системный MPRIS2 D-Bus сервер
+                mpris::spawn_mpris_server(player.clone(), mpris_rx);
+
+                // Создаем и отображаем главное окно приложения
+                let window = VolnaWindow::new(app, player, ui_rx);
                 window.present();
             }
             Err(e) => {

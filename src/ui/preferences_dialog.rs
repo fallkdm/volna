@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Entry, Orientation};
 use libadwaita::prelude::*;
@@ -14,16 +16,21 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
     page.set_title("Параметры потока");
     page.set_icon_name(Some("audio-volume-high-symbolic"));
 
+    let selected_mood = Rc::new(RefCell::new(None::<String>));
+    let selected_char = Rc::new(RefCell::new(None::<String>));
+    let selected_lang = Rc::new(RefCell::new(None::<String>));
+
     // Группа 1: Настроение
     let mood_group = PreferencesGroup::new();
-    mood_group.set_title("Настроение");
-    mood_group.set_description(Some("Выберите эмоциональную окраску рекомендаций"));
+    mood_group.set_title("Настроение потока");
+    mood_group.set_description(Some("Выберите эмоциональную окраску"));
 
     let moods = [
-        ("⚡ Энергичное", "energetic"),
-        ("☕ Спокойное", "calm"),
-        ("🎉 Весёлое", "fun"),
-        ("🌧 Грустное", "sad"),
+        ("Любое настроение", None),
+        ("⚡ Энергичное", Some("energetic")),
+        ("☕ Спокойное", Some("calm")),
+        ("🎉 Весёлое", Some("fun")),
+        ("🌧 Грустное", Some("sad")),
     ];
 
     for (name, tag) in moods {
@@ -32,11 +39,17 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
             .activatable(true)
             .build();
 
-        let player_clone = player.clone();
-        let dialog_weak = dialog.downgrade();
+        let sm = selected_mood.clone();
+        let p = player.clone();
+        let d_weak = dialog.downgrade();
         row.connect_activated(move |_| {
-            player_clone.fetch_wave_tracks(tag);
-            if let Some(d) = dialog_weak.upgrade() {
+            *sm.borrow_mut() = tag.map(|s| s.to_string());
+            p.apply_rotor_filter(
+                tag.map(|s| s.to_string()),
+                None,
+                None,
+            );
+            if let Some(d) = d_weak.upgrade() {
                 d.close();
             }
         });
@@ -49,9 +62,10 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
     char_group.set_title("Характер рекомендаций");
 
     let characters = [
-        ("❤️ Любимое", "favorite"),
-        ("🧭 Незнакомое", "discover"),
-        ("🔥 Популярное", "popular"),
+        ("Любой характер", None),
+        ("❤️ Любимое", Some("favorite")),
+        ("🧭 Незнакомое", Some("discover")),
+        ("🔥 Популярное", Some("popular")),
     ];
 
     for (name, tag) in characters {
@@ -60,11 +74,17 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
             .activatable(true)
             .build();
 
-        let player_clone = player.clone();
-        let dialog_weak = dialog.downgrade();
+        let sc = selected_char.clone();
+        let p = player.clone();
+        let d_weak = dialog.downgrade();
         row.connect_activated(move |_| {
-            player_clone.fetch_wave_tracks(tag);
-            if let Some(d) = dialog_weak.upgrade() {
+            *sc.borrow_mut() = tag.map(|s| s.to_string());
+            p.apply_rotor_filter(
+                None,
+                None,
+                tag.map(|s| s.to_string()),
+            );
+            if let Some(d) = d_weak.upgrade() {
                 d.close();
             }
         });
@@ -77,10 +97,10 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
     lang_group.set_title("Язык композиций");
 
     let languages = [
-        ("🌐 Любой", "any"),
-        ("🇷🇺 Русский", "russian"),
-        ("🌍 Иностранный", "foreign"),
-        ("🎹 Без слов", "instrumental"),
+        ("🌐 Любой язык", None),
+        ("🇷🇺 Русский", Some("russian")),
+        ("🌍 Иностранный", Some("foreign")),
+        ("🎹 Без слов", Some("instrumental")),
     ];
 
     for (name, tag) in languages {
@@ -89,11 +109,17 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
             .activatable(true)
             .build();
 
-        let player_clone = player.clone();
-        let dialog_weak = dialog.downgrade();
+        let sl = selected_lang.clone();
+        let p = player.clone();
+        let d_weak = dialog.downgrade();
         row.connect_activated(move |_| {
-            player_clone.fetch_wave_tracks(tag);
-            if let Some(d) = dialog_weak.upgrade() {
+            *sl.borrow_mut() = tag.map(|s| s.to_string());
+            p.apply_rotor_filter(
+                None,
+                tag.map(|s| s.to_string()),
+                None,
+            );
+            if let Some(d) = d_weak.upgrade() {
                 d.close();
             }
         });
@@ -104,7 +130,7 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
     // Группа 4: Авторизация в Яндекс Музыке
     let auth_group = PreferencesGroup::new();
     auth_group.set_title("Авторизация Яндекс Музыки");
-    auth_group.set_description(Some("OAuth токен для доступа к персональной Волне и полным трекам"));
+    auth_group.set_description(Some("OAuth токен для доступа к персональной Волне и высокому битрейту"));
 
     let token_row = ActionRow::builder()
         .title("OAuth токен")
@@ -135,7 +161,7 @@ pub fn show_preferences_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerM
                 client.set_token(Some(new_token));
             }
             player_clone.emit(crate::player::PlayerUiEvent::StatusMessage(
-                "Токен успешно сохранен! Загружаем персональную Волну...".into(),
+                "Токен сохранен! Загружаем персональную Волну...".into(),
             ));
             player_clone.fetch_wave_tracks("onyourwave");
         }

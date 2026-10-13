@@ -4,13 +4,14 @@ use std::time::Duration;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, Orientation, Overlay,
+    Align, Box as GtkBox, Button, Label, Orientation, Overlay, ScrolledWindow, PolicyType,
 };
 use libadwaita::prelude::*;
 use libadwaita::{
     Application, ApplicationWindow, HeaderBar, Toast, ToastOverlay, ViewStack, ViewSwitcher,
 };
 
+use crate::api::models::{parse_lrc, LrcLine};
 use crate::player::{PlayerManager, PlayerUiEvent};
 use super::floating_island::{create_floating_island, FloatingIslandWidgets};
 use super::library_view::create_library_view;
@@ -39,7 +40,7 @@ impl VolnaWindow {
 
         let toast_overlay = ToastOverlay::new();
 
-        // Главный GtkOverlay (позволяет разместить плавающий остров поверх контента)
+        // Главный GtkOverlay
         let root_overlay = Overlay::new();
 
         // Фоновый контейнер с радиальным градиентом
@@ -66,19 +67,17 @@ impl VolnaWindow {
 
         header_bar.pack_start(&brand_box);
 
-        // ViewStack для переключения основных экранов
+        // ViewStack
         let view_stack = ViewStack::new();
         view_stack.set_vexpand(true);
         view_stack.set_hexpand(true);
 
-        // ViewSwitcher по центру
         let view_switcher = ViewSwitcher::builder()
             .stack(&view_stack)
             .policy(libadwaita::ViewSwitcherPolicy::Wide)
             .build();
         header_bar.set_title_widget(Some(&view_switcher));
 
-        // Кнопка настроек справа
         let settings_btn = Button::from_icon_name("emblem-system-symbolic");
         settings_btn.set_tooltip_text(Some("Настройки Волны и токен"));
         settings_btn.add_css_class("flat");
@@ -87,21 +86,20 @@ impl VolnaWindow {
 
         background_box.append(&header_bar);
 
-        // Состояние воспроизведения и цвет волны
         let is_playing_state = Rc::new(RefCell::new(false));
         let accent_color = Rc::new(RefCell::new([1.0_f64, 0.42_f64, 0.29_f64])); // #ff6b4a
 
-        // Экран 1: Моя волна (WaveView)
+        // Экран 1: Моя волна
         let wave_view = create_wave_view(&player, is_playing_state.clone(), accent_color);
         let wave_page = view_stack.add_titled(&wave_view.container, Some("wave"), "Моя волна");
         wave_page.set_icon_name(Some("audio-volume-high-symbolic"));
 
-        // Экран 2: Поиск (SearchView)
+        // Экран 2: Поиск
         let search_view = create_search_view(&player);
         let search_page = view_stack.add_titled(&search_view.container, Some("search"), "Поиск");
         search_page.set_icon_name(Some("system-search-symbolic"));
 
-        // Экран 3: Медиатека (LibraryView)
+        // Экран 3: Медиатека
         let library_view = create_library_view(&player);
         let lib_page = view_stack.add_titled(&library_view.container, Some("library"), "Медиатека");
         lib_page.set_icon_name(Some("folder-music-symbolic"));
@@ -109,12 +107,12 @@ impl VolnaWindow {
         background_box.append(&view_stack);
         root_overlay.set_child(Some(&background_box));
 
-        // Нижний плавающий остров плеера (FloatingIsland)
+        // Нижний плавающий остров плеера
         let island = create_floating_island(&player);
         root_overlay.add_overlay(&island.container);
 
-        // Оверлей текста песни (Karaoke Overlay)
-        let karaoke_box = GtkBox::new(Orientation::Vertical, 16);
+        // ================= Оверлей текста песни (Karaoke Overlay) =================
+        let karaoke_box = GtkBox::new(Orientation::Vertical, 12);
         karaoke_box.add_css_class("karaoke-sheet");
         karaoke_box.set_visible(false);
         karaoke_box.set_vexpand(true);
@@ -125,7 +123,7 @@ impl VolnaWindow {
         k_header.set_margin_start(20);
         k_header.set_margin_end(20);
 
-        let k_title = Label::new(Some("Синхронизированный текст"));
+        let k_title = Label::new(Some("Синхронизированный текст песни"));
         k_title.add_css_class("heading");
         k_header.append(&k_title);
 
@@ -141,33 +139,24 @@ impl VolnaWindow {
         k_header.append(&k_close_btn);
         karaoke_box.append(&k_header);
 
-        let lyrics_box = GtkBox::new(Orientation::Vertical, 12);
-        lyrics_box.set_valign(Align::Center);
-        lyrics_box.set_halign(Align::Center);
-        lyrics_box.set_vexpand(true);
+        let lyrics_scrolled = ScrolledWindow::new();
+        lyrics_scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+        lyrics_scrolled.set_vexpand(true);
 
-        let lines = [
-            "Waiting in a car",
-            "Waiting for a ride in the dark",
-            "The night city grows",
-            "Look and see her eyes, they look like fire",
-            "Waiting in a car",
-            "The city is my church",
-            "It wraps me in the blinding twilight",
-        ];
+        let lyrics_container = GtkBox::new(Orientation::Vertical, 14);
+        lyrics_container.set_valign(Align::Center);
+        lyrics_container.set_halign(Align::Center);
+        lyrics_container.set_margin_top(32);
+        lyrics_container.set_margin_bottom(80);
 
-        for (i, line) in lines.iter().enumerate() {
-            let lbl = Label::new(Some(line));
-            lbl.add_css_class("karaoke-line");
-            if i == 3 {
-                lbl.add_css_class("active");
-            }
-            lyrics_box.append(&lbl);
-        }
-        karaoke_box.append(&lyrics_box);
+        lyrics_scrolled.set_child(Some(&lyrics_container));
+        karaoke_box.append(&lyrics_scrolled);
         root_overlay.add_overlay(&karaoke_box);
 
-        // Открытие/закрытие текста песни
+        let lyrics_data: Rc<RefCell<Vec<LrcLine>>> = Rc::new(RefCell::new(Vec::new()));
+        let lyrics_labels: Rc<RefCell<Vec<Label>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Управление показом караоке
         {
             let k_box_clone = karaoke_box.clone();
             island.karaoke_btn.connect_clicked(move |_| {
@@ -184,7 +173,7 @@ impl VolnaWindow {
         toast_overlay.set_child(Some(&root_overlay));
         window.set_content(Some(&toast_overlay));
 
-        // Открытие диалога настроек
+        // Открытие настроек
         {
             let p_clone = player.clone();
             let win_weak = window.downgrade();
@@ -204,15 +193,18 @@ impl VolnaWindow {
             });
         }
 
-        // Таймер тика прогресса воспроизведения (раз в секунду)
+        // Таймер тика прогресса и синхронизации караоке
         {
             let player_clone = player.clone();
             let island_seek = island.seek_scale.clone();
             let island_curr_time = island.curr_time_label.clone();
             let island_total_time = island.total_time_label.clone();
             let is_playing_ref = is_playing_state.clone();
+            let l_data = lyrics_data.clone();
+            let l_labels = lyrics_labels.clone();
+            let sc_weak = lyrics_scrolled.downgrade();
 
-            gtk4::glib::timeout_add_local(Duration::from_millis(1000), move || {
+            gtk4::glib::timeout_add_local(Duration::from_millis(500), move || {
                 if *is_playing_ref.borrow() {
                     if let Some(pos) = player_clone.audio.position_seconds() {
                         let dur = player_clone.audio.duration_seconds().unwrap_or(240);
@@ -220,19 +212,44 @@ impl VolnaWindow {
                         island_seek.set_value(pos as f64);
                         island_curr_time.set_text(&format_seconds(pos));
                         island_total_time.set_text(&format_seconds(dur));
+
+                        // Синхронизация караоке
+                        let pos_ms = pos * 1000;
+                        let lines = l_data.borrow();
+                        let labels = l_labels.borrow();
+                        if !lines.is_empty() && lines.len() == labels.len() {
+                            let active_idx = lines.iter().rposition(|l| l.time_ms <= pos_ms);
+                            if let Some(idx) = active_idx {
+                                for (i, lbl) in labels.iter().enumerate() {
+                                    if i == idx {
+                                        lbl.add_css_class("active");
+                                    } else {
+                                        lbl.remove_css_class("active");
+                                    }
+                                }
+                                if let Some(sc) = sc_weak.upgrade() {
+                                    let vadj = sc.vadjustment();
+                                    let target_val = (idx as f64 * 45.0).min(vadj.upper() - vadj.page_size());
+                                    vadj.set_value(target_val.max(0.0));
+                                }
+                            }
+                        }
                     }
                 }
                 gtk4::glib::ControlFlow::Continue
             });
         }
 
-        // Обработка асинхронных событий от PlayerManager
+        // Обработка асинхронных событий
         setup_event_listener(
             event_receiver,
             toast_overlay,
             wave_view,
             island,
             is_playing_state,
+            lyrics_container,
+            lyrics_data,
+            lyrics_labels,
         );
 
         Self { window }
@@ -255,6 +272,9 @@ fn setup_event_listener(
     wave_view: WaveViewWidgets,
     island: FloatingIslandWidgets,
     is_playing_state: Rc<RefCell<bool>>,
+    lyrics_container: GtkBox,
+    lyrics_data: Rc<RefCell<Vec<LrcLine>>>,
+    lyrics_labels: Rc<RefCell<Vec<Label>>>,
 ) {
     gtk4::glib::spawn_future_local(async move {
         while let Ok(event) = receiver.recv().await {
@@ -310,6 +330,29 @@ fn setup_event_listener(
                     } else {
                         island.dislike_btn.remove_css_class("disliked");
                     }
+                }
+                PlayerUiEvent::CoverUpdated(path) => {
+                    island.cover_image.set_from_file(Some(&path));
+                }
+                PlayerUiEvent::LyricsUpdated(lrc_text) => {
+                    let parsed = parse_lrc(&lrc_text);
+                    // Очищаем старые строки
+                    while let Some(child) = lyrics_container.first_child() {
+                        lyrics_container.remove(&child);
+                    }
+
+                    let mut new_labels = Vec::new();
+                    for line in &parsed {
+                        let lbl = Label::new(Some(&line.text));
+                        lbl.add_css_class("karaoke-line");
+                        lbl.set_wrap(true);
+                        lbl.set_justify(gtk4::Justification::Center);
+                        lyrics_container.append(&lbl);
+                        new_labels.push(lbl);
+                    }
+
+                    *lyrics_data.borrow_mut() = parsed;
+                    *lyrics_labels.borrow_mut() = new_labels;
                 }
                 PlayerUiEvent::StatusMessage(msg) => {
                     let toast = Toast::new(&msg);
