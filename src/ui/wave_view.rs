@@ -115,12 +115,28 @@ pub fn create_wave_view(
     drawing_area.set_hexpand(true);
     drawing_area.set_vexpand(true);
 
+    // Центральная кнопка Play/Pause (фиксированный размер 72x72)
+    let play_btn = Button::new();
+    play_btn.add_css_class("hero-play-badge");
+    play_btn.set_size_request(72, 72);
+    play_btn.set_halign(Align::Center);
+    play_btn.set_valign(Align::Center);
+    let play_btn_icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
+    play_btn_icon.set_pixel_size(32);
+    play_btn.set_child(Some(&play_btn_icon));
+
     // Отрисовка органического живого фона на Cairo
     {
         let state_ref = shader_state.clone();
-        drawing_area.set_draw_func(move |_area, cr, width, height| {
+        let play_btn_ref = play_btn.clone();
+        drawing_area.set_draw_func(move |area, cr, width, height| {
             let state = state_ref.borrow();
-            render_live_wave_cairo(cr, width as f64, height as f64, &state);
+            // Вычисляем точный центр кнопки Play в координатах холста
+            let (cx, cy) = play_btn_ref
+                .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
+                .map(|p| (p.x() as f64, p.y() as f64))
+                .unwrap_or((width as f64 / 2.0, height as f64 * 0.38));
+            render_live_wave_cairo(cr, width as f64, height as f64, cx, cy, &state);
         });
     }
 
@@ -154,43 +170,36 @@ pub fn create_wave_view(
     root_overlay.set_child(Some(&drawing_area));
 
     // ================= Центральный блок интерфейса поверх фона =================
-    let content_box = GtkBox::new(Orientation::Vertical, 16);
+    // Вертикальная компоновка: кнопка Play по центру сферы, а текст и настройки строго ПОД сферой!
+    let content_box = GtkBox::new(Orientation::Vertical, 0);
     content_box.set_valign(Align::Center);
-    content_box.set_halign(Align::Fill);
-    content_box.add_css_class("hero-container");
+    content_box.set_halign(Align::Center);
+    content_box.set_margin_bottom(50); // Учитываем нижний плавающий остров плеера
 
-    // Центральная кнопка Play/Pause
-    let play_btn = Button::new();
-    play_btn.add_css_class("hero-play-badge");
-    play_btn.set_halign(Align::Center);
-    play_btn.set_valign(Align::Center);
-    let play_btn_icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
-    play_btn_icon.set_pixel_size(36);
-    play_btn.set_child(Some(&play_btn_icon));
     content_box.append(&play_btn);
 
-    // Метаданные текущего трека
-    let meta_box = GtkBox::new(Orientation::Vertical, 4);
-    meta_box.set_halign(Align::Center);
+    // Блок метаданных и кнопки настроек: размещен строго под сферой с отступом 175px
+    let bottom_box = GtkBox::new(Orientation::Vertical, 6);
+    bottom_box.set_halign(Align::Center);
+    bottom_box.set_margin_top(175);
 
     let title_label = Label::new(Some("Моя волна"));
     title_label.add_css_class("hero-track-title");
     title_label.set_wrap(true);
     title_label.set_justify(gtk4::Justification::Center);
-    meta_box.append(&title_label);
+    bottom_box.append(&title_label);
 
     let artist_label = Label::new(Some("Нажмите для запуска персонального потока 🌊"));
     artist_label.add_css_class("hero-track-artist");
     artist_label.set_justify(gtk4::Justification::Center);
-    meta_box.append(&artist_label);
-
-    content_box.append(&meta_box);
+    bottom_box.append(&artist_label);
 
     // Центральная кнопка фильтров Ротора «Настроить волну»
     let menu_button = MenuButton::new();
     menu_button.set_label("⚙ Настроить волну ▾");
     menu_button.add_css_class("fluid-pill");
     menu_button.set_halign(Align::Center);
+    menu_button.set_margin_top(14);
 
     // Всплывающее Popover меню настройки Моей волны
     let popover = Popover::new();
@@ -411,7 +420,8 @@ pub fn create_wave_view(
     popover.set_child(Some(&popover_box));
     menu_button.set_popover(Some(&popover));
 
-    content_box.append(&menu_button);
+    bottom_box.append(&menu_button);
+    content_box.append(&bottom_box);
 
     // Обработчик центральной кнопки Play
     {
@@ -436,126 +446,174 @@ pub fn create_wave_view(
 }
 
 // ==============================================================================
-// Высокопроизводительный и 100% безопасный рендеринг «Плавающего нечто» на Cairo
+// Роскошный, кинематографичный рендеринг «Luminous Fluid Orb» на Cairo (100% safe)
 // ==============================================================================
 
-fn render_live_wave_cairo(cr: &cairo::Context, w: f64, h: f64, state: &WaveShaderState) {
-    let cx = w / 2.0;
-    let cy = h * 0.42; // Центр визуализатора чуть выше центра экрана
-    let max_r = w.max(h);
+fn render_live_wave_cairo(
+    cr: &cairo::Context,
+    w: f64,
+    h: f64,
+    cx: f64,
+    cy: f64,
+    state: &WaveShaderState,
+) {
+    let max_dim = w.max(h);
     let time = state.time;
     let bass = state.bass;
     let core = state.cur_core;
     let deep = state.cur_deep;
     let ridge = state.cur_ridge;
 
-    // 1. Очистка и отрисовка глубокого фонового радиального градиента на весь экран
+    // --------------------------------------------------------------------------
+    // 1. Полноэкранное атмосферное свечение (Ambient Aurora Mesh)
+    // --------------------------------------------------------------------------
     cr.set_operator(cairo::Operator::Source);
-    let bg_pattern = cairo::RadialGradient::new(cx, cy, 20.0, cx, cy, max_r * 0.85);
-    bg_pattern.add_color_stop_rgba(0.0, deep[0], deep[1], deep[2], 0.65);
-    bg_pattern.add_color_stop_rgba(0.4, deep[0] * 0.4, deep[1] * 0.4, deep[2] * 0.4, 0.35);
-    bg_pattern.add_color_stop_rgba(0.85, 0.06, 0.06, 0.06, 1.0);
-    bg_pattern.add_color_stop_rgba(1.0, 0.04, 0.04, 0.04, 1.0);
+    let bg_pattern = cairo::RadialGradient::new(cx, cy, 30.0, cx, cy, max_dim * 0.90);
+    bg_pattern.add_color_stop_rgba(0.0, deep[0] * 0.70, deep[1] * 0.70, deep[2] * 0.70, 0.75);
+    bg_pattern.add_color_stop_rgba(0.40, deep[0] * 0.30, deep[1] * 0.30, deep[2] * 0.30, 0.40);
+    bg_pattern.add_color_stop_rgba(0.80, 0.04, 0.04, 0.06, 1.0);
+    bg_pattern.add_color_stop_rgba(1.0, 0.02, 0.02, 0.03, 1.0);
     let _ = cr.set_source(&bg_pattern);
     let _ = cr.paint();
     cr.set_operator(cairo::Operator::Over);
 
-    // 2. Радиальные световые лучи из центра
-    let ray_count = 8;
-    for i in 0..ray_count {
-        let angle = (i as f64 / ray_count as f64) * PI * 2.0 + time * 0.06;
-        let ray_r = 160.0 + (time * 0.3 + i as f64).sin() * 40.0;
-        let spread = 0.22;
+    // 3–4 мягких дрейфующих световых фокуса (attractors) по краям экрана (Lissajous)
+    let attractors = [
+        (
+            w * 0.22 + (time * 0.35).sin() * (w * 0.16),
+            h * 0.20 + (time * 0.28).cos() * (h * 0.14),
+            max_dim * 0.44,
+            core,
+            0.15 + bass * 0.06,
+        ),
+        (
+            w * 0.80 + (time * 0.30 + 1.5).cos() * (w * 0.15),
+            h * 0.30 + (time * 0.40 + 2.0).sin() * (h * 0.16),
+            max_dim * 0.48,
+            deep,
+            0.22 + bass * 0.08,
+        ),
+        (
+            w * 0.48 + (time * 0.25 + 3.0).sin() * (w * 0.20),
+            h * 0.72 + (time * 0.32 + 0.8).cos() * (h * 0.12),
+            max_dim * 0.42,
+            ridge,
+            0.11 + bass * 0.05,
+        ),
+        (
+            w * 0.14 + (time * 0.38 + 4.0).cos() * (w * 0.12),
+            h * 0.82 + (time * 0.24 + 1.2).sin() * (h * 0.14),
+            max_dim * 0.38,
+            core,
+            0.09,
+        ),
+    ];
 
+    for (ax, ay, ar, acolor, aalpha) in attractors {
+        let a_pat = cairo::RadialGradient::new(ax, ay, 0.0, ax, ay, ar);
+        a_pat.add_color_stop_rgba(0.0, acolor[0], acolor[1], acolor[2], aalpha);
+        a_pat.add_color_stop_rgba(0.55, acolor[0] * 0.5, acolor[1] * 0.5, acolor[2] * 0.5, aalpha * 0.30);
+        a_pat.add_color_stop_rgba(1.0, acolor[0], acolor[1], acolor[2], 0.0);
         cr.new_path();
-        cr.move_to(cx, cy);
-        cr.line_to(cx + (angle - spread).cos() * ray_r, cy + (angle - spread).sin() * ray_r);
-        cr.line_to(cx + (angle + spread).cos() * ray_r, cy + (angle + spread).sin() * ray_r);
-        cr.close_path();
-
-        let ray_pat = cairo::RadialGradient::new(cx, cy, 10.0, cx, cy, ray_r);
-        ray_pat.add_color_stop_rgba(0.0, core[0], core[1], core[2], 0.18 + bass * 0.12);
-        ray_pat.add_color_stop_rgba(0.7, ridge[0], ridge[1], ridge[2], 0.06);
-        ray_pat.add_color_stop_rgba(1.0, deep[0], deep[1], deep[2], 0.0);
-        let _ = cr.set_source(&ray_pat);
+        cr.arc(ax, ay, ar, 0.0, PI * 2.0);
+        let _ = cr.set_source(&a_pat);
         let _ = cr.fill();
     }
 
-    // 3. 4-итерационный Domain Warping с каустическими складками (Fresnel Silk Ridges)
-    let points_count = 28;
-    for layer in 0..4 {
-        let fi = (layer + 1) as f64;
-        let base_radius = (145.0 - fi * 22.0) * (1.0 + bass * 0.35);
-        let rot = 0.38 * fi + time * 0.07;
+    // --------------------------------------------------------------------------
+    // 2. Крупное объемное плазменное ядро (Luminous Fluid Orb)
+    // --------------------------------------------------------------------------
+    let base_r = (175.0 + bass * 18.0).max(120.0);
 
-        let mut pts = Vec::with_capacity(points_count);
-        for i in 0..points_count {
-            let theta = (i as f64 / points_count as f64) * PI * 2.0;
-            // 4-итерационный сдвиг синусов/косинусов
-            let shift1 = (theta * 3.0 + rot * 1.6).sin() * (16.0 + fi * 4.0);
-            let shift2 = (theta * 5.0 - time * 0.35 + fi).cos() * (9.0 + fi * 2.5);
-            let r = base_radius + (shift1 + shift2) * (1.0 + bass * 0.22);
-            let x = cx + theta.cos() * r;
-            let y = cy + theta.sin() * r;
-            pts.push((x, y));
-        }
-
-        // Рисуем непрерывный плавный Catmull-Rom/Bezier замкнутый контур
-        draw_smooth_closed_path(cr, &pts);
-
-        // Градиент заливки складок
-        let pat = cairo::RadialGradient::new(cx, cy, 15.0, cx, cy, base_radius + 35.0);
-        match layer {
-            0 => {
-                pat.add_color_stop_rgba(0.0, core[0], core[1], core[2], 0.60);
-                pat.add_color_stop_rgba(0.6, deep[0], deep[1], deep[2], 0.30);
-                pat.add_color_stop_rgba(1.0, deep[0], deep[1], deep[2], 0.0);
-            }
-            1 => {
-                pat.add_color_stop_rgba(0.0, ridge[0], ridge[1], ridge[2], 0.45);
-                pat.add_color_stop_rgba(0.5, core[0], core[1], core[2], 0.35);
-                pat.add_color_stop_rgba(1.0, deep[0], deep[1], deep[2], 0.0);
-            }
-            2 => {
-                pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.50);
-                pat.add_color_stop_rgba(0.4, ridge[0], ridge[1], ridge[2], 0.35);
-                pat.add_color_stop_rgba(1.0, core[0], core[1], core[2], 0.0);
-            }
-            _ => {
-                pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.70);
-                pat.add_color_stop_rgba(0.3, ridge[0], ridge[1], ridge[2], 0.50);
-                pat.add_color_stop_rgba(1.0, core[0], core[1], core[2], 0.0);
-            }
-        }
-        let _ = cr.set_source(&pat);
-        let _ = cr.fill_preserve();
-
-        // Тонкий контур каустических складок (Silk Ridges)
-        cr.set_line_width(2.2 - fi * 0.3);
-        cr.set_source_rgba(ridge[0], ridge[1], ridge[2], 0.28 + (3.0 - fi) * 0.08);
-        let _ = cr.stroke();
-    }
-
-    // 4. Мягкое центральное свечение ядра
-    let core_r = 50.0 + bass * 14.0;
-    let core_pat = cairo::RadialGradient::new(cx, cy, 5.0, cx, cy, core_r);
-    core_pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.85);
-    core_pat.add_color_stop_rgba(0.35, ridge[0], ridge[1], ridge[2], 0.65);
-    core_pat.add_color_stop_rgba(0.7, core[0], core[1], core[2], 0.35);
-    core_pat.add_color_stop_rgba(1.0, deep[0], deep[1], deep[2], 0.0);
+    // Внешняя корона мягкого свечения (Corona Bloom)
+    let corona_r = base_r * 1.55;
+    let corona_pat = cairo::RadialGradient::new(cx, cy, base_r * 0.45, cx, cy, corona_r);
+    corona_pat.add_color_stop_rgba(0.0, core[0], core[1], core[2], 0.35 + bass * 0.14);
+    corona_pat.add_color_stop_rgba(0.42, core[0], core[1], core[2], 0.14);
+    corona_pat.add_color_stop_rgba(0.75, ridge[0], ridge[1], ridge[2], 0.04);
+    corona_pat.add_color_stop_rgba(1.0, core[0], core[1], core[2], 0.0);
     cr.new_path();
-    cr.arc(cx, cy, core_r, 0.0, PI * 2.0);
-    let _ = cr.set_source(&core_pat);
+    cr.arc(cx, cy, corona_r, 0.0, PI * 2.0);
+    let _ = cr.set_source(&corona_pat);
     let _ = cr.fill();
 
-    // 5. Плавное затухание в глубокий черный цвет в нижней части экрана
-    // (для идеальной читаемости острова-плеера и кнопки настроек)
-    let vignette_start = h * 0.52;
+    // Органический контур деформации Безье (36 контрольных точек через Catmull-Rom)
+    let points_count = 36;
+    let mut pts = Vec::with_capacity(points_count);
+    for i in 0..points_count {
+        let theta = (i as f64 / points_count as f64) * PI * 2.0;
+        let warp = (theta * 3.0 + time * 1.2).sin() * 14.0
+            + (theta * 5.0 - time * 0.9).cos() * 10.0
+            + (theta * 2.0 + time * 0.5).sin() * 8.0;
+        let r = base_r + warp * (1.0 + bass * 0.30);
+        let px = cx + theta.cos() * r;
+        let py = cy + theta.sin() * r;
+        pts.push((px, py));
+    }
+
+    draw_smooth_closed_path(cr, &pts);
+
+    // Объемная 3D-заливка сферы смещенным радиальным градиентом
+    let orb_pat = cairo::RadialGradient::new(
+        cx - base_r * 0.32,
+        cy - base_r * 0.32,
+        10.0,
+        cx,
+        cy,
+        base_r * 1.08,
+    );
+    orb_pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.95);
+    orb_pat.add_color_stop_rgba(0.22, core[0], core[1], core[2], 0.95);
+    orb_pat.add_color_stop_rgba(0.60, ridge[0], ridge[1], ridge[2], 0.85);
+    orb_pat.add_color_stop_rgba(0.92, deep[0], deep[1], deep[2], 0.90);
+    orb_pat.add_color_stop_rgba(1.0, deep[0] * 0.4, deep[1] * 0.4, deep[2] * 0.4, 0.95);
+
+    let _ = cr.set_source(&orb_pat);
+    let _ = cr.fill();
+
+    // Внутренний флюидный плазменный вихрь (Secondary Plasma Swirl)
+    let swirl_cx = cx + (time * 0.8).cos() * (base_r * 0.22);
+    let swirl_cy = cy + (time * 0.7).sin() * (base_r * 0.22);
+    let swirl_r = base_r * 0.65;
+    let swirl_pat = cairo::RadialGradient::new(swirl_cx, swirl_cy, 5.0, swirl_cx, swirl_cy, swirl_r);
+    swirl_pat.add_color_stop_rgba(0.0, ridge[0], ridge[1], ridge[2], 0.42);
+    swirl_pat.add_color_stop_rgba(0.50, core[0], core[1], core[2], 0.22);
+    swirl_pat.add_color_stop_rgba(1.0, deep[0], deep[1], deep[2], 0.0);
+
+    cr.new_path();
+    cr.arc(swirl_cx, swirl_cy, swirl_r, 0.0, PI * 2.0);
+    let _ = cr.set_source(&swirl_pat);
+    let _ = cr.fill();
+
+    // Зеркальный блик стекла (Specular Glass Highlight)
+    let hl_cx = cx - base_r * 0.32;
+    let hl_cy = cy - base_r * 0.32;
+    let hl_rx = base_r * 0.30;
+    let hl_ry = base_r * 0.18;
+    let hl_pat = cairo::RadialGradient::new(hl_cx, hl_cy, 2.0, hl_cx, hl_cy, hl_rx);
+    hl_pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.58);
+    hl_pat.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.22);
+    hl_pat.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0);
+
+    cr.save().ok();
+    cr.translate(hl_cx, hl_cy);
+    cr.rotate(-PI * 0.18);
+    cr.scale(1.0, hl_ry / hl_rx);
+    cr.new_path();
+    cr.arc(0.0, 0.0, hl_rx, 0.0, PI * 2.0);
+    let _ = cr.set_source(&hl_pat);
+    let _ = cr.fill();
+    cr.restore().ok();
+
+    // --------------------------------------------------------------------------
+    // 3. Плавное затухание в глубокий ночной цвет в нижней части экрана
+    // --------------------------------------------------------------------------
+    let vignette_start = h * 0.54;
     let vignette_pat = cairo::LinearGradient::new(0.0, vignette_start, 0.0, h);
-    vignette_pat.add_color_stop_rgba(0.0, 0.05, 0.05, 0.05, 0.0);
-    vignette_pat.add_color_stop_rgba(0.35, 0.06, 0.06, 0.06, 0.65);
-    vignette_pat.add_color_stop_rgba(0.75, 0.06, 0.06, 0.06, 0.92);
-    vignette_pat.add_color_stop_rgba(1.0, 0.05, 0.05, 0.05, 0.98);
+    vignette_pat.add_color_stop_rgba(0.0, 0.02, 0.02, 0.03, 0.0);
+    vignette_pat.add_color_stop_rgba(0.35, 0.03, 0.03, 0.04, 0.65);
+    vignette_pat.add_color_stop_rgba(0.70, 0.03, 0.03, 0.05, 0.90);
+    vignette_pat.add_color_stop_rgba(1.0, 0.02, 0.02, 0.03, 0.98);
 
     cr.new_path();
     cr.rectangle(0.0, vignette_start, w, h - vignette_start);

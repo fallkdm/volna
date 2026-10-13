@@ -35,31 +35,34 @@
 .hero-track-title {
     font-size: 26px;
     font-weight: 800;
-    letter-spacing: -0.5px;
+    letter-spacing: -0.4px;
     color: #ffffff;
+    text-shadow: 0 2px 14px rgba(0, 0, 0, 0.75);
 }
 
 .hero-track-artist {
     font-size: 15px;
     font-weight: 500;
-    color: rgba(255, 255, 255, 0.65);
+    color: rgba(255, 255, 255, 0.75);
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
 }
 
-/* Круглая центральная кнопка волны */
+/* Круглая центральная стеклянная кнопка волны */
 .hero-play-badge {
-    min-width: 68px;
-    min-height: 68px;
+    min-width: 72px;
+    min-height: 72px;
     border-radius: 9999px;
-    background: rgba(255, 255, 255, 0.18);
-    border: 1px solid rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.16);
+    border: 1px solid rgba(255, 255, 255, 0.40);
     color: #ffffff;
-    box-shadow: 0 6px 26px rgba(0, 0, 0, 0.45);
-    transition: all 200ms ease;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.55), inset 0 1px 2px rgba(255, 255, 255, 0.5);
+    transition: all 220ms ease;
 }
 
 .hero-play-badge:hover {
     background: rgba(255, 255, 255, 0.28);
-    border-color: rgba(255, 255, 255, 0.6);
+    border-color: rgba(255, 255, 255, 0.75);
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.65), inset 0 1px 3px rgba(255, 255, 255, 0.7);
 }
 
 /* Чипы настроений */
