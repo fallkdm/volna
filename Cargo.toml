@@ -18,3 +18,4 @@ gstreamer = { version = "0.25", features = ["v1_28"] }
 gstreamer-play = { version = "0.25", features = ["v1_28"] }
 async-channel = "2"
 mpris-server = { version = "0.10", features = ["tokio"] }
+glow = "0.18.0"

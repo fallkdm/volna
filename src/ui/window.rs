@@ -327,6 +327,7 @@ fn setup_event_listener(
 
                     wave_view.title_label.set_text(&track.title);
                     wave_view.artist_label.set_text(&subtitle);
+                    wave_view.update_track_colors(&track);
 
                     island.title_label.set_text(&track.title);
                     island.artist_label.set_text(&artists);

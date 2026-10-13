@@ -61,6 +61,63 @@ pub struct Track {
     #[serde(rename = "ogImage")]
     pub og_image: Option<String>,
     pub available: Option<bool>,
+    #[serde(rename = "derivedColors")]
+    pub derived_colors: Option<DerivedColors>,
+}
+
+/// Производные акцентные цвета трека из Яндекс Музыки
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DerivedColors {
+    pub average: Option<String>,
+    pub accent: Option<String>,
+    #[serde(rename = "miniPlayer")]
+    pub mini_player: Option<String>,
+    #[serde(rename = "waveText")]
+    pub wave_text: Option<String>,
+}
+
+/// Парсинг HEX цвета вида #RRGGBB или RRGGBB в нормализованные [f32; 3]
+pub fn parse_hex_color(hex: &str) -> Option<[f32; 3]> {
+    let s = hex.trim().trim_start_matches('#');
+    if s.len() == 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+    } else {
+        None
+    }
+}
+
+impl DerivedColors {
+    /// Основной акцентный цвет (по умолчанию янтарный [0.95, 0.42, 0.02])
+    pub fn core_rgb(&self) -> [f32; 3] {
+        self.accent
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or([0.95, 0.42, 0.02])
+    }
+
+    /// Глубокий тёмный фоновый цвет (по умолчанию тёмно-терракотовый [0.36, 0.10, 0.00])
+    pub fn deep_rgb(&self) -> [f32; 3] {
+        self.average
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or([0.36, 0.10, 0.00])
+    }
+
+    /// Осветлённый акцент складок (по умолчанию кремово-золотистый [1.0, 0.84, 0.42])
+    pub fn ridge_rgb(&self) -> [f32; 3] {
+        if let Some(accent) = self.accent.as_deref().and_then(parse_hex_color) {
+            [
+                (accent[0] * 0.6 + 0.4).min(1.0),
+                (accent[1] * 0.6 + 0.4).min(1.0),
+                (accent[2] * 0.6 + 0.4).min(1.0),
+            ]
+        } else {
+            [1.0, 0.84, 0.42]
+        }
+    }
 }
 
 impl Track {
@@ -95,6 +152,30 @@ impl Track {
         let mins = total_secs / 60;
         let secs = total_secs % 60;
         format!("{:02}:{:02}", mins, secs)
+    }
+
+    /// Основной акцентный цвет шейдера Волны
+    pub fn core_rgb(&self) -> [f32; 3] {
+        self.derived_colors
+            .as_ref()
+            .map(|c| c.core_rgb())
+            .unwrap_or([0.95, 0.42, 0.02])
+    }
+
+    /// Глубокий тёмный цвет шейдера Волны
+    pub fn deep_rgb(&self) -> [f32; 3] {
+        self.derived_colors
+            .as_ref()
+            .map(|c| c.deep_rgb())
+            .unwrap_or([0.36, 0.10, 0.00])
+    }
+
+    /// Осветленный акцентный цвет гребней шейдера Волны
+    pub fn ridge_rgb(&self) -> [f32; 3] {
+        self.derived_colors
+            .as_ref()
+            .map(|c| c.ridge_rgb())
+            .unwrap_or([1.0, 0.84, 0.42])
     }
 }
 
@@ -376,5 +457,36 @@ mod tests {
         assert_eq!(parsed[0].text, "Waiting in a car");
         assert_eq!(parsed[1].time_ms, 8500);
         assert_eq!(parsed[2].time_ms, 15100);
+    }
+
+    #[test]
+    fn test_derived_colors() {
+        let json_data = r##"{
+            "id": 999,
+            "title": "Звезда по имени Солнце",
+            "derivedColors": {
+                "average": "#1A0A00",
+                "accent": "#FF6B00",
+                "miniPlayer": "#FF6B00",
+                "waveText": "#FFFFFF"
+            }
+        }"##;
+
+        let track: Track = serde_json::from_str(json_data).unwrap();
+        let colors = track.derived_colors.as_ref().unwrap();
+        assert_eq!(colors.accent.as_deref(), Some("#FF6B00"));
+        assert_eq!(colors.average.as_deref(), Some("#1A0A00"));
+
+        let core = track.core_rgb();
+        assert!((core[0] - 1.0).abs() < 0.01);
+        assert!((core[1] - (107.0 / 255.0)).abs() < 0.01);
+        assert!((core[2] - 0.0).abs() < 0.01);
+
+        let deep = track.deep_rgb();
+        assert!((deep[0] - (26.0 / 255.0)).abs() < 0.01);
+        assert!((deep[1] - (10.0 / 255.0)).abs() < 0.01);
+
+        let ridge = track.ridge_rgb();
+        assert!(ridge[0] > 0.9);
     }
 }

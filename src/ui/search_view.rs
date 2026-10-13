@@ -47,6 +47,7 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
             cover_uri: None,
             og_image: None,
             available: Some(true),
+            derived_colors: None,
         },
         Track {
             id: "102".to_string(),
@@ -57,6 +58,7 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
             cover_uri: None,
             og_image: None,
             available: Some(true),
+            derived_colors: None,
         },
         Track {
             id: "103".to_string(),
@@ -67,6 +69,7 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
             cover_uri: None,
             og_image: None,
             available: Some(true),
+            derived_colors: None,
         },
     ];
 
