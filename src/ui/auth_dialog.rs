@@ -3,11 +3,11 @@ use gtk4::{Align, Box as GtkBox, Button, Entry, Label, Orientation, Spinner};
 use libadwaita::prelude::*;
 use libadwaita::{ActionRow, PreferencesDialog, PreferencesGroup, PreferencesPage};
 
-use crate::api::auth::{extract_token_from_input, save_token};
+use crate::api::auth::{
+    extract_token_from_input, request_device_code, save_token, OAUTH_AUTHORIZE_URL,
+};
 use crate::api::client::YandexMusicClient;
 use crate::player::PlayerManager;
-
-const YANDEX_OAUTH_URL: &str = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b4c73e3300b97";
 
 /// Отображает диалог входа в аккаунт Яндекс Музыки
 pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager) {
@@ -18,39 +18,44 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
     page.set_title("Авторизация");
     page.set_icon_name(Some("avatar-default-symbolic"));
 
-    let group = PreferencesGroup::new();
-    group.set_title("Яндекс ID");
-    group.set_description(Some(
-        "Войдите через Яндекс ID для доступа к персональной Моей волне, рекомендациям и вашей фонотеке."
+    // ================= Группа 1: Быстрый вход по ссылке OAuth =================
+    let link_group = PreferencesGroup::new();
+    link_group.set_title("Быстрый вход через браузер");
+    link_group.set_description(Some(
+        "Нажмите кнопку ниже, подтвердите вход в Яндекс ID, затем скопируйте полученную адресную строку."
     ));
 
-    // Шаг 1: Кнопка открытия браузера
     let step1_row = ActionRow::builder()
-        .title("1. Получить токен")
-        .subtitle("Откроется страница авторизации в браузере по умолчанию")
+        .title("1. Открыть страницу входа")
+        .subtitle("Откроется официальная страница Яндекс ID в браузере")
         .build();
 
-    let open_browser_btn = Button::with_label("Открыть Яндекс ID");
+    let open_browser_btn = Button::with_label("Получить токен ↗");
     open_browser_btn.add_css_class("suggested-action");
 
     open_browser_btn.connect_clicked(|_| {
-        let _ = gio::AppInfo::launch_default_for_uri(YANDEX_OAUTH_URL, None::<&gio::AppLaunchContext>);
+        let _ = gio::AppInfo::launch_default_for_uri(
+            OAUTH_AUTHORIZE_URL,
+            None::<&gio::AppLaunchContext>,
+        );
     });
 
     step1_row.add_suffix(&open_browser_btn);
-    group.add(&step1_row);
+    link_group.add(&step1_row);
 
-    // Шаг 2: Ввод токена
     let step2_row = ActionRow::builder()
-        .title("2. Вставить токен или URL")
-        .subtitle("Скопируйте полученный access_token или всю адресную строку из браузера")
+        .title("2. Вставить токен или адресную строку")
+        .subtitle("Вставьте токен или полный URL из адресной строки браузера после входа")
         .build();
 
     let input_box = GtkBox::new(Orientation::Horizontal, 8);
     let token_entry = Entry::new();
     token_entry.set_width_chars(28);
-    token_entry.set_placeholder_text(Some("y0_AgAAAA... или https://..."));
+    token_entry.set_placeholder_text(Some("y0_AgAAAA... или https://music.yandex.ru/#access_token=..."));
     token_entry.set_hexpand(true);
+
+    let paste_btn = Button::from_icon_name("edit-paste-symbolic");
+    paste_btn.set_tooltip_text(Some("Вставить из буфера обмена"));
 
     let submit_btn = Button::with_label("Войти");
     submit_btn.add_css_class("suggested-action");
@@ -59,23 +64,79 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
     spinner.set_visible(false);
 
     input_box.append(&token_entry);
+    input_box.append(&paste_btn);
     input_box.append(&spinner);
     input_box.append(&submit_btn);
     step2_row.add_suffix(&input_box);
-    group.add(&step2_row);
+    link_group.add(&step2_row);
 
-    // Сообщение об ошибке/статусе
+    page.add(&link_group);
+
+    // ================= Группа 2: Вход по коду устройства (ya.ru/device) =================
+    let device_group = PreferencesGroup::new();
+    device_group.set_title("Альтернатива: Вход по коду (ya.ru/device)");
+    device_group.set_description(Some(
+        "Вы также можете подтвердить вход по коду устройства на ya.ru/device"
+    ));
+
+    let code_row = ActionRow::builder()
+        .title("Код устройства")
+        .subtitle("Загрузка одноразового кода...")
+        .build();
+
+    let open_device_btn = Button::with_label("Открыть ya.ru/device ↗");
+    open_device_btn.connect_clicked(|_| {
+        let _ = gio::AppInfo::launch_default_for_uri(
+            "https://ya.ru/device",
+            None::<&gio::AppLaunchContext>,
+        );
+    });
+    code_row.add_suffix(&open_device_btn);
+    device_group.add(&code_row);
+
+    page.add(&device_group);
+
+    // Статус и ошибки
     let status_label = Label::new(None);
     status_label.set_halign(Align::Center);
     status_label.set_margin_top(8);
     status_label.add_css_class("error");
     status_label.set_visible(false);
 
-    let group_box = GtkBox::new(Orientation::Vertical, 4);
-    group_box.append(&status_label);
-
-    page.add(&group);
     dialog.add(&page);
+
+    // Вставка из буфера обмена
+    {
+        let entry_clone = token_entry.clone();
+        let display = gtk4::gdk::Display::default();
+        paste_btn.connect_clicked(move |_| {
+            if let Some(d) = display.as_ref() {
+                let clipboard = d.clipboard();
+                let ec = entry_clone.clone();
+                clipboard.read_text_async(None::<&gio::Cancellable>, move |res| {
+                    if let Ok(Some(text)) = res {
+                        ec.set_text(&text);
+                    }
+                });
+            }
+        });
+    }
+
+    // Асинхронный запрос кода устройства при открытии диалога
+    {
+        let row_weak = code_row.downgrade();
+        gtk4::glib::spawn_future_local(async move {
+            if let Ok(device_code) = request_device_code().await {
+                if let Some(r) = row_weak.upgrade() {
+                    r.set_title(&format!("Код: {}", device_code.user_code));
+                    r.set_subtitle(&format!(
+                        "Введите этот код на {} для подтверждения",
+                        device_code.verification_url
+                    ));
+                }
+            }
+        });
+    }
 
     // Обработчик кнопки «Войти»
     {
@@ -92,7 +153,7 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
 
             if clean_token.is_empty() {
                 if let Some(s) = status_weak.upgrade() {
-                    s.set_text("Пожалуйста, вставьте токен");
+                    s.set_text("Пожалуйста, вставьте токен или адресную строку");
                     s.set_visible(true);
                 }
                 return;
@@ -142,7 +203,7 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
                         sp_clone.stop();
                         sp_clone.set_visible(false);
                         if let Some(s) = s_weak.upgrade() {
-                            s.set_text(&format!("Неверный токен или ошибка: {}", e));
+                            s.set_text(&format!("Неверный токен или ошибка сети: {}", e));
                             s.set_visible(true);
                         }
                     }

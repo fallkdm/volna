@@ -3,6 +3,12 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
+/// Официальный рабочий client_id Яндекс Музыки
+pub const CLIENT_ID: &str = "23cabbbdc6cd418abb4b39c32c41195d";
+
+/// Официальный OAuth URL для быстрого получения токена
+pub const OAUTH_AUTHORIZE_URL: &str = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d";
+
 /// Конфигурация приложения Волна
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
@@ -88,6 +94,31 @@ pub fn extract_token_from_input(raw: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+/// Ответ эндпоинта Device Code
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCodeResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_url: String,
+    pub interval: u64,
+    pub expires_in: u64,
+}
+
+/// Запрашивает device_code для авторизации по коду на ya.ru/device
+pub async fn request_device_code() -> Result<DeviceCodeResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://oauth.yandex.ru/device/code")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(format!("client_id={}", CLIENT_ID))
+        .send()
+        .await?
+        .json::<DeviceCodeResponse>()
+        .await?;
+
+    Ok(resp)
 }
 
 #[cfg(test)]
