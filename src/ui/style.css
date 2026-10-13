@@ -71,19 +71,20 @@
 }
 
 .fluid-pill {
-    background: transparent;
-    border: none;
-    color: rgba(255, 255, 255, 0.7);
-    padding: 6px 14px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: rgba(255, 255, 255, 0.85);
+    padding: 8px 18px;
     border-radius: 9999px;
-    font-size: 13px;
-    font-weight: 500;
+    font-size: 14px;
+    font-weight: 600;
     transition: all 180ms ease;
 }
 
 .fluid-pill:hover {
     color: #ffffff;
-    background: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.16);
+    border-color: rgba(255, 255, 255, 0.28);
 }
 
 .fluid-pill:checked, .fluid-pill.active {
@@ -91,6 +92,56 @@
     color: #111111;
     font-weight: 600;
     box-shadow: 0 4px 14px rgba(255, 255, 255, 0.28);
+}
+
+/* Popover меню фильтров Волны */
+.rotor-popover-box {
+    padding: 6px 4px;
+    min-width: 250px;
+}
+
+.rotor-section-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: rgba(255, 255, 255, 0.45);
+    margin-top: 10px;
+    margin-bottom: 4px;
+    padding-left: 8px;
+}
+
+.rotor-filter-btn {
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 13px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.88);
+    background: transparent;
+    border: none;
+    transition: all 120ms ease;
+}
+
+.rotor-filter-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+}
+
+.rotor-reset-btn {
+    border-radius: 8px;
+    padding: 7px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #ff9d85;
+    background: rgba(255, 107, 74, 0.12);
+    border: 1px solid rgba(255, 107, 74, 0.22);
+    margin-top: 8px;
+}
+
+.rotor-reset-btn:hover {
+    background: rgba(255, 107, 74, 0.24);
+    color: #ffb7a5;
+    border-color: rgba(255, 107, 74, 0.4);
 }
 
 /* Парящий остров-плеер (Floating Island) */

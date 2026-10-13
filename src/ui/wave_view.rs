@@ -4,7 +4,10 @@ use std::rc::Rc;
 use std::time::Duration;
 use gtk4::cairo;
 use gtk4::prelude::*;
-use gtk4::{glib, Align, Box as GtkBox, Button, DrawingArea, Label, Orientation, Overlay, ScrolledWindow, PolicyType};
+use gtk4::{
+    glib, Align, Box as GtkBox, Button, DrawingArea, Label, MenuButton, Orientation, Overlay,
+    Popover, PositionType, Separator,
+};
 
 use crate::player::PlayerManager;
 
@@ -14,7 +17,7 @@ pub struct WaveViewWidgets {
     pub artist_label: Label,
     pub play_btn: Button,
     pub play_btn_icon: gtk4::Image,
-    pub filter_btn: Button,
+    pub menu_button: MenuButton,
     pub drawing_area: DrawingArea,
 }
 
@@ -154,60 +157,212 @@ pub fn create_wave_view(
 
     container.append(&meta_box);
 
-    // Горизонтальная лента чипов настроений
-    let scroll_wrap = ScrolledWindow::new();
-    scroll_wrap.set_policy(PolicyType::Automatic, PolicyType::Never);
-    scroll_wrap.set_halign(Align::Center);
+    // Центральная кнопка фильтров Ротора «Настроить волну»
+    let menu_button = MenuButton::new();
+    menu_button.set_label("⚙ Настроить волну ▾");
+    menu_button.add_css_class("fluid-pill");
+    menu_button.set_halign(Align::Center);
 
-    let pill_bar = GtkBox::new(Orientation::Horizontal, 8);
-    pill_bar.add_css_class("fluid-pill-bar");
+    // Всплывающее Popover меню настройки Моей волны
+    let popover = Popover::new();
+    popover.set_autohide(true);
+    popover.set_position(PositionType::Bottom);
 
-    let moods = [
-        ("⚡ Энергичное", "energetic", [1.0, 0.42, 0.29]), // #ff6b4a
-        ("☕ Спокойное", "calm", [0.21, 0.52, 0.89]),      // #3584e4
-        ("🇷🇺 На русском", "russian", [0.15, 0.64, 0.41]), // #26a269
-        ("✨ Новое", "discover", [0.61, 0.15, 0.69]),       // #9c27b0
-        ("🎉 Вечеринка", "party", [0.90, 0.65, 0.04]),     // #e5a50a
+    let popover_box = GtkBox::new(Orientation::Vertical, 2);
+    popover_box.add_css_class("rotor-popover-box");
+
+    struct RotorFilterOption {
+        label: &'static str,
+        mood: Option<&'static str>,
+        lang: Option<&'static str>,
+        charac: Option<&'static str>,
+        color: [f64; 3],
+    }
+
+    struct FilterSection {
+        title: &'static str,
+        options: Vec<RotorFilterOption>,
+    }
+
+    let sections = vec![
+        FilterSection {
+            title: "Настроение",
+            options: vec![
+                RotorFilterOption {
+                    label: "⚡ Энергичное",
+                    mood: Some("energetic"),
+                    lang: None,
+                    charac: None,
+                    color: [1.0, 0.42, 0.29],
+                },
+                RotorFilterOption {
+                    label: "☕ Спокойное",
+                    mood: Some("calm"),
+                    lang: None,
+                    charac: None,
+                    color: [0.21, 0.52, 0.89],
+                },
+                RotorFilterOption {
+                    label: "🎉 Весёлое",
+                    mood: Some("fun"),
+                    lang: None,
+                    charac: None,
+                    color: [0.90, 0.65, 0.04],
+                },
+                RotorFilterOption {
+                    label: "🌧 Грустное",
+                    mood: Some("sad"),
+                    lang: None,
+                    charac: None,
+                    color: [0.45, 0.50, 0.68],
+                },
+            ],
+        },
+        FilterSection {
+            title: "Характер",
+            options: vec![
+                RotorFilterOption {
+                    label: "❤️ Моё любимое",
+                    mood: None,
+                    lang: None,
+                    charac: Some("favorite"),
+                    color: [0.95, 0.20, 0.40],
+                },
+                RotorFilterOption {
+                    label: "✨ Незнакомое",
+                    mood: None,
+                    lang: None,
+                    charac: Some("discover"),
+                    color: [0.61, 0.15, 0.69],
+                },
+                RotorFilterOption {
+                    label: "🔥 Популярное",
+                    mood: None,
+                    lang: None,
+                    charac: Some("popular"),
+                    color: [0.95, 0.35, 0.10],
+                },
+            ],
+        },
+        FilterSection {
+            title: "Язык",
+            options: vec![
+                RotorFilterOption {
+                    label: "🇷🇺 На русском",
+                    mood: None,
+                    lang: Some("russian"),
+                    charac: None,
+                    color: [0.15, 0.64, 0.41],
+                },
+                RotorFilterOption {
+                    label: "🌐 Иностранный",
+                    mood: None,
+                    lang: Some("foreign"),
+                    charac: None,
+                    color: [0.12, 0.68, 0.82],
+                },
+                RotorFilterOption {
+                    label: "🎵 Без слов",
+                    mood: None,
+                    lang: Some("instrumental"),
+                    charac: None,
+                    color: [0.55, 0.35, 0.75],
+                },
+            ],
+        },
     ];
 
-    for (label_text, tag, rgb) in moods {
-        let pill = Button::with_label(label_text);
-        pill.add_css_class("fluid-pill");
-        if tag == "energetic" {
-            pill.add_css_class("active");
+    for (s_idx, section) in sections.into_iter().enumerate() {
+        if s_idx > 0 {
+            let sep = Separator::new(Orientation::Horizontal);
+            sep.set_margin_top(4);
+            sep.set_margin_bottom(4);
+            popover_box.append(&sep);
         }
 
+        let section_header = Label::new(Some(section.title));
+        section_header.add_css_class("rotor-section-title");
+        section_header.set_halign(Align::Start);
+        popover_box.append(&section_header);
+
+        for opt in section.options {
+            let btn = Button::with_label(opt.label);
+            btn.add_css_class("flat");
+            btn.add_css_class("rotor-filter-btn");
+            btn.set_halign(Align::Fill);
+
+            let player_clone = player.clone();
+            let accent_clone = accent_color.clone();
+            let da_weak = drawing_area.downgrade();
+            let pop_weak = popover.downgrade();
+            let mb_weak = menu_button.downgrade();
+
+            let opt_label = opt.label;
+            let mood_val = opt.mood.map(|s| s.to_string());
+            let lang_val = opt.lang.map(|s| s.to_string());
+            let char_val = opt.charac.map(|s| s.to_string());
+            let rgb = opt.color;
+
+            btn.connect_clicked(move |_| {
+                if let Some(pop) = pop_weak.upgrade() {
+                    pop.popdown();
+                }
+                if let Some(mb) = mb_weak.upgrade() {
+                    mb.set_label(&format!("{} ▾", opt_label));
+                }
+                *accent_clone.borrow_mut() = rgb;
+                if let Some(da) = da_weak.upgrade() {
+                    da.queue_draw();
+                }
+                player_clone.apply_rotor_filter(
+                    mood_val.clone(),
+                    lang_val.clone(),
+                    char_val.clone(),
+                );
+            });
+
+            popover_box.append(&btn);
+        }
+    }
+
+    // Разделитель и кнопка сброса фильтров
+    let reset_sep = Separator::new(Orientation::Horizontal);
+    reset_sep.set_margin_top(6);
+    reset_sep.set_margin_bottom(4);
+    popover_box.append(&reset_sep);
+
+    let reset_btn = Button::with_label("↺ Сбросить фильтры");
+    reset_btn.add_css_class("flat");
+    reset_btn.add_css_class("rotor-reset-btn");
+    reset_btn.set_halign(Align::Fill);
+
+    {
         let player_clone = player.clone();
         let accent_clone = accent_color.clone();
         let da_weak = drawing_area.downgrade();
-        let pill_bar_weak = pill_bar.downgrade();
+        let pop_weak = popover.downgrade();
+        let mb_weak = menu_button.downgrade();
 
-        pill.connect_clicked(move |clicked_btn| {
-            if let Some(bar) = pill_bar_weak.upgrade() {
-                // Снимаем класс active со всех дочерних кнопок
-                let mut child = bar.first_child();
-                while let Some(w) = child {
-                    w.remove_css_class("active");
-                    child = w.next_sibling();
-                }
+        reset_btn.connect_clicked(move |_| {
+            if let Some(pop) = pop_weak.upgrade() {
+                pop.popdown();
             }
-            clicked_btn.add_css_class("active");
-            *accent_clone.borrow_mut() = rgb;
+            if let Some(mb) = mb_weak.upgrade() {
+                mb.set_label("⚙ Настроить волну ▾");
+            }
+            *accent_clone.borrow_mut() = [1.0, 0.42, 0.29]; // дефолтный цвет
             if let Some(da) = da_weak.upgrade() {
                 da.queue_draw();
             }
-            player_clone.fetch_wave_tracks(tag);
+            player_clone.apply_rotor_filter(None, None, None);
         });
-
-        pill_bar.append(&pill);
     }
 
-    let filter_btn = Button::with_label("⚙ Фильтры");
-    filter_btn.add_css_class("fluid-pill");
-    pill_bar.append(&filter_btn);
+    popover_box.append(&reset_btn);
+    popover.set_child(Some(&popover_box));
+    menu_button.set_popover(Some(&popover));
 
-    scroll_wrap.set_child(Some(&pill_bar));
-    container.append(&scroll_wrap);
+    container.append(&menu_button);
 
     // Обработчик центральной кнопки Play
     {
@@ -223,7 +378,7 @@ pub fn create_wave_view(
         artist_label,
         play_btn,
         play_btn_icon,
-        filter_btn,
+        menu_button,
         drawing_area,
     }
 }

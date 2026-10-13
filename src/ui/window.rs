@@ -222,15 +222,6 @@ impl VolnaWindow {
                 }
             });
         }
-        {
-            let p_clone = player.clone();
-            let win_weak = window.downgrade();
-            wave_view.filter_btn.connect_clicked(move |_| {
-                if let Some(w) = win_weak.upgrade() {
-                    show_preferences_dialog(&w, &p_clone);
-                }
-            });
-        }
 
         // Таймер тика прогресса и синхронизации караоке
         {
