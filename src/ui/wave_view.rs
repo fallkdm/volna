@@ -43,7 +43,7 @@ pub fn create_wave_view(
     play_btn.add_css_class("hero-play-badge");
     play_btn.set_halign(Align::Center);
     play_btn.set_valign(Align::Center);
-    let play_btn_icon = gtk4::Image::from_icon_name("media-playback-pause-symbolic");
+    let play_btn_icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
     play_btn_icon.set_pixel_size(32);
     play_btn.set_child(Some(&play_btn_icon));
     visualizer_overlay.add_overlay(&play_btn);
@@ -141,13 +141,13 @@ pub fn create_wave_view(
     let meta_box = GtkBox::new(Orientation::Vertical, 4);
     meta_box.set_halign(Align::Center);
 
-    let title_label = Label::new(Some("Midnight City"));
+    let title_label = Label::new(Some("Моя волна"));
     title_label.add_css_class("hero-track-title");
     title_label.set_wrap(true);
     title_label.set_justify(gtk4::Justification::Center);
     meta_box.append(&title_label);
 
-    let artist_label = Label::new(Some("M83 • Hurry Up, We're Dreaming"));
+    let artist_label = Label::new(Some("Нажмите для запуска персонального потока 🌊"));
     artist_label.add_css_class("hero-track-artist");
     artist_label.set_justify(gtk4::Justification::Center);
     meta_box.append(&artist_label);

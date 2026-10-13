@@ -52,12 +52,65 @@ pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error +
 
 /// Получает сохраненный токен или None
 pub fn load_token() -> Option<String> {
-    load_config().ok().and_then(|cfg| cfg.token)
+    load_config().ok().and_then(|cfg| cfg.token).filter(|t| !t.trim().is_empty())
 }
 
 /// Сохраняет токен в файл конфигурации
 pub fn save_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let clean = extract_token_from_input(token);
     let mut config = load_config().unwrap_or_default();
-    config.token = Some(token.trim().to_string());
+    config.token = Some(clean);
     save_config(&config)
+}
+
+/// Удаляет сохраненный токен (выход из аккаунта)
+pub fn clear_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.token = None;
+    save_config(&config)
+}
+
+/// Извлекает чистый токен из произвольного ввода пользователя
+/// (например из URL https://music.yandex.ru/#access_token=y0_AgAAAA...&token_type=bearer)
+pub fn extract_token_from_input(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    // Если скопирован URL или фрагмент с access_token=
+    if let Some(pos) = trimmed.find("access_token=") {
+        let after = &trimmed[pos + "access_token=".len()..];
+        let token_part = after.split('&').next().unwrap_or(after);
+        return token_part.trim().to_string();
+    }
+
+    // Если скопирован с префиксом OAuth
+    if let Some(rest) = trimmed.strip_prefix("OAuth ") {
+        return rest.trim().to_string();
+    }
+
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_token() {
+        assert_eq!(
+            extract_token_from_input("y0_AgAAAAABcDeF"),
+            "y0_AgAAAAABcDeF"
+        );
+        assert_eq!(
+            extract_token_from_input("https://music.yandex.ru/#access_token=y0_AgAAAA12345&token_type=bearer"),
+            "y0_AgAAAA12345"
+        );
+        assert_eq!(
+            extract_token_from_input("access_token=y0_SecretToken&other=1"),
+            "y0_SecretToken"
+        );
+        assert_eq!(
+            extract_token_from_input("OAuth y0_MyToken"),
+            "y0_MyToken"
+        );
+    }
 }

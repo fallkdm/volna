@@ -45,14 +45,14 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     let meta_box = GtkBox::new(Orientation::Vertical, 2);
     meta_box.set_valign(Align::Center);
 
-    let title_label = Label::new(Some("Midnight City"));
+    let title_label = Label::new(Some("Моя волна"));
     title_label.add_css_class("island-title");
     title_label.set_halign(Align::Start);
     title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     title_label.set_max_width_chars(16);
     meta_box.append(&title_label);
 
-    let artist_label = Label::new(Some("M83"));
+    let artist_label = Label::new(Some("Яндекс Музыка"));
     artist_label.add_css_class("island-artist");
     artist_label.set_halign(Align::Start);
     artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -97,7 +97,7 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     let play_btn = Button::new();
     play_btn.add_css_class("circular");
     play_btn.add_css_class("suggested-action");
-    let play_btn_icon = Image::from_icon_name("media-playback-pause-symbolic");
+    let play_btn_icon = Image::from_icon_name("media-playback-start-symbolic");
     play_btn_icon.set_pixel_size(18);
     play_btn.set_child(Some(&play_btn_icon));
     play_btn.set_tooltip_text(Some("Пауза / Воспроизведение"));
@@ -126,7 +126,7 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     seek_scale.set_draw_value(false);
     progress_box.append(&seek_scale);
 
-    let total_time_label = Label::new(Some("04:03"));
+    let total_time_label = Label::new(Some("00:00"));
     total_time_label.add_css_class("time-label");
     progress_box.append(&total_time_label);
 

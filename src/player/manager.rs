@@ -21,9 +21,12 @@ pub enum PlayerUiEvent {
     LikeStateChanged(bool),
     DislikeStateChanged(bool),
     QueueUpdated(Vec<Track>),
-    CoverUpdated(String), // Локальный путь к скачанной обложке
-    LyricsUpdated(String), // Текст песни (LRC)
+    CoverUpdated(String),
+    LyricsUpdated(String),
     LoadingState(bool),
+    AuthRequired,
+    UserLoggedIn(String),
+    UserLoggedOut,
     StatusMessage(String),
     Error(String),
 }
@@ -41,6 +44,7 @@ pub struct PlayerState {
     pub current_mood: Option<String>,
     pub current_language: Option<String>,
     pub current_character: Option<String>,
+    pub user_login: Option<String>,
 }
 
 impl Default for PlayerState {
@@ -57,6 +61,7 @@ impl Default for PlayerState {
             current_mood: None,
             current_language: None,
             current_character: None,
+            user_login: None,
         }
     }
 }
@@ -87,8 +92,8 @@ impl PlayerManager {
             event_senders,
         };
 
-        // Наполняем стартовыми треками
-        manager.init_default_tracks();
+        // Проверяем статус авторизации при старте
+        manager.check_auth_on_startup();
 
         Ok(manager)
     }
@@ -100,86 +105,64 @@ impl PlayerManager {
         }
     }
 
-    /// Инициализирует стартовый набор треков для демонстрации/быстрого старта
-    fn init_default_tracks(&self) {
-        let default_tracks = vec![
-            Track {
-                id: "101".to_string(),
-                title: "Midnight City".to_string(),
-                artists: vec![crate::api::models::Artist {
-                    id: "1".to_string(),
-                    name: "M83".to_string(),
-                    cover: None,
-                }],
-                albums: vec![crate::api::models::Album {
-                    id: "1".to_string(),
-                    title: Some("Hurry Up, We're Dreaming".to_string()),
-                    year: Some(2011),
-                    cover_uri: None,
-                }],
-                duration_ms: Some(243000),
-                cover_uri: Some("avatars.yandex.net/get-music-content/175991/1a5cb1ad.a.872242-1/%%".to_string()),
-                og_image: None,
-                available: Some(true),
-            },
-            Track {
-                id: "102".to_string(),
-                title: "Star Guitar".to_string(),
-                artists: vec![crate::api::models::Artist {
-                    id: "2".to_string(),
-                    name: "The Chemical Brothers".to_string(),
-                    cover: None,
-                }],
-                albums: vec![crate::api::models::Album {
-                    id: "2".to_string(),
-                    title: Some("Come with Us".to_string()),
-                    year: Some(2002),
-                    cover_uri: None,
-                }],
-                duration_ms: Some(239000),
-                cover_uri: Some("avatars.yandex.net/get-music-content/2358262/a949b251.a.100222-1/%%".to_string()),
-                og_image: None,
-                available: Some(true),
-            },
-            Track {
-                id: "103".to_string(),
-                title: "Resonance".to_string(),
-                artists: vec![crate::api::models::Artist {
-                    id: "3".to_string(),
-                    name: "HOME".to_string(),
-                    cover: None,
-                }],
-                albums: vec![crate::api::models::Album {
-                    id: "3".to_string(),
-                    title: Some("Odyssey".to_string()),
-                    year: Some(2014),
-                    cover_uri: None,
-                }],
-                duration_ms: Some(212000),
-                cover_uri: Some("avatars.yandex.net/get-music-content/42107/8a6998ff.a.379201-1/%%".to_string()),
-                og_image: None,
-                available: Some(true),
-            },
-        ];
+    /// Проверяет наличие токена при старте и запрашивает профиль пользователя
+    fn check_auth_on_startup(&self) {
+        let client_clone = self.client.clone();
+        let state_clone = self.state.clone();
+        let senders = self.event_senders.clone();
 
-        if let Ok(mut state) = self.state.lock() {
-            state.queue = default_tracks.clone();
-            state.current_track = state.queue.first().cloned();
-            state.current_index = 0;
-        }
+        tokio::spawn(async move {
+            let client = client_clone.lock().unwrap().clone();
+            if client.has_token() {
+                match client.get_account_status().await {
+                    Ok(acc) => {
+                        let login = acc.account.as_ref().and_then(|a| a.login.clone())
+                            .or_else(|| acc.account.as_ref().and_then(|a| a.full_name.clone()))
+                            .unwrap_or_else(|| "Яндекс Пользователь".to_string());
 
-        self.emit(PlayerUiEvent::QueueUpdated(default_tracks.clone()));
-        if let Some(first) = default_tracks.first() {
-            self.emit(PlayerUiEvent::TrackStarted {
-                track: first.clone(),
-                index: 0,
-                total_queue: default_tracks.len(),
-            });
-        }
+                        if let Ok(mut state) = state_clone.lock() {
+                            state.user_login = Some(login.clone());
+                        }
+
+                        emit_all(&senders, PlayerUiEvent::UserLoggedIn(login.clone()));
+                        emit_all(&senders, PlayerUiEvent::StatusMessage(
+                            format!("С возвращением, {}! Нажмите «Включить волну» 🌊", login)
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("Ошибка проверки аккаунта: {}", e);
+                        emit_all(&senders, PlayerUiEvent::AuthRequired);
+                    }
+                }
+            } else {
+                emit_all(&senders, PlayerUiEvent::AuthRequired);
+            }
+        });
     }
 
-    /// Переключает воспроизведение (Play/Pause)
+    /// Запускает или переключает воспроизведение (Play/Pause)
     pub fn toggle_play(&self) {
+        let has_tracks = {
+            let state = self.state.lock().unwrap();
+            !state.queue.is_empty()
+        };
+
+        if !has_tracks {
+            let has_token = self.client.lock().unwrap().has_token();
+            if !has_token {
+                self.emit(PlayerUiEvent::AuthRequired);
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Для запуска Моей волны выполните вход через Яндекс ID".to_string(),
+                ));
+            } else {
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Загружаем персональную Мою волну... 🌊".to_string(),
+                ));
+                self.fetch_wave_tracks("onyourwave");
+            }
+            return;
+        }
+
         let is_playing = self.audio.toggle_play();
         self.emit(PlayerUiEvent::PlaybackToggled(is_playing));
     }
@@ -244,7 +227,7 @@ impl PlayerManager {
         self.play_track_stream(&prev_track);
     }
 
-    /// Воспроизводит конкретный трек (например, выбранный из поиска)
+    /// Воспроизводит конкретный трек (например, из поиска)
     pub fn play_single_track(&self, track: Track) {
         {
             let mut state = self.state.lock().unwrap();
@@ -357,6 +340,24 @@ impl PlayerManager {
         }
     }
 
+    /// Выход из аккаунта
+    pub fn logout(&self) {
+        let _ = crate::api::auth::clear_token();
+        self.audio.pause();
+        if let Ok(mut c) = self.client.lock() {
+            c.set_token(None);
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.user_login = None;
+            state.queue.clear();
+            state.current_track = None;
+            state.current_index = 0;
+        }
+        self.emit(PlayerUiEvent::PlaybackToggled(false));
+        self.emit(PlayerUiEvent::UserLoggedOut);
+        self.emit(PlayerUiEvent::StatusMessage("Вы вышли из аккаунта Яндекс Музыки".into()));
+    }
+
     /// Загружает прямую ссылку на трек, кэширует обложку и начинает воспроизведение через GStreamer
     fn play_track_stream(&self, track: &Track) {
         let client_clone = self.client.clone();
@@ -396,12 +397,14 @@ impl PlayerManager {
                     }
                     Err(e) => {
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
-                        emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка потока: {}", e)));
+                        emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка получения потока: {}", e)));
                     }
                 }
             } else {
-                audio_clone.play();
-                emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
+                emit_all(&senders, PlayerUiEvent::AuthRequired);
+                emit_all(&senders, PlayerUiEvent::StatusMessage(
+                    "Требуется авторизация для воспроизведения".to_string(),
+                ));
             }
         });
     }
@@ -443,11 +446,14 @@ impl PlayerManager {
             state.station_id = station_id.clone();
         }
 
+        let audio_clone = self.audio.clone();
+
         tokio::spawn(async move {
             let client = client_clone.lock().unwrap().clone();
             if !client.has_token() {
+                emit_all(&senders, PlayerUiEvent::AuthRequired);
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
-                    "Для реального потока Волны укажите токен в настройках ⚙".to_string(),
+                    "Войдите в Яндекс ID для запуска персональной Моей волны".to_string(),
                 ));
                 return;
             }
@@ -461,26 +467,44 @@ impl PlayerManager {
             ).await {
                 Ok(station_tracks) => {
                     let tracks: Vec<Track> = station_tracks.sequence.into_iter().map(|s| s.track).collect();
+                    let first_track = tracks.first().cloned();
+
                     if let Ok(mut state) = state_clone.lock() {
-                        state.batch_id = station_tracks.batch_id;
+                        state.batch_id = station_tracks.batch_id.clone();
                         if !tracks.is_empty() {
                             state.queue = tracks.clone();
                             state.current_index = 0;
-                            state.current_track = state.queue.first().cloned();
+                            state.current_track = first_track.clone();
                         }
                     }
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     emit_all(&senders, PlayerUiEvent::QueueUpdated(tracks.clone()));
-                    if let Some(first) = tracks.first() {
+
+                    if let Some(track) = first_track {
                         emit_all(&senders, PlayerUiEvent::TrackStarted {
-                            track: first.clone(),
+                            track: track.clone(),
                             index: 0,
                             total_queue: tracks.len(),
                         });
+
+                        // Сразу запускаем воспроизведение первого трека Волны
+                        let track_id = track.id.clone();
+                        let batch_id = station_tracks.batch_id;
+                        match client.get_track_direct_url(&track_id).await {
+                            Ok(url) => {
+                                audio_clone.play_url(&url);
+                                emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
+                                let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
+                            }
+                            Err(e) => {
+                                emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка старта Волны: {}", e)));
+                            }
+                        }
+                    } else {
+                        emit_all(&senders, PlayerUiEvent::StatusMessage(
+                            "В станции ротора нет треков".to_string(),
+                        ));
                     }
-                    emit_all(&senders, PlayerUiEvent::StatusMessage(
-                        "Поток Моей волны перенастроен ✨".to_string(),
-                    ));
                 }
                 Err(e) => {
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));

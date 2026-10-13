@@ -13,6 +13,7 @@ use libadwaita::{
 
 use crate::api::models::{parse_lrc, LrcLine};
 use crate::player::{PlayerManager, PlayerUiEvent};
+use super::auth_dialog::show_auth_dialog;
 use super::floating_island::{create_floating_island, FloatingIslandWidgets};
 use super::library_view::create_library_view;
 use super::preferences_dialog::show_preferences_dialog;
@@ -78,12 +79,20 @@ impl VolnaWindow {
             .build();
         header_bar.set_title_widget(Some(&view_switcher));
 
+        // Правая часть HeaderBar: Кнопка профиля/авторизации + Настройки
+        let right_header_box = GtkBox::new(Orientation::Horizontal, 8);
+
+        let auth_btn = Button::with_label("Войти в Яндекс ID");
+        auth_btn.add_css_class("suggested-action");
+        right_header_box.append(&auth_btn);
+
         let settings_btn = Button::from_icon_name("emblem-system-symbolic");
         settings_btn.set_tooltip_text(Some("Настройки Волны и токен"));
         settings_btn.add_css_class("flat");
         settings_btn.add_css_class("circular");
-        header_bar.pack_end(&settings_btn);
+        right_header_box.append(&settings_btn);
 
+        header_bar.pack_end(&right_header_box);
         background_box.append(&header_bar);
 
         let is_playing_state = Rc::new(RefCell::new(false));
@@ -173,6 +182,36 @@ impl VolnaWindow {
         toast_overlay.set_child(Some(&root_overlay));
         window.set_content(Some(&toast_overlay));
 
+        // Клик по кнопке авторизации
+        {
+            let p_clone = player.clone();
+            let win_weak = window.downgrade();
+            auth_btn.connect_clicked(move |_| {
+                if let Some(w) = win_weak.upgrade() {
+                    let is_logged_in = p_clone.client.lock().unwrap().has_token();
+                    if is_logged_in {
+                        // Диалог с предложением выйти
+                        let alert = libadwaita::AlertDialog::new(
+                            Some("Управление аккаунтом"),
+                            Some("Вы авторизованы в Яндекс Музыке."),
+                        );
+                        alert.add_response("cancel", "Отмена");
+                        alert.add_response("logout", "Выйти из аккаунта");
+                        alert.set_response_appearance("logout", libadwaita::ResponseAppearance::Destructive);
+
+                        let p_inner = p_clone.clone();
+                        alert.choose(Some(&w), None::<&gio::Cancellable>, move |response| {
+                            if response == "logout" {
+                                p_inner.logout();
+                            }
+                        });
+                    } else {
+                        show_auth_dialog(&w, &p_clone);
+                    }
+                }
+            });
+        }
+
         // Открытие настроек
         {
             let p_clone = player.clone();
@@ -243,9 +282,12 @@ impl VolnaWindow {
         // Обработка асинхронных событий
         setup_event_listener(
             event_receiver,
+            window.clone(),
             toast_overlay,
             wave_view,
             island,
+            auth_btn,
+            player.clone(),
             is_playing_state,
             lyrics_container,
             lyrics_data,
@@ -268,14 +310,18 @@ fn format_seconds(secs: u64) -> String {
 
 fn setup_event_listener(
     receiver: Receiver<PlayerUiEvent>,
+    window: ApplicationWindow,
     toast_overlay: ToastOverlay,
     wave_view: WaveViewWidgets,
     island: FloatingIslandWidgets,
+    auth_btn: Button,
+    player: PlayerManager,
     is_playing_state: Rc<RefCell<bool>>,
     lyrics_container: GtkBox,
     lyrics_data: Rc<RefCell<Vec<LrcLine>>>,
     lyrics_labels: Rc<RefCell<Vec<Label>>>,
 ) {
+    let win_weak = window.downgrade();
     gtk4::glib::spawn_future_local(async move {
         while let Ok(event) = receiver.recv().await {
             match event {
@@ -336,7 +382,6 @@ fn setup_event_listener(
                 }
                 PlayerUiEvent::LyricsUpdated(lrc_text) => {
                     let parsed = parse_lrc(&lrc_text);
-                    // Очищаем старые строки
                     while let Some(child) = lyrics_container.first_child() {
                         lyrics_container.remove(&child);
                     }
@@ -353,6 +398,30 @@ fn setup_event_listener(
 
                     *lyrics_data.borrow_mut() = parsed;
                     *lyrics_labels.borrow_mut() = new_labels;
+                }
+                PlayerUiEvent::AuthRequired => {
+                    auth_btn.set_label("Войти в Яндекс ID");
+                    auth_btn.remove_css_class("flat");
+                    auth_btn.add_css_class("suggested-action");
+                    if let Some(w) = win_weak.upgrade() {
+                        show_auth_dialog(&w, &player);
+                    }
+                }
+                PlayerUiEvent::UserLoggedIn(login) => {
+                    auth_btn.set_label(&format!("👤 {}", login));
+                    auth_btn.remove_css_class("suggested-action");
+                    auth_btn.add_css_class("flat");
+                }
+                PlayerUiEvent::UserLoggedOut => {
+                    auth_btn.set_label("Войти в Яндекс ID");
+                    auth_btn.remove_css_class("flat");
+                    auth_btn.add_css_class("suggested-action");
+
+                    wave_view.title_label.set_text("Моя волна");
+                    wave_view.artist_label.set_text("Войдите в Яндекс ID для запуска потока");
+                    island.title_label.set_text("Моя волна");
+                    island.artist_label.set_text("Яндекс Музыка");
+                    island.cover_image.set_icon_name(Some("audio-x-generic-symbolic"));
                 }
                 PlayerUiEvent::StatusMessage(msg) => {
                     let toast = Toast::new(&msg);

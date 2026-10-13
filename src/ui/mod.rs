@@ -1,3 +1,4 @@
+pub mod auth_dialog;
 pub mod floating_island;
 pub mod library_view;
 pub mod preferences_dialog;
@@ -5,6 +6,7 @@ pub mod search_view;
 pub mod wave_view;
 pub mod window;
 
+pub use auth_dialog::show_auth_dialog;
 pub use window::VolnaWindow;
 
 /// Загружает встроенные CSS стили приложения
