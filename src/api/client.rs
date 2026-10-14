@@ -7,8 +7,9 @@ use sha2::Sha256;
 use std::fmt;
 
 use super::models::{
-    AccountStatus, DownloadInfo, LikedTracksResult, RotorFeedback, RotorFeedbackType,
-    RotorStationTracks, SearchResult, Track, TrackLyricsResult, TrackSupplement, YandexApiResponse,
+    parse_lrc, AccountStatus, DownloadInfo, LikedTracksResult, LrclibResponse, RotorFeedback,
+    RotorFeedbackType, RotorStationTracks, SearchResult, Track, TrackLyricsResult, TrackSupplement,
+    YandexApiResponse,
 };
 
 const BASE_API_URL: &str = "https://api.music.yandex.net";
@@ -317,9 +318,109 @@ impl YandexMusicClient {
         Ok(full_tracks.result)
     }
 
-    /// Запрос синхронизированного текста песни (Караоке LRC) с fallback на полный текст (supplement)
-    pub async fn get_track_lyrics(&self, track_id: &str) -> Result<Option<String>, ApiError> {
-        // 1. Пробуем запросить официальный синхронизированный LRC
+    /// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net)
+    pub async fn get_lrclib_lyrics(
+        &self,
+        artist: &str,
+        title: &str,
+        duration_secs: Option<u64>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let clean_artist = artist.trim();
+        let clean_title = title.trim();
+        if clean_artist.is_empty() || clean_title.is_empty() {
+            return Ok(None);
+        }
+
+        let encoded_artist = urlencoding_encode(clean_artist);
+        let encoded_title = urlencoding_encode(clean_title);
+
+        let make_url = |dur: Option<u64>| {
+            if let Some(secs) = dur {
+                format!(
+                    "https://lrclib.net/api/get?artist_name={}&track_name={}&duration={}",
+                    encoded_artist, encoded_title, secs
+                )
+            } else {
+                format!(
+                    "https://lrclib.net/api/get?artist_name={}&track_name={}",
+                    encoded_artist, encoded_title
+                )
+            }
+        };
+
+        let primary_url = make_url(duration_secs);
+        let resp = self
+            .client
+            .get(&primary_url)
+            .header(
+                "User-Agent",
+                "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
+            )
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => Some(r),
+            // Если запрос с точной длительностью вернул 404, повторяем поиск без ограничения длительности
+            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND && duration_secs.is_some() => {
+                let fallback_url = make_url(None);
+                if let Ok(r2) = self
+                    .client
+                    .get(&fallback_url)
+                    .header(
+                        "User-Agent",
+                        "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
+                    )
+                    .send()
+                    .await
+                {
+                    if r2.status().is_success() {
+                        Some(r2)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(response) = resp {
+            if let Ok(data) = response.json::<LrclibResponse>().await {
+                if let Some(synced) = data.synced_lyrics {
+                    let trimmed = synced.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(Some(trimmed.to_string()));
+                    }
+                }
+                if let Some(plain) = data.plain_lyrics {
+                    let trimmed = plain.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(Some(trimmed.to_string()));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Запрос текста песни для плеера:
+    /// - Если Яндекс Музыка вернула синхронизированный LRC с таймкодами — используем его.
+    /// - Если Яндекс Музыка вернула статический текст (без таймкодов) или ошибку — запрашиваем LRCLIB.
+    /// - Если LRCLIB нашел синхронизированный LRC — отдаем его (полноценное караоке!).
+    /// - Если LRCLIB ничего не нашел — отдаем статический текст Яндекса.
+    pub async fn get_track_lyrics(
+        &self,
+        track_id: &str,
+        artist: &str,
+        title: &str,
+        duration_secs: Option<u64>,
+    ) -> Result<Option<String>, ApiError> {
+        let mut yandex_plain: Option<String> = None;
+
+        // 1. Пробуем запросить официальный синхронизированный LRC из Яндекса
         let timestamp = chrono::Utc::now().timestamp();
         let sign = sign_lyrics_request(track_id, timestamp);
         let lrc_url = format!(
@@ -342,28 +443,53 @@ impl YandexMusicClient {
                     if let Some(lrc_text) = lrc_resp.result.lyrics.or(lrc_resp.result.full_lyrics) {
                         let trimmed = lrc_text.trim();
                         if !trimmed.is_empty() {
-                            return Ok(Some(trimmed.to_string()));
+                            if !parse_lrc(trimmed).is_empty() {
+                                return Ok(Some(trimmed.to_string()));
+                            } else {
+                                yandex_plain = Some(trimmed.to_string());
+                            }
                         }
                     }
                 }
             }
         }
 
-        // 2. Fallback на /tracks/{track_id}/supplement (обычный полный текст песни)
-        let supp_url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
-        let resp = self
-            .client
-            .get(&supp_url)
-            .headers(self.headers())
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            return Ok(None);
+        // Если Яндекс не вернул LRC, пробуем /tracks/{track_id}/supplement на случай статического текста
+        if yandex_plain.is_none() {
+            let supp_url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
+            if let Ok(resp) = self.client.get(&supp_url).headers(self.headers()).send().await {
+                if resp.status().is_success() {
+                    if let Ok(supp) = resp.json::<YandexApiResponse<TrackSupplement>>().await {
+                        if let Some(full) = supp.result.lyrics.and_then(|l| l.full_lyrics) {
+                            let trimmed = full.trim();
+                            if !trimmed.is_empty() {
+                                if !parse_lrc(trimmed).is_empty() {
+                                    return Ok(Some(trimmed.to_string()));
+                                } else {
+                                    yandex_plain = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let supp: YandexApiResponse<TrackSupplement> = resp.json().await?;
-        Ok(supp.result.lyrics.and_then(|l| l.full_lyrics))
+        // 2. У Яндекса нет синхронизированных таймкодов (или запрос вернул ошибку).
+        // Запрашиваем открытую глобальную базу LRCLIB (https://lrclib.net)
+        if let Ok(Some(lrclib_text)) = self.get_lrclib_lyrics(artist, title, duration_secs).await {
+            // Если в LRCLIB есть синхронизированные таймкоды — возвращаем их (полноценное караоке!)
+            if !parse_lrc(&lrclib_text).is_empty() {
+                return Ok(Some(lrclib_text));
+            }
+            // Если в LRCLIB только статический текст, а у Яндекса текста не было вовсе
+            if yandex_plain.is_none() {
+                return Ok(Some(lrclib_text));
+            }
+        }
+
+        // 3. Fallback на статический текст из Яндекс Музыки
+        Ok(yandex_plain)
     }
 
     /// Отправляет событие обратной связи (Feedback) в станцию Ротора
@@ -545,5 +671,21 @@ mod tests {
         let sign = sign_lyrics_request("12345", 1728840000);
         assert!(!sign.is_empty());
         assert_eq!(sign, sign_lyrics_request("12345", 1728840000));
+    }
+
+    #[test]
+    fn test_lrclib_response_deserialization() {
+        let json_camel = r#"{
+            "id": 1154804,
+            "trackName": "Blessed with a Curse",
+            "artistName": "Bring Me the Horizon",
+            "plainLyrics": "Ever since this began, I was blessed with a curse\n",
+            "syncedLyrics": "[01:01.06] Ever since this began, I was blessed with a curse\n[01:08.02] And for better or for worse\n"
+        }"#;
+
+        let parsed: LrclibResponse = serde_json::from_str(json_camel).unwrap();
+        assert!(parsed.synced_lyrics.is_some());
+        assert!(parsed.plain_lyrics.is_some());
+        assert!(!parse_lrc(parsed.synced_lyrics.as_deref().unwrap()).is_empty());
     }
 }

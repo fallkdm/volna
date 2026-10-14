@@ -371,6 +371,15 @@ pub struct TrackLyricsResult {
     pub full_lyrics: Option<String>,
 }
 
+/// Ответ от открытой базы караоке LRCLIB (https://lrclib.net)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LrclibResponse {
+    #[serde(rename = "syncedLyrics", alias = "synced_lyrics")]
+    pub synced_lyrics: Option<String>,
+    #[serde(rename = "plainLyrics", alias = "plain_lyrics")]
+    pub plain_lyrics: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LyricsInfo {
     #[serde(rename = "syncType")]

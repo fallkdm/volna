@@ -458,6 +458,9 @@ impl PlayerManager {
         let client_clone = self.client.clone();
         let audio_clone = self.audio.clone();
         let track_id = track.id.clone();
+        let track_title = track.title.clone();
+        let track_artist = track.artists_string();
+        let track_duration_secs = track.duration_ms.map(|d| d / 1000);
         let cover_url = track.cover_url(400);
         let station_id = self.state.lock().unwrap().station_id.clone();
         let batch_id = self.state.lock().unwrap().batch_id.clone();
@@ -476,7 +479,15 @@ impl PlayerManager {
             // Запрашиваем текст песни (Lyrics)
             let client = client_clone.lock().unwrap().clone();
             if client.has_token() {
-                if let Ok(Some(lyrics)) = client.get_track_lyrics(&track_id).await {
+                if let Ok(Some(lyrics)) = client
+                    .get_track_lyrics(
+                        &track_id,
+                        &track_artist,
+                        &track_title,
+                        track_duration_secs,
+                    )
+                    .await
+                {
                     emit_all(&senders, PlayerUiEvent::LyricsUpdated(lyrics));
                 }
             }
