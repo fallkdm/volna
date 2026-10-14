@@ -244,27 +244,16 @@
 }
 
 /* Индикатор обратного отсчета (Countdown 3..2..1) перед вступлением */
-.karaoke-countdown-box {
-    background-color: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 20px;
-    padding: 8px 18px;
-    transition: all 200ms ease;
+.karaoke-countdown-digit {
+    font-size: 82px;
+    font-weight: 900;
+    color: #ffffff;
+    text-shadow: 0 0 36px rgba(255, 107, 74, 0.9), 0 0 12px #ffffff;
+    margin-top: 50px;
 }
 
-.countdown-dot {
-    min-width: 12px;
-    min-height: 12px;
-    border-radius: 9999px;
-    background-color: rgba(255, 255, 255, 0.22);
-    transition: all 250ms ease;
-}
-
-.countdown-dot.active {
-    background-color: #ff6b4a;
-    box-shadow: 0 0 14px rgba(255, 107, 74, 0.85);
-    min-width: 14px;
-    min-height: 14px;
+.karaoke-lyrics-scrolled {
+    transition: opacity 350ms ease;
 }
 
 /* Строки караоке и текста песни */

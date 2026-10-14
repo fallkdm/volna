@@ -121,73 +121,91 @@ impl VolnaWindow {
         root_overlay.add_overlay(&island.container);
 
         // ================= Оверлей текста песни (Karaoke Overlay) =================
-        let karaoke_box = GtkBox::new(Orientation::Vertical, 12);
-        karaoke_box.add_css_class("karaoke-sheet");
-        karaoke_box.set_visible(false);
-        karaoke_box.set_vexpand(true);
-        karaoke_box.set_hexpand(true);
+        let karaoke_overlay = Overlay::new();
+        karaoke_overlay.add_css_class("karaoke-sheet");
+        karaoke_overlay.set_visible(false);
+        karaoke_overlay.set_vexpand(true);
+        karaoke_overlay.set_hexpand(true);
 
-        let k_header = GtkBox::new(Orientation::Horizontal, 0);
+        // 1. Скроллируемый контейнер текста песни (базовый слой)
+        let lyrics_scrolled = ScrolledWindow::new();
+        lyrics_scrolled.add_css_class("karaoke-lyrics-scrolled");
+        lyrics_scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
+        lyrics_scrolled.set_vexpand(true);
+        lyrics_scrolled.set_hexpand(true);
+
+        let lyrics_container = GtkBox::new(Orientation::Vertical, 14);
+        lyrics_container.set_valign(Align::Center);
+        lyrics_container.set_halign(Align::Center);
+        lyrics_container.set_margin_top(80);
+        lyrics_container.set_margin_bottom(90);
+
+        lyrics_scrolled.set_child(Some(&lyrics_container));
+        karaoke_overlay.set_child(Some(&lyrics_scrolled));
+
+        // 2. Абсолютно зафиксированная шапка (слой поверх текста, Align::Start по вертикали)
+        let k_header = GtkBox::new(Orientation::Horizontal, 16);
+        k_header.set_valign(Align::Start);
+        k_header.set_hexpand(true);
         k_header.set_margin_top(20);
         k_header.set_margin_start(24);
         k_header.set_margin_end(24);
 
+        let k_track_info = GtkBox::new(Orientation::Vertical, 2);
+        k_track_info.set_valign(Align::Center);
+        k_track_info.set_halign(Align::Start);
+
+        let k_track_title = Label::new(Some("Моя волна"));
+        k_track_title.add_css_class("heading");
+        k_track_title.set_halign(Align::Start);
+        k_track_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        k_track_title.set_max_width_chars(28);
+
+        let k_track_artist = Label::new(Some("Яндекс Музыка"));
+        k_track_artist.add_css_class("dim-label");
+        k_track_artist.set_halign(Align::Start);
+        k_track_artist.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        k_track_artist.set_max_width_chars(28);
+
+        k_track_info.append(&k_track_title);
+        k_track_info.append(&k_track_artist);
+        k_header.append(&k_track_info);
+
         let k_close_btn = Button::from_icon_name("window-close-symbolic");
         k_close_btn.set_halign(Align::End);
+        k_close_btn.set_valign(Align::Center);
         k_close_btn.set_hexpand(true);
         k_close_btn.add_css_class("circular");
         k_close_btn.add_css_class("karaoke-close-btn");
         k_close_btn.set_tooltip_text(Some("Закрыть текст песни"));
         k_header.append(&k_close_btn);
-        karaoke_box.append(&k_header);
+        karaoke_overlay.add_overlay(&k_header);
 
-        let countdown_box = GtkBox::new(Orientation::Horizontal, 12);
-        countdown_box.add_css_class("karaoke-countdown-box");
-        countdown_box.set_halign(Align::Center);
-        countdown_box.set_margin_top(8);
-        countdown_box.set_margin_bottom(8);
-        countdown_box.set_visible(false);
+        // 3. Крупная неоновая цифра обратного отсчета (парит в верхней трети, не дергает верстку)
+        let countdown_label = Label::new(Some("3"));
+        countdown_label.add_css_class("karaoke-countdown-digit");
+        countdown_label.set_halign(Align::Center);
+        countdown_label.set_valign(Align::Start);
+        countdown_label.set_margin_top(90);
+        countdown_label.set_visible(false);
+        karaoke_overlay.add_overlay(&countdown_label);
 
-        let dot1 = GtkBox::new(Orientation::Horizontal, 0);
-        dot1.add_css_class("countdown-dot");
-        let dot2 = GtkBox::new(Orientation::Horizontal, 0);
-        dot2.add_css_class("countdown-dot");
-        let dot3 = GtkBox::new(Orientation::Horizontal, 0);
-        dot3.add_css_class("countdown-dot");
-
-        countdown_box.append(&dot1);
-        countdown_box.append(&dot2);
-        countdown_box.append(&dot3);
-        karaoke_box.append(&countdown_box);
-
-        let lyrics_scrolled = ScrolledWindow::new();
-        lyrics_scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
-        lyrics_scrolled.set_vexpand(true);
-
-        let lyrics_container = GtkBox::new(Orientation::Vertical, 14);
-        lyrics_container.set_valign(Align::Center);
-        lyrics_container.set_halign(Align::Center);
-        lyrics_container.set_margin_top(32);
-        lyrics_container.set_margin_bottom(80);
-
-        lyrics_scrolled.set_child(Some(&lyrics_container));
-        karaoke_box.append(&lyrics_scrolled);
-        root_overlay.add_overlay(&karaoke_box);
+        root_overlay.add_overlay(&karaoke_overlay);
 
         let lyrics_data: Rc<RefCell<Vec<LrcLine>>> = Rc::new(RefCell::new(Vec::new()));
         let lyrics_labels: Rc<RefCell<Vec<Label>>> = Rc::new(RefCell::new(Vec::new()));
 
         // Управление показом караоке
         {
-            let k_box_clone = karaoke_box.clone();
+            let k_overlay_clone = karaoke_overlay.clone();
             island.karaoke_btn.connect_clicked(move |_| {
-                k_box_clone.set_visible(true);
+                k_overlay_clone.set_visible(true);
             });
         }
         {
-            let k_box_clone = karaoke_box.clone();
+            let k_overlay_clone = karaoke_overlay.clone();
             k_close_btn.connect_clicked(move |_| {
-                k_box_clone.set_visible(false);
+                k_overlay_clone.set_visible(false);
             });
         }
 
@@ -245,12 +263,10 @@ impl VolnaWindow {
             let l_data = lyrics_data.clone();
             let l_labels = lyrics_labels.clone();
             let sc_weak = lyrics_scrolled.downgrade();
-            let cnt_box = countdown_box.clone();
-            let d1 = dot1.clone();
-            let d2 = dot2.clone();
-            let d3 = dot3.clone();
+            let cnt_label = countdown_label.clone();
+            let sc_clone = lyrics_scrolled.clone();
 
-            gtk4::glib::timeout_add_local(Duration::from_millis(250), move || {
+            gtk4::glib::timeout_add_local(Duration::from_millis(200), move || {
                 if *is_playing_ref.borrow() {
                     if let Some(pos) = player_clone.audio.position_seconds() {
                         let dur = player_clone.audio.duration_seconds().unwrap_or(240);
@@ -286,32 +302,25 @@ impl VolnaWindow {
                             if let Some(target_time) = next_line_info {
                                 if target_time > pos_ms {
                                     let diff_ms = target_time - pos_ms;
-                                    if diff_ms <= 3000 {
+                                    if diff_ms <= 3000 && diff_ms > 0 {
                                         counting_down = true;
-                                        cnt_box.set_visible(true);
-                                        // за 3 секунды загорается первая точка (3)
-                                        d1.add_css_class("active");
-                                        // за 2 секунды загорается вторая точка (2)
-                                        if diff_ms <= 2000 {
-                                            d2.add_css_class("active");
+                                        cnt_label.set_visible(true);
+                                        let digit_str = if diff_ms > 2000 {
+                                            "3"
+                                        } else if diff_ms > 1000 {
+                                            "2"
                                         } else {
-                                            d2.remove_css_class("active");
-                                        }
-                                        // за 1 секунду загорается третья точка (1)
-                                        if diff_ms <= 1000 {
-                                            d3.add_css_class("active");
-                                        } else {
-                                            d3.remove_css_class("active");
-                                        }
+                                            "1"
+                                        };
+                                        cnt_label.set_text(digit_str);
+                                        sc_clone.set_opacity(0.0);
                                     }
                                 }
                             }
 
                             if !counting_down {
-                                cnt_box.set_visible(false);
-                                d1.remove_css_class("active");
-                                d2.remove_css_class("active");
-                                d3.remove_css_class("active");
+                                cnt_label.set_visible(false);
+                                sc_clone.set_opacity(1.0);
                             }
 
                             let active_idx = lines.iter().rposition(|l| l.time_ms <= pos_ms);
@@ -330,7 +339,8 @@ impl VolnaWindow {
                                 }
                             }
                         } else {
-                            cnt_box.set_visible(false);
+                            cnt_label.set_visible(false);
+                            sc_clone.set_opacity(1.0);
                         }
                     }
                 }
@@ -351,7 +361,10 @@ impl VolnaWindow {
             lyrics_container,
             lyrics_data,
             lyrics_labels,
-            countdown_box,
+            countdown_label,
+            lyrics_scrolled,
+            k_track_title,
+            k_track_artist,
         );
 
         Self { window }
@@ -380,7 +393,10 @@ fn setup_event_listener(
     lyrics_container: GtkBox,
     lyrics_data: Rc<RefCell<Vec<LrcLine>>>,
     lyrics_labels: Rc<RefCell<Vec<Label>>>,
-    countdown_box: GtkBox,
+    countdown_label: Label,
+    lyrics_scrolled: ScrolledWindow,
+    k_track_title: Label,
+    k_track_artist: Label,
 ) {
     let win_weak = window.downgrade();
     gtk4::glib::spawn_future_local(async move {
@@ -402,13 +418,17 @@ fn setup_event_listener(
                     island.title_label.set_text(&track.title);
                     island.artist_label.set_text(&artists);
 
+                    k_track_title.set_text(&track.title);
+                    k_track_artist.set_text(&artists);
+
                     // Сбрасываем текст песни и обратный отсчет для нового трека
                     while let Some(child) = lyrics_container.first_child() {
                         lyrics_container.remove(&child);
                     }
                     *lyrics_data.borrow_mut() = Vec::new();
                     *lyrics_labels.borrow_mut() = Vec::new();
-                    countdown_box.set_visible(false);
+                    countdown_label.set_visible(false);
+                    lyrics_scrolled.set_opacity(1.0);
 
                     if let Some(dur_ms) = track.duration_ms {
                         let total_secs = dur_ms / 1000;
@@ -470,7 +490,8 @@ fn setup_event_listener(
                         *lyrics_data.borrow_mut() = parsed;
                         *lyrics_labels.borrow_mut() = new_labels;
                     } else {
-                        countdown_box.set_visible(false);
+                        countdown_label.set_visible(false);
+                        lyrics_scrolled.set_opacity(1.0);
                         *lyrics_data.borrow_mut() = Vec::new();
                         *lyrics_labels.borrow_mut() = Vec::new();
 
