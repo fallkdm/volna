@@ -258,20 +258,24 @@
 
 /* Строки караоке и текста песни */
 .karaoke-line {
-    font-size: 18px;
+    font-size: 19px;
     font-weight: 600;
     color: rgba(255, 255, 255, 0.45);
-    padding: 10px 24px;
-    border-radius: 14px;
+    padding: 8px 16px;
+    background: transparent;
+    border: none;
+    border-radius: 0;
     transition: all 250ms ease;
 }
 
 .karaoke-line.active {
-    font-size: 26px;
-    font-weight: 700;
+    font-size: 28px;
+    font-weight: 800;
     color: #ffffff;
-    text-shadow: 0 0 20px rgba(255, 255, 255, 0.6);
-    background-color: rgba(255, 107, 74, 0.15);
+    text-shadow: 0 0 26px rgba(255, 107, 74, 0.85), 0 0 10px #ffffff;
+    background: transparent;
+    border: none;
+    border-radius: 0;
 }
 
 .plain-lyrics-line {

@@ -135,9 +135,9 @@ impl VolnaWindow {
         lyrics_scrolled.set_hexpand(true);
 
         let lyrics_container = GtkBox::new(Orientation::Vertical, 14);
-        lyrics_container.set_valign(Align::Center);
+        lyrics_container.set_valign(Align::Start);
         lyrics_container.set_halign(Align::Center);
-        lyrics_container.set_margin_top(80);
+        lyrics_container.set_margin_top(260);
         lyrics_container.set_margin_bottom(90);
 
         lyrics_scrolled.set_child(Some(&lyrics_container));
@@ -280,22 +280,10 @@ impl VolnaWindow {
                         let lines = l_data.borrow();
                         let labels = l_labels.borrow();
                         if !lines.is_empty() && lines.len() == labels.len() {
-                            // Проверяем обратный отсчет перед вступлением или длинным проигрышем (> 4 сек)
+                            // Проверяем обратный отсчет ИСКЛЮЧИТЕЛЬНО перед первой строкой в начале песни
                             let next_line_info = match lines.iter().position(|l| l.time_ms > pos_ms) {
-                                Some(0) => {
-                                    // До первой строки песни
-                                    Some(lines[0].time_ms)
-                                }
-                                Some(next_idx) => {
-                                    let prev_time = lines[next_idx - 1].time_ms;
-                                    let next_time = lines[next_idx].time_ms;
-                                    if next_time.saturating_sub(prev_time) >= 4000 {
-                                        Some(next_time)
-                                    } else {
-                                        None
-                                    }
-                                }
-                                None => None,
+                                Some(0) => Some(lines[0].time_ms),
+                                _ => None,
                             };
 
                             let mut counting_down = false;
