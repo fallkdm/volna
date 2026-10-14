@@ -40,12 +40,15 @@ env DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_kGbDrQ \
 │   ├── karaoke_redesign.html   # Живой интерактивный прототип караоке (открывается в Firefox)
 │   └── screenshots/            # Эталонные графические рендеры и макеты
 ├── graphify-out/
-│   ├── graph.json              # База знаний кодовой базы (387 узлов, 716 связей)
+│   ├── graph.json              # База знаний кодовой базы (396 узлов, 724 связи, 28 сообществ)
 │   └── graph.html              # Интерактивная 3D-карта зависимостей
 ├── scripts/
-│   └── rustdesk_autolink.sh    # PipeWire демон проброса аудиопотока в RustDesk
+│   ├── rustdesk_autolink.sh    # PipeWire демон проброса аудиопотока в RustDesk
+│   └── watch_agent_chat.sh     # Фоновый монитор канала связи Claude ↔ Gemini
 └── src/
     ├── main.rs                 # Точка входа, инициализация GTK4 и GStreamer
+    ├── cache/
+    │   └── mod.rs              # Кэширование обложек и сетевых ресурсов
     ├── api/
     │   ├── auth.rs             # Хранение и загрузка токена Яндекс Музыки (~/.config/volna/)
     │   ├── client.rs           # REST API Яндекса (ротор, треки, фидбеки) + Smart Fallback на LRCLIB для караоке
@@ -57,10 +60,12 @@ env DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_kGbDrQ \
     │   └── mod.rs              # Системное D-Bus управление плеером через MPRIS
     └── ui/
         ├── window.rs           # Главное окно, GtkOverlay, координация экранов и караоке
-        ├── wave_view.rs        # Кинематографичная 3D-плазма «Luminous Fluid Orb» + Аврора на Cairo
+        ├── wave_view.rs        # Кинематографичная визуализация волны с реактивным басом
         ├── floating_island.rs  # Парящий остров управления (капсула плеера с кнопкой «Т»)
+        ├── search_view.rs      # Экран поиска по каталогу Яндекс Музыки
+        ├── library_view.rs     # Экран фонотеки/коллекции пользователя
         ├── auth_dialog.rs      # Диалог авторизации Яндекс Музыки
-        ├── pref_dialog.rs      # Окно настроек качества и внешнего вида
+        ├── preferences_dialog.rs # Окно настроек качества и внешнего вида
         └── style.css           # Темизация Libadwaita Dark, неон и акрил
 ```
 
