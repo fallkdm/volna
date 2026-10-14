@@ -3,10 +3,7 @@ use std::f64::consts::PI;
 use std::rc::Rc;
 use gtk4::cairo;
 use gtk4::prelude::*;
-use gtk4::{
-    glib, Align, Box as GtkBox, Button, DrawingArea, Label, MenuButton, Orientation,
-    Overlay, Popover, PositionType, Separator,
-};
+use gtk4::{glib, Align, Box as GtkBox, Button, DrawingArea, Label, Orientation, Overlay};
 
 use crate::player::PlayerManager;
 
@@ -58,7 +55,8 @@ impl WaveShaderState {
         );
     }
 
-    pub fn tick(&mut self, dt: f64) {
+    /// `bass_level` — реальный уровень баса 0..1 из аудио-бэкенда
+    pub fn tick(&mut self, dt: f64, bass_level: f64) {
         // Плавная интерполяция текущих цветов к целевым цветам текущего трека:
         // cur = cur + (target - cur) * 0.05
         let interp = 0.05_f64;
@@ -69,9 +67,10 @@ impl WaveShaderState {
         }
 
         if self.is_playing {
-            // Воспроизведение: динамичное течение плазмы + легкая ритмичная пульсация баса
+            // Воспроизведение: течение плазмы + пульсация по реальному басу (0..1 → 0..0.35);
+            // атака/спад уже в анализаторе, тут только сглаживаем 30 Гц обновлений до 60 FPS
             self.time += dt * 1.0;
-            self.bass = (self.time * 3.5).sin().max(0.0) * 0.28;
+            self.bass += (bass_level * 0.35 - self.bass) * 0.5;
         } else {
             // Пауза: замедление скорости течения плазмы и плавное затухание баса
             self.time += dt * 0.18;
@@ -86,7 +85,7 @@ pub struct WaveViewWidgets {
     pub artist_label: Label,
     pub play_btn: Button,
     pub play_btn_icon: gtk4::Image,
-    pub menu_button: MenuButton,
+    pub menu_button: Button,
     pub drawing_area: DrawingArea,
     pub shader_state: Rc<RefCell<WaveShaderState>>,
 }
@@ -144,6 +143,7 @@ pub fn create_wave_view(
     {
         let state_ref = shader_state.clone();
         let is_playing_clone = is_playing_state.clone();
+        let audio = player.audio.clone();
         let last_time_ref = Rc::new(RefCell::new(0_i64));
 
         drawing_area.add_tick_callback(move |area, frame_clock| {
@@ -159,7 +159,7 @@ pub fn create_wave_view(
             {
                 let mut state = state_ref.borrow_mut();
                 state.is_playing = *is_playing_clone.borrow();
-                state.tick(dt);
+                state.tick(dt, audio.bass_level() as f64);
             }
 
             area.queue_draw();
@@ -186,28 +186,60 @@ pub fn create_wave_view(
     let title_label = Label::new(Some("Моя волна"));
     title_label.add_css_class("hero-track-title");
     title_label.set_wrap(true);
+    title_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     title_label.set_justify(gtk4::Justification::Center);
+    title_label.set_max_width_chars(24);
     bottom_box.append(&title_label);
 
     let artist_label = Label::new(Some("Нажмите для запуска персонального потока 🌊"));
     artist_label.add_css_class("hero-track-artist");
+    artist_label.set_wrap(true);
+    artist_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     artist_label.set_justify(gtk4::Justification::Center);
+    artist_label.set_max_width_chars(38);
     bottom_box.append(&artist_label);
 
     // Центральная кнопка фильтров Ротора «Настроить волну»
-    let menu_button = MenuButton::new();
-    menu_button.set_label("⚙ Настроить волну ▾");
+    let menu_button = Button::new();
+    let menu_label = Label::new(Some("Настроить волну"));
+    let menu_content = GtkBox::new(Orientation::Horizontal, 8);
+    menu_content.append(&gtk4::Image::from_icon_name("preferences-system-symbolic"));
+    menu_content.append(&menu_label);
+    menu_content.append(&gtk4::Image::from_icon_name("pan-down-symbolic"));
+    menu_button.set_child(Some(&menu_content));
     menu_button.add_css_class("fluid-pill");
     menu_button.set_halign(Align::Center);
     menu_button.set_margin_top(14);
 
-    // Всплывающее Popover меню настройки Моей волны
-    let popover = Popover::new();
-    popover.set_autohide(true);
-    popover.set_position(PositionType::Bottom);
+    // Панель настройки Моей волны внутри окна: затемнение + карточка по центру экрана волны
+    let popover = GtkBox::new(Orientation::Vertical, 0);
+    popover.add_css_class("wave-scrim");
+    popover.set_visible(false);
+    popover.set_hexpand(true);
+    popover.set_vexpand(true);
+    popover.set_halign(Align::Fill);
+    popover.set_valign(Align::Fill);
 
-    let popover_box = GtkBox::new(Orientation::Vertical, 2);
-    popover_box.add_css_class("rotor-popover-box");
+    // выбранный пункт подсвечивается; общий список нужен, чтобы снять подсветку с прежнего
+    let option_buttons: Rc<RefCell<Vec<Button>>> = Rc::default();
+
+    let popover_box = GtkBox::new(Orientation::Vertical, 14);
+    popover_box.add_css_class("wave-settings-card");
+    popover_box.set_halign(Align::Center);
+    popover_box.set_valign(Align::Center);
+    popover_box.set_vexpand(true);
+
+    let card_header = GtkBox::new(Orientation::Horizontal, 8);
+    let card_title = Label::new(Some("Настроить волну"));
+    card_title.add_css_class("wave-settings-title");
+    card_title.set_hexpand(true);
+    card_title.set_halign(Align::Start);
+    let close_btn = Button::from_icon_name("window-close-symbolic");
+    close_btn.add_css_class("karaoke-close-btn");
+    close_btn.set_tooltip_text(Some("Закрыть"));
+    card_header.append(&card_title);
+    card_header.append(&close_btn);
+    popover_box.append(&card_header);
 
     struct RotorFilterOption {
         label: &'static str,
@@ -311,29 +343,36 @@ pub fn create_wave_view(
     ];
 
     for (s_idx, section) in sections.into_iter().enumerate() {
-        if s_idx > 0 {
-            let sep = Separator::new(Orientation::Horizontal);
-            sep.set_margin_top(4);
-            sep.set_margin_bottom(4);
-            popover_box.append(&sep);
-        }
+        let _ = s_idx;
+        let section_flow = gtk4::FlowBox::new();
+        section_flow.set_selection_mode(gtk4::SelectionMode::None);
+        section_flow.set_max_children_per_line(4);
+        section_flow.set_column_spacing(8);
+        section_flow.set_row_spacing(8);
 
         let section_header = Label::new(Some(section.title));
         section_header.add_css_class("rotor-section-title");
         section_header.set_halign(Align::Start);
         popover_box.append(&section_header);
+        popover_box.append(&section_flow);
 
         for opt in section.options {
-            let btn = Button::with_label(opt.label);
+            let btn = Button::new();
+            let text = Label::new(Some(opt.label));
+            text.set_halign(Align::Start);
+            text.set_xalign(0.0);
+            btn.set_child(Some(&text));
             btn.add_css_class("flat");
             btn.add_css_class("rotor-filter-btn");
             btn.set_halign(Align::Fill);
+            option_buttons.borrow_mut().push(btn.clone());
 
             let player_clone = player.clone();
             let accent_clone = accent_color.clone();
             let da_weak = drawing_area.downgrade();
             let pop_weak = popover.downgrade();
-            let mb_weak = menu_button.downgrade();
+            let label_clone = menu_label.clone();
+            let buttons_clone = option_buttons.clone();
             let shader_state_clone = shader_state.clone();
 
             let opt_label = opt.label;
@@ -342,13 +381,15 @@ pub fn create_wave_view(
             let char_val = opt.charac.map(|s| s.to_string());
             let rgb = opt.color;
 
-            btn.connect_clicked(move |_| {
+            btn.connect_clicked(move |clicked| {
                 if let Some(pop) = pop_weak.upgrade() {
-                    pop.popdown();
+                    pop.set_visible(false);
                 }
-                if let Some(mb) = mb_weak.upgrade() {
-                    mb.set_label(&format!("{} ▾", opt_label));
+                label_clone.set_text(opt_label);
+                for b in buttons_clone.borrow().iter() {
+                    b.remove_css_class("selected");
                 }
+                clicked.add_css_class("selected");
                 *accent_clone.borrow_mut() = rgb;
                 if let Some(da) = da_weak.upgrade() {
                     da.queue_draw();
@@ -371,35 +412,36 @@ pub fn create_wave_view(
                 );
             });
 
-            popover_box.append(&btn);
+            section_flow.append(&btn);
         }
     }
 
     // Разделитель и кнопка сброса фильтров
-    let reset_sep = Separator::new(Orientation::Horizontal);
-    reset_sep.set_margin_top(6);
-    reset_sep.set_margin_bottom(4);
-    popover_box.append(&reset_sep);
-
-    let reset_btn = Button::with_label("↺ Сбросить фильтры");
+    let reset_btn = Button::new();
+    let reset_text = Label::new(Some("↺ Сбросить фильтры"));
+    reset_text.set_halign(Align::Start);
+    reset_text.set_xalign(0.0);
+    reset_btn.set_child(Some(&reset_text));
     reset_btn.add_css_class("flat");
     reset_btn.add_css_class("rotor-reset-btn");
-    reset_btn.set_halign(Align::Fill);
+    reset_btn.set_halign(Align::Start);
 
     {
         let player_clone = player.clone();
         let accent_clone = accent_color.clone();
         let da_weak = drawing_area.downgrade();
         let pop_weak = popover.downgrade();
-        let mb_weak = menu_button.downgrade();
+        let label_clone = menu_label.clone();
+        let buttons_clone = option_buttons.clone();
         let shader_state_clone = shader_state.clone();
 
         reset_btn.connect_clicked(move |_| {
             if let Some(pop) = pop_weak.upgrade() {
-                pop.popdown();
+                pop.set_visible(false);
             }
-            if let Some(mb) = mb_weak.upgrade() {
-                mb.set_label("⚙ Настроить волну ▾");
+            label_clone.set_text("Настроить волну");
+            for b in buttons_clone.borrow().iter() {
+                b.remove_css_class("selected");
             }
             *accent_clone.borrow_mut() = [1.0, 0.42, 0.29];
             if let Some(da) = da_weak.upgrade() {
@@ -417,8 +459,23 @@ pub fn create_wave_view(
     }
 
     popover_box.append(&reset_btn);
-    popover.set_child(Some(&popover_box));
-    menu_button.set_popover(Some(&popover));
+    popover.append(&popover_box);
+
+    // Открытие по кнопке; закрытие — крестиком или кликом по затемнению
+    {
+        let pop = popover.clone();
+        menu_button.connect_clicked(move |_| pop.set_visible(true));
+        let pop = popover.clone();
+        close_btn.connect_clicked(move |_| pop.set_visible(false));
+        let click = gtk4::GestureClick::new();
+        let pop = popover.clone();
+        click.connect_released(move |_, _, x, y| {
+            if pop.pick(x, y, gtk4::PickFlags::DEFAULT).as_ref() == Some(pop.upcast_ref::<gtk4::Widget>()) {
+                pop.set_visible(false);
+            }
+        });
+        popover.add_controller(click);
+    }
 
     bottom_box.append(&menu_button);
     content_box.append(&bottom_box);
@@ -432,6 +489,7 @@ pub fn create_wave_view(
     }
 
     root_overlay.add_overlay(&content_box);
+    root_overlay.add_overlay(&popover);
 
     WaveViewWidgets {
         container: root_overlay,
@@ -465,145 +523,72 @@ fn render_live_wave_cairo(
     let ridge = state.cur_ridge;
 
     // --------------------------------------------------------------------------
-    // 1. Полноэкранное атмосферное свечение (Ambient Aurora Mesh)
+    // 1. Сплошная заливка цветом трека (как у Яндекс Музыки): без шара и твёрдых форм
     // --------------------------------------------------------------------------
+    let base = [
+        core[0] * 0.55 + deep[0] * 0.45,
+        core[1] * 0.55 + deep[1] * 0.45,
+        core[2] * 0.55 + deep[2] * 0.45,
+    ];
     cr.set_operator(cairo::Operator::Source);
-    let bg_pattern = cairo::RadialGradient::new(cx, cy, 30.0, cx, cy, max_dim * 0.90);
-    bg_pattern.add_color_stop_rgba(0.0, deep[0] * 0.70, deep[1] * 0.70, deep[2] * 0.70, 0.75);
-    bg_pattern.add_color_stop_rgba(0.40, deep[0] * 0.30, deep[1] * 0.30, deep[2] * 0.30, 0.40);
-    bg_pattern.add_color_stop_rgba(0.80, 0.04, 0.04, 0.06, 1.0);
-    bg_pattern.add_color_stop_rgba(1.0, 0.02, 0.02, 0.03, 1.0);
+    let bg_pattern = cairo::RadialGradient::new(cx, cy, 0.0, cx, cy, max_dim * 0.95);
+    bg_pattern.add_color_stop_rgba(0.0, base[0] * 1.25 + ridge[0] * 0.10, base[1] * 1.25 + ridge[1] * 0.10, base[2] * 1.25 + ridge[2] * 0.10, 1.0);
+    bg_pattern.add_color_stop_rgba(0.55, base[0], base[1], base[2], 1.0);
+    bg_pattern.add_color_stop_rgba(1.0, base[0] * 0.45, base[1] * 0.45, base[2] * 0.45, 1.0);
     let _ = cr.set_source(&bg_pattern);
     let _ = cr.paint();
     cr.set_operator(cairo::Operator::Over);
 
-    // 3–4 мягких дрейфующих световых фокуса (attractors) по краям экрана (Lissajous)
-    let attractors = [
-        (
-            w * 0.22 + (time * 0.35).sin() * (w * 0.16),
-            h * 0.20 + (time * 0.28).cos() * (h * 0.14),
-            max_dim * 0.44,
-            core,
-            0.15 + bass * 0.06,
-        ),
-        (
-            w * 0.80 + (time * 0.30 + 1.5).cos() * (w * 0.15),
-            h * 0.30 + (time * 0.40 + 2.0).sin() * (h * 0.16),
-            max_dim * 0.48,
-            deep,
-            0.22 + bass * 0.08,
-        ),
-        (
-            w * 0.48 + (time * 0.25 + 3.0).sin() * (w * 0.20),
-            h * 0.72 + (time * 0.32 + 0.8).cos() * (h * 0.12),
-            max_dim * 0.42,
-            ridge,
-            0.11 + bass * 0.05,
-        ),
-        (
-            w * 0.14 + (time * 0.38 + 4.0).cos() * (w * 0.12),
-            h * 0.82 + (time * 0.24 + 1.2).sin() * (h * 0.14),
-            max_dim * 0.38,
-            core,
-            0.09,
-        ),
+    // Мягкий свет у кнопки Play, усиливается басом
+    let glow_r = max_dim * 0.42 * (1.0 + bass * 0.35);
+    let glow_pat = cairo::RadialGradient::new(cx, cy, 0.0, cx, cy, glow_r);
+    glow_pat.add_color_stop_rgba(0.0, ridge[0], ridge[1], ridge[2], 0.38 + bass * 0.40);
+    glow_pat.add_color_stop_rgba(0.45, core[0], core[1], core[2], 0.14 + bass * 0.12);
+    glow_pat.add_color_stop_rgba(1.0, core[0], core[1], core[2], 0.0);
+    cr.new_path();
+    cr.arc(cx, cy, glow_r, 0.0, PI * 2.0);
+    let _ = cr.set_source(&glow_pat);
+    let _ = cr.fill();
+
+    // --------------------------------------------------------------------------
+    // 2. Текучие светящиеся нити: замкнутые контуры-«жилки», медленно меняющие форму
+    // --------------------------------------------------------------------------
+    const FILAMENTS: usize = 7;
+    const FILAMENT_POINTS: usize = 72;
+    let light = [
+        ridge[0] * 0.7 + 0.3,
+        ridge[1] * 0.7 + 0.3,
+        ridge[2] * 0.7 + 0.3,
     ];
+    cr.set_operator(cairo::Operator::Screen);
+    for k in 0..FILAMENTS {
+        let kf = k as f64;
+        let frac = kf / FILAMENTS as f64;
+        let radius = max_dim * (0.14 + 0.14 * kf);
+        let drift_x = (time * 0.17 + kf * 1.9).sin() * 36.0;
+        let drift_y = (time * 0.13 + kf * 1.1).cos() * 24.0;
+        let speed = 1.0 + kf * 0.09;
 
-    for (ax, ay, ar, acolor, aalpha) in attractors {
-        let a_pat = cairo::RadialGradient::new(ax, ay, 0.0, ax, ay, ar);
-        a_pat.add_color_stop_rgba(0.0, acolor[0], acolor[1], acolor[2], aalpha);
-        a_pat.add_color_stop_rgba(0.55, acolor[0] * 0.5, acolor[1] * 0.5, acolor[2] * 0.5, aalpha * 0.30);
-        a_pat.add_color_stop_rgba(1.0, acolor[0], acolor[1], acolor[2], 0.0);
-        cr.new_path();
-        cr.arc(ax, ay, ar, 0.0, PI * 2.0);
-        let _ = cr.set_source(&a_pat);
-        let _ = cr.fill();
+        let mut pts = Vec::with_capacity(FILAMENT_POINTS);
+        for i in 0..FILAMENT_POINTS {
+            let theta = (i as f64 / FILAMENT_POINTS as f64) * PI * 2.0;
+            let wave = 0.16 * (theta * 3.0 + time * 0.50 * speed + kf * 1.3).sin()
+                + 0.10 * (theta * 5.0 - time * 0.40 * speed + kf * 0.7).cos()
+                + 0.06 * (theta * 2.0 + time * 0.30 * speed + kf).sin();
+            let r = radius * (1.0 + wave) + bass * 22.0 * (0.4 + frac);
+            pts.push((cx + drift_x + theta.cos() * r, cy + drift_y + theta.sin() * r));
+        }
+
+        let strength = (0.16 + bass * 0.70) * (1.0 - frac * 0.55);
+        // Три обводки разной толщины имитируют размытие нити
+        for (width, alpha) in [(18.0, 0.16), (7.0, 0.34), (2.2, 0.85)] {
+            draw_smooth_closed_path(cr, &pts);
+            cr.set_line_width(width);
+            cr.set_source_rgba(light[0], light[1], light[2], (alpha * strength).min(1.0));
+            let _ = cr.stroke();
+        }
     }
-
-    // --------------------------------------------------------------------------
-    // 2. Крупное объемное плазменное ядро (Luminous Fluid Orb)
-    // --------------------------------------------------------------------------
-    let base_r = (175.0 + bass * 18.0).max(120.0);
-
-    // Внешняя корона мягкого свечения (Corona Bloom)
-    let corona_r = base_r * 1.55;
-    let corona_pat = cairo::RadialGradient::new(cx, cy, base_r * 0.45, cx, cy, corona_r);
-    corona_pat.add_color_stop_rgba(0.0, core[0], core[1], core[2], 0.35 + bass * 0.14);
-    corona_pat.add_color_stop_rgba(0.42, core[0], core[1], core[2], 0.14);
-    corona_pat.add_color_stop_rgba(0.75, ridge[0], ridge[1], ridge[2], 0.04);
-    corona_pat.add_color_stop_rgba(1.0, core[0], core[1], core[2], 0.0);
-    cr.new_path();
-    cr.arc(cx, cy, corona_r, 0.0, PI * 2.0);
-    let _ = cr.set_source(&corona_pat);
-    let _ = cr.fill();
-
-    // Органический контур деформации Безье (36 контрольных точек через Catmull-Rom)
-    let points_count = 36;
-    let mut pts = Vec::with_capacity(points_count);
-    for i in 0..points_count {
-        let theta = (i as f64 / points_count as f64) * PI * 2.0;
-        let warp = (theta * 3.0 + time * 1.2).sin() * 14.0
-            + (theta * 5.0 - time * 0.9).cos() * 10.0
-            + (theta * 2.0 + time * 0.5).sin() * 8.0;
-        let r = base_r + warp * (1.0 + bass * 0.30);
-        let px = cx + theta.cos() * r;
-        let py = cy + theta.sin() * r;
-        pts.push((px, py));
-    }
-
-    draw_smooth_closed_path(cr, &pts);
-
-    // Объемная 3D-заливка сферы смещенным радиальным градиентом
-    let orb_pat = cairo::RadialGradient::new(
-        cx - base_r * 0.32,
-        cy - base_r * 0.32,
-        10.0,
-        cx,
-        cy,
-        base_r * 1.08,
-    );
-    orb_pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.95);
-    orb_pat.add_color_stop_rgba(0.22, core[0], core[1], core[2], 0.95);
-    orb_pat.add_color_stop_rgba(0.60, ridge[0], ridge[1], ridge[2], 0.85);
-    orb_pat.add_color_stop_rgba(0.92, deep[0], deep[1], deep[2], 0.90);
-    orb_pat.add_color_stop_rgba(1.0, deep[0] * 0.4, deep[1] * 0.4, deep[2] * 0.4, 0.95);
-
-    let _ = cr.set_source(&orb_pat);
-    let _ = cr.fill();
-
-    // Внутренний флюидный плазменный вихрь (Secondary Plasma Swirl)
-    let swirl_cx = cx + (time * 0.8).cos() * (base_r * 0.22);
-    let swirl_cy = cy + (time * 0.7).sin() * (base_r * 0.22);
-    let swirl_r = base_r * 0.65;
-    let swirl_pat = cairo::RadialGradient::new(swirl_cx, swirl_cy, 5.0, swirl_cx, swirl_cy, swirl_r);
-    swirl_pat.add_color_stop_rgba(0.0, ridge[0], ridge[1], ridge[2], 0.42);
-    swirl_pat.add_color_stop_rgba(0.50, core[0], core[1], core[2], 0.22);
-    swirl_pat.add_color_stop_rgba(1.0, deep[0], deep[1], deep[2], 0.0);
-
-    cr.new_path();
-    cr.arc(swirl_cx, swirl_cy, swirl_r, 0.0, PI * 2.0);
-    let _ = cr.set_source(&swirl_pat);
-    let _ = cr.fill();
-
-    // Зеркальный блик стекла (Specular Glass Highlight)
-    let hl_cx = cx - base_r * 0.32;
-    let hl_cy = cy - base_r * 0.32;
-    let hl_rx = base_r * 0.30;
-    let hl_ry = base_r * 0.18;
-    let hl_pat = cairo::RadialGradient::new(hl_cx, hl_cy, 2.0, hl_cx, hl_cy, hl_rx);
-    hl_pat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.58);
-    hl_pat.add_color_stop_rgba(0.45, 1.0, 1.0, 1.0, 0.22);
-    hl_pat.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0);
-
-    cr.save().ok();
-    cr.translate(hl_cx, hl_cy);
-    cr.rotate(-PI * 0.18);
-    cr.scale(1.0, hl_ry / hl_rx);
-    cr.new_path();
-    cr.arc(0.0, 0.0, hl_rx, 0.0, PI * 2.0);
-    let _ = cr.set_source(&hl_pat);
-    let _ = cr.fill();
-    cr.restore().ok();
+    cr.set_operator(cairo::Operator::Over);
 
     // --------------------------------------------------------------------------
     // 3. Плавное затухание в глубокий ночной цвет в нижней части экрана

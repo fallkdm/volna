@@ -33,18 +33,20 @@
 }
 
 .hero-track-title {
-    font-size: 26px;
+    font-size: 68px;
     font-weight: 800;
-    letter-spacing: -0.4px;
+    letter-spacing: -1.2px;
+    line-height: 1.1;
     color: #ffffff;
-    text-shadow: 0 2px 14px rgba(0, 0, 0, 0.75);
+    text-shadow: 0 4px 24px rgba(0, 0, 0, 0.85);
 }
 
 .hero-track-artist {
-    font-size: 15px;
+    font-size: 18px;
     font-weight: 500;
-    color: rgba(255, 255, 255, 0.75);
+    color: rgba(255, 255, 255, 0.82);
     text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
+    margin-top: 6px;
 }
 
 /* Круглая центральная стеклянная кнопка волны */
@@ -74,10 +76,10 @@
 }
 
 .fluid-pill {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    color: rgba(255, 255, 255, 0.85);
-    padding: 8px 18px;
+    background: rgba(0, 0, 0, 0.28);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    color: #ffffff;
+    padding: 9px 20px;
     border-radius: 9999px;
     font-size: 14px;
     font-weight: 600;
@@ -99,8 +101,15 @@
 
 /* Popover меню фильтров Волны */
 .rotor-popover-box {
-    padding: 6px 4px;
-    min-width: 250px;
+    padding: 8px 6px;
+    min-width: 270px;
+}
+
+popover.rotor-popover > contents {
+    background-color: rgba(24, 24, 27, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 20px;
+    box-shadow: 0 16px 44px rgba(0, 0, 0, 0.65);
 }
 
 .rotor-section-title {
@@ -115,8 +124,8 @@
 }
 
 .rotor-filter-btn {
-    border-radius: 8px;
-    padding: 7px 12px;
+    border-radius: 12px;
+    padding: 9px 12px;
     font-size: 13px;
     font-weight: 500;
     color: rgba(255, 255, 255, 0.88);
@@ -130,8 +139,14 @@
     color: #ffffff;
 }
 
+.rotor-filter-btn.selected {
+    background: rgba(255, 107, 74, 0.20);
+    color: #ffffff;
+    font-weight: 700;
+}
+
 .rotor-reset-btn {
-    border-radius: 8px;
+    border-radius: 12px;
     padding: 7px 12px;
     font-size: 13px;
     font-weight: 600;
@@ -147,75 +162,124 @@
     border-color: rgba(255, 107, 74, 0.4);
 }
 
-/* Парящий остров-плеер (Floating Island) */
+/* Парящий остров-плеер (Floating Island): тёмное стекло, радиус концентричен обложке (12 + 12) */
 .floating-island-player {
-    background-color: rgba(28, 28, 28, 0.94);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 22px;
-    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.75), 0 2px 8px rgba(0, 0, 0, 0.4);
-    padding: 8px 18px;
-    margin-bottom: 22px;
-    min-height: 70px;
+    background-color: rgba(22, 22, 26, 0.94);
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.07) 0%, rgba(255, 255, 255, 0) 60%);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-top-color: rgba(255, 255, 255, 0.16);
+    border-radius: 24px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65), 0 4px 14px rgba(0, 0, 0, 0.4);
+    padding: 12px 18px 8px 12px;
 }
 
-/* Круглая обложка трека */
+/* Обложка трека; без обложки видна заглушка в цветах волны */
 .circular-cover {
-    border-radius: 9999px;
-    min-width: 44px;
-    min-height: 44px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+    min-width: 56px;
+    min-height: 56px;
+    border-radius: 12px;
+    color: rgba(255, 255, 255, 0.92);
+    background-color: #2a2a30;
+    background-image: -gtk-icontheme("audio-x-generic-symbolic"), linear-gradient(135deg, #ff8a5c 0%, #ff6b4a 38%, #9c27b0 100%);
+    background-size: 22px 22px, cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
 }
 
 /* Метаданные трека в капсуле */
 .island-title {
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 700;
+    letter-spacing: -0.1px;
     color: #ffffff;
 }
 
 .island-artist {
-    font-size: 11px;
-    color: rgba(255, 255, 255, 0.6);
+    font-size: 12.5px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.58);
 }
 
 .time-label {
     font-size: 11px;
+    font-weight: 600;
     color: rgba(255, 255, 255, 0.5);
     font-feature-settings: "tnum";
     min-width: 34px;
 }
 
-/* Кнопки реакций Лайк/Дизлайк */
+/* Реакции по краям транспорта: вторичные, тише Prev/Next */
 .reaction-btn {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
     border-radius: 9999px;
-    padding: 6px;
-    color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.55);
     background: transparent;
     border: none;
+    box-shadow: none;
+    transition: all 150ms ease;
 }
 
 .reaction-btn:hover {
     color: #ffffff;
-    background: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.10);
 }
 
 .reaction-btn.liked {
-    color: #ff4081;
+    color: #ff4f7b;
+    background: rgba(255, 79, 123, 0.18);
 }
 
 .reaction-btn.disliked {
-    color: #e53935;
+    color: #ff6b4a;
+    background: rgba(255, 107, 74, 0.18);
 }
 
-/* Бейдж качества LOSSLESS */
-.lossless-badge {
-    font-size: 10px;
-    font-weight: 700;
-    padding: 2px 6px;
-    border-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.1);
+/* Prev / Next */
+.island-skip {
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0;
+    color: rgba(255, 255, 255, 0.86);
+}
+
+.island-skip:hover {
     color: #ffffff;
-    letter-spacing: 0.5px;
+    background: rgba(255, 255, 255, 0.10);
+}
+
+/* Кнопка текста песни — стеклянный круг, как крестик караоке */
+.karaoke-toggle-btn {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+    color: #ffffff;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    transition: all 150ms ease;
+}
+
+.karaoke-toggle-btn:hover {
+    background: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.22);
+}
+
+/* Бейдж качества LOSSLESS — в стиле бейджа бренда в шапке */
+.lossless-badge {
+    font-size: 9.5px;
+    font-weight: 800;
+    letter-spacing: 1px;
+    padding: 3px 8px;
+    border-radius: 9999px;
+    color: #ffb59f;
+    background-color: rgba(255, 107, 74, 0.14);
+    border: 1px solid rgba(255, 107, 74, 0.34);
+}
+
+.island-volume-icon {
+    color: rgba(255, 255, 255, 0.7);
 }
 
 /* Полноэкранный караоке / текст песни */
@@ -287,7 +351,163 @@
     letter-spacing: 0.2px;
 }
 
-/* Слайдер громкости и перемотки */
+/* Кнопка воспроизведения острова */
+.island-play {
+    min-width: 48px;
+    min-height: 48px;
+    padding: 0;
+    color: #ffffff;
+    background-color: #ff6b4a;
+    background-image: linear-gradient(180deg, #ff8a66 0%, #ff5c3c 100%);
+    box-shadow: 0 6px 18px rgba(255, 107, 74, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+    transition: all 150ms ease;
+}
+
+.island-play:hover {
+    background-image: linear-gradient(180deg, #ff9878 0%, #ff6b4a 100%);
+    box-shadow: 0 8px 24px rgba(255, 107, 74, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+
+.island-play:active {
+    background-image: linear-gradient(180deg, #f2603f 0%, #e24f30 100%);
+}
+
+/* Тонкие полосы перемотки и громкости; бегунок появляется при наведении */
+/* Без боковых отступов: полоса начинается ровно от названия трека */
+scale.adw-scale {
+    padding: 8px 0;
+}
+
+scale.adw-scale trough {
+    min-height: 4px;
+    background-color: rgba(255, 255, 255, 0.14);
+    border-radius: 9999px;
+}
+
+scale.adw-scale:hover trough {
+    background-color: rgba(255, 255, 255, 0.22);
+}
+
 scale.adw-scale highlight {
     background-color: #ff6b4a;
+    background-image: linear-gradient(90deg, #ff8a5c, #ff6b4a);
+    border-radius: 9999px;
 }
+
+scale.adw-scale slider {
+    min-width: 12px;
+    min-height: 12px;
+    margin: -4px;
+    background: #ffffff;
+    border: none;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+    opacity: 0;
+    transition: opacity 150ms ease;
+}
+
+scale.adw-scale:hover slider,
+scale.adw-scale:active slider,
+scale.adw-scale:focus-visible slider {
+    opacity: 1;
+}
+
+/* Коллекции: обложки, плитки, заголовки страниц */
+.cover-art {
+    border-radius: 12px;
+}
+
+.cover-tile {
+    padding: 6px;
+    border-radius: 16px;
+}
+
+.tile-title {
+    font-weight: 700;
+    font-size: 13px;
+}
+
+.tile-sub {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+.section-title {
+    font-size: 22px;
+    font-weight: 800;
+}
+
+.detail-title {
+    font-size: 40px;
+    font-weight: 800;
+}
+
+/* Основные кнопки страниц — в акцентном цвете приложения */
+button.pill.suggested-action {
+    background-image: none;
+    background-color: #ff6b4a;
+    color: #ffffff;
+}
+button.pill.suggested-action:hover {
+    background-color: #ff8264;
+}
+
+.round-cover {
+    border-radius: 9999px;
+}
+
+/* Название трека и артиста в плеере открывают страницы */
+.island-title:hover,
+.island-artist:hover {
+    text-decoration: underline;
+}
+
+/* Кнопка «Настроить волну»: внутренняя кнопка MenuButton не рисует вторую «капсулу» */
+menubutton.fluid-pill > button {
+    background: transparent;
+    background-image: none;
+    box-shadow: none;
+    border: none;
+    padding: 0;
+    min-height: 0;
+}
+
+/* Панель настройки волны внутри окна */
+.wave-scrim {
+    background-color: rgba(0, 0, 0, 0.5);
+}
+
+.wave-settings-card {
+    background-color: rgba(24, 24, 27, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 28px;
+    box-shadow: 0 20px 56px rgba(0, 0, 0, 0.6);
+    padding: 22px 26px;
+    min-width: 440px;
+    margin-bottom: 90px;
+}
+
+.wave-settings-title {
+    font-size: 22px;
+    font-weight: 800;
+}
+
+.wave-settings-card .rotor-filter-btn {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 9999px;
+    padding: 8px 16px;
+}
+
+.wave-settings-card .rotor-filter-btn:hover {
+    background: rgba(255, 255, 255, 0.16);
+}
+
+.wave-settings-card .rotor-filter-btn.selected {
+    background: #ff6b4a;
+    color: #ffffff;
+}
+
+/* Всплывающие уведомления (тосты) Libadwaita: поднимаем выше плавающего острова плеера */
+toast {
+    margin-bottom: 115px;
+}
+
