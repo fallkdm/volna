@@ -365,6 +365,13 @@ pub struct TrackSupplement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TrackLyricsResult {
+    pub lyrics: Option<String>,
+    #[serde(rename = "fullLyrics")]
+    pub full_lyrics: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LyricsInfo {
     #[serde(rename = "syncType")]
     pub sync_type: Option<String>,

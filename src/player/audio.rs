@@ -1,20 +1,33 @@
-use gstreamer_play::Play;
+use gstreamer_play::{Play, PlaySignalAdapter};
 use std::sync::{Arc, Mutex};
 
-/// Аудио-бэкенд на базе GStreamer Play
+/// Аудио-бэкенд на базе GStreamer Play с поддержкой сигналов воспроизведения
 pub struct AudioBackend {
     play: Play,
+    _adapter: PlaySignalAdapter,
     is_playing: Arc<Mutex<bool>>,
 }
 
 impl AudioBackend {
-    /// Инициализирует аудио бэкенд
+    /// Инициализирует аудио бэкенд и адаптер сигналов
     pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         gstreamer::init()?;
         let play = Play::new(None::<gstreamer_play::PlayVideoRenderer>);
+        let adapter = PlaySignalAdapter::new(&play);
         let is_playing = Arc::new(Mutex::new(false));
 
-        Ok(Self { play, is_playing })
+        Ok(Self {
+            play,
+            _adapter: adapter,
+            is_playing,
+        })
+    }
+
+    /// Регистрирует обработчик окончания воспроизведения трека (EndOfStream)
+    pub fn set_on_eos<F: Fn() + Send + Sync + 'static>(&self, callback: F) {
+        self._adapter.connect_end_of_stream(move |_| {
+            callback();
+        });
     }
 
     /// Загружает и начинает воспроизведение трека по прямой ссылке

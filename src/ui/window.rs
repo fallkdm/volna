@@ -283,6 +283,8 @@ impl VolnaWindow {
             lyrics_container,
             lyrics_data,
             lyrics_labels,
+            k_title,
+            k_badge,
         );
 
         Self { window }
@@ -311,6 +313,8 @@ fn setup_event_listener(
     lyrics_container: GtkBox,
     lyrics_data: Rc<RefCell<Vec<LrcLine>>>,
     lyrics_labels: Rc<RefCell<Vec<Label>>>,
+    k_title: Label,
+    k_badge: Label,
 ) {
     let win_weak = window.downgrade();
     gtk4::glib::spawn_future_local(async move {
@@ -331,6 +335,13 @@ fn setup_event_listener(
 
                     island.title_label.set_text(&track.title);
                     island.artist_label.set_text(&artists);
+
+                    // Сбрасываем текст песни для нового трека
+                    while let Some(child) = lyrics_container.first_child() {
+                        lyrics_container.remove(&child);
+                    }
+                    *lyrics_data.borrow_mut() = Vec::new();
+                    *lyrics_labels.borrow_mut() = Vec::new();
 
                     if let Some(dur_ms) = track.duration_ms {
                         let total_secs = dur_ms / 1000;
@@ -373,23 +384,72 @@ fn setup_event_listener(
                     island.cover_image.set_from_file(Some(&path));
                 }
                 PlayerUiEvent::LyricsUpdated(lrc_text) => {
-                    let parsed = parse_lrc(&lrc_text);
                     while let Some(child) = lyrics_container.first_child() {
                         lyrics_container.remove(&child);
                     }
 
-                    let mut new_labels = Vec::new();
-                    for line in &parsed {
-                        let lbl = Label::new(Some(&line.text));
-                        lbl.add_css_class("karaoke-line");
-                        lbl.set_wrap(true);
-                        lbl.set_justify(gtk4::Justification::Center);
-                        lyrics_container.append(&lbl);
-                        new_labels.push(lbl);
-                    }
+                    let parsed = parse_lrc(&lrc_text);
+                    if !parsed.is_empty() {
+                        k_title.set_text("Синхронизированный текст песни");
+                        k_badge.set_text("LRC Karaoke");
 
-                    *lyrics_data.borrow_mut() = parsed;
-                    *lyrics_labels.borrow_mut() = new_labels;
+                        let mut new_labels = Vec::new();
+                        for line in &parsed {
+                            let lbl = Label::new(Some(&line.text));
+                            lbl.add_css_class("karaoke-line");
+                            lbl.set_wrap(true);
+                            lbl.set_justify(gtk4::Justification::Center);
+                            lyrics_container.append(&lbl);
+                            new_labels.push(lbl);
+                        }
+
+                        *lyrics_data.borrow_mut() = parsed;
+                        *lyrics_labels.borrow_mut() = new_labels;
+                    } else {
+                        *lyrics_data.borrow_mut() = Vec::new();
+                        *lyrics_labels.borrow_mut() = Vec::new();
+
+                        let trimmed = lrc_text.trim();
+                        if !trimmed.is_empty() {
+                            k_title.set_text("Текст песни");
+                            k_badge.set_text("Текст песни");
+
+                            for line in lrc_text.lines() {
+                                let line_trimmed = line.trim();
+                                if line_trimmed.is_empty() {
+                                    let spacer = GtkBox::new(Orientation::Vertical, 0);
+                                    spacer.set_size_request(-1, 10);
+                                    lyrics_container.append(&spacer);
+                                } else {
+                                    let lbl = Label::new(Some(line_trimmed));
+                                    lbl.add_css_class("plain-lyrics-line");
+                                    lbl.set_wrap(true);
+                                    lbl.set_justify(gtk4::Justification::Center);
+                                    lyrics_container.append(&lbl);
+                                }
+                            }
+                        } else {
+                            k_title.set_text("Текст песни");
+                            k_badge.set_text("Текст недоступен");
+
+                            let empty_box = GtkBox::new(Orientation::Vertical, 12);
+                            empty_box.set_valign(Align::Center);
+                            empty_box.set_halign(Align::Center);
+                            empty_box.set_margin_top(60);
+
+                            let empty_icon = gtk4::Image::from_icon_name("audio-x-generic-symbolic");
+                            empty_icon.set_pixel_size(48);
+                            empty_icon.add_css_class("dim-label");
+                            empty_box.append(&empty_icon);
+
+                            let empty_label = Label::new(Some("У этого трека текст песни пока не добавлен"));
+                            empty_label.add_css_class("heading");
+                            empty_label.add_css_class("dim-label");
+                            empty_box.append(&empty_label);
+
+                            lyrics_container.append(&empty_box);
+                        }
+                    }
                 }
                 PlayerUiEvent::AuthRequired => {
                     auth_btn.set_label("Войти в Яндекс ID");

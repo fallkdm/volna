@@ -92,6 +92,12 @@ impl PlayerManager {
             event_senders,
         };
 
+        // Подключаем автоматический переход к следующему треку по окончании воспроизведения
+        let mgr_eos = manager.clone();
+        manager.audio.set_on_eos(move || {
+            mgr_eos.on_track_finished();
+        });
+
         // Проверяем статус авторизации при старте
         manager.check_auth_on_startup();
 
@@ -167,6 +173,40 @@ impl PlayerManager {
         self.emit(PlayerUiEvent::PlaybackToggled(is_playing));
     }
 
+    /// Обработчик естественного окончания воспроизведения трека (EndOfStream)
+    pub fn on_track_finished(&self) {
+        let (station_id, track_id, total_secs, batch_id) = {
+            let state = self.state.lock().unwrap();
+            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
+            let total_secs = state
+                .current_track
+                .as_ref()
+                .and_then(|t| t.duration_ms)
+                .map(|ms| ms as f64 / 1000.0)
+                .unwrap_or(state.played_seconds);
+            (
+                state.station_id.clone(),
+                track_id,
+                total_secs,
+                state.batch_id.clone(),
+            )
+        };
+
+        if let Some(t_id) = track_id {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let client_guard = client.lock().unwrap().clone();
+                if client_guard.has_token() {
+                    let _ = client_guard
+                        .feedback_track_finished(&station_id, &t_id, total_secs, batch_id)
+                        .await;
+                }
+            });
+        }
+
+        self.next_track();
+    }
+
     /// Запускает следующий трек
     pub fn next_track(&self) {
         let (next_track, idx, total) = {
@@ -184,6 +224,12 @@ impl PlayerManager {
             (track, idx, state.queue.len())
         };
 
+        // Если в очереди осталось менее 2 треков, подгружаем следующую пачку станции Ротора
+        let remaining = total.saturating_sub(idx + 1);
+        if remaining < 2 {
+            self.load_more_wave_tracks();
+        }
+
         self.emit(PlayerUiEvent::LikeStateChanged(false));
         self.emit(PlayerUiEvent::DislikeStateChanged(false));
         self.emit(PlayerUiEvent::TrackStarted {
@@ -193,6 +239,55 @@ impl PlayerManager {
         });
 
         self.play_track_stream(&next_track);
+    }
+
+    /// Подгружает следующую порцию треков Волны и добавляет в хвост очереди
+    pub fn load_more_wave_tracks(&self) {
+        let client_clone = self.client.clone();
+        let state_clone = self.state.clone();
+        let senders = self.event_senders.clone();
+
+        let (station_id, mood, language, character) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.station_id.clone(),
+                state.current_mood.clone(),
+                state.current_language.clone(),
+                state.current_character.clone(),
+            )
+        };
+
+        tokio::spawn(async move {
+            let client = client_clone.lock().unwrap().clone();
+            if !client.has_token() {
+                return;
+            }
+
+            if let Ok(station_tracks) = client
+                .get_station_tracks_with_params(
+                    &station_id,
+                    mood.as_deref(),
+                    language.as_deref(),
+                    character.as_deref(),
+                )
+                .await
+            {
+                let new_tracks: Vec<Track> =
+                    station_tracks.sequence.into_iter().map(|s| s.track).collect();
+                if new_tracks.is_empty() {
+                    return;
+                }
+
+                let updated_queue = {
+                    let mut state = state_clone.lock().unwrap();
+                    state.batch_id = station_tracks.batch_id;
+                    state.queue.extend(new_tracks);
+                    state.queue.clone()
+                };
+
+                emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+            }
+        });
     }
 
     /// Запускает предыдущий трек

@@ -1,16 +1,30 @@
+use base64::prelude::*;
 use chrono::Utc;
+use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use sha2::Sha256;
 use std::fmt;
 
 use super::models::{
     AccountStatus, DownloadInfo, LikedTracksResult, RotorFeedback, RotorFeedbackType,
-    RotorStationTracks, SearchResult, Track, TrackSupplement, YandexApiResponse,
+    RotorStationTracks, SearchResult, Track, TrackLyricsResult, TrackSupplement, YandexApiResponse,
 };
 
 const BASE_API_URL: &str = "https://api.music.yandex.net";
 const USER_AGENT_VALUE: &str = "YandexMusic/2024.1 (Linux; Volna Desktop)";
 const MD5_SALT: &str = "XGRlBW9FXlekgb0rTaf0yN";
+const LYRICS_SIGN_KEY: &[u8] = b"p93jhgh689SBReK6ghtw62";
+
+type HmacSha256 = Hmac<Sha256>;
+
+fn sign_lyrics_request(track_id: &str, timestamp: i64) -> String {
+    let mut mac = HmacSha256::new_from_slice(LYRICS_SIGN_KEY).expect("HMAC supports any key size");
+    let payload = format!("{}{}", track_id, timestamp);
+    mac.update(payload.as_bytes());
+    let code = mac.finalize();
+    BASE64_STANDARD.encode(code.into_bytes())
+}
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -303,12 +317,43 @@ impl YandexMusicClient {
         Ok(full_tracks.result)
     }
 
-    /// Запрос синхронизированного текста песни (Караоке LRC)
+    /// Запрос синхронизированного текста песни (Караоке LRC) с fallback на полный текст (supplement)
     pub async fn get_track_lyrics(&self, track_id: &str) -> Result<Option<String>, ApiError> {
-        let url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
+        // 1. Пробуем запросить официальный синхронизированный LRC
+        let timestamp = chrono::Utc::now().timestamp();
+        let sign = sign_lyrics_request(track_id, timestamp);
+        let lrc_url = format!(
+            "{}/tracks/{}/lyrics?format=LRC&timeStamp={}&sign={}",
+            self.base_url,
+            track_id,
+            timestamp,
+            urlencoding_encode(&sign)
+        );
+
+        let mut headers = self.headers();
+        headers.insert(
+            HeaderName::from_static("x-yandex-music-client"),
+            HeaderValue::from_static("YandexMusicAndroid/24023231"),
+        );
+
+        if let Ok(resp) = self.client.get(&lrc_url).headers(headers).send().await {
+            if resp.status().is_success() {
+                if let Ok(lrc_resp) = resp.json::<YandexApiResponse<TrackLyricsResult>>().await {
+                    if let Some(lrc_text) = lrc_resp.result.lyrics.or(lrc_resp.result.full_lyrics) {
+                        let trimmed = lrc_text.trim();
+                        if !trimmed.is_empty() {
+                            return Ok(Some(trimmed.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback на /tracks/{track_id}/supplement (обычный полный текст песни)
+        let supp_url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
         let resp = self
             .client
-            .get(&url)
+            .get(&supp_url)
             .headers(self.headers())
             .send()
             .await?;
@@ -493,5 +538,12 @@ mod tests {
     fn test_urlencode() {
         assert_eq!(urlencoding_encode("hello world"), "hello+world");
         assert_eq!(urlencoding_encode("кино"), "%D0%BA%D0%B8%D0%BD%D0%BE");
+    }
+
+    #[test]
+    fn test_sign_lyrics_request() {
+        let sign = sign_lyrics_request("12345", 1728840000);
+        assert!(!sign.is_empty());
+        assert_eq!(sign, sign_lyrics_request("12345", 1728840000));
     }
 }

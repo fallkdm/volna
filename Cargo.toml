@@ -18,3 +18,6 @@ gstreamer = { version = "0.25", features = ["v1_28"] }
 gstreamer-play = { version = "0.25", features = ["v1_28"] }
 async-channel = "2"
 mpris-server = { version = "0.10", features = ["tokio"] }
+hmac = "0.13.0"
+sha2 = "0.11.1"
+base64 = "0.23.1"
