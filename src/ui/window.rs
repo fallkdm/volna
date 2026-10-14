@@ -127,26 +127,38 @@ impl VolnaWindow {
         karaoke_box.set_vexpand(true);
         karaoke_box.set_hexpand(true);
 
-        let k_header = GtkBox::new(Orientation::Horizontal, 12);
-        k_header.set_margin_top(16);
-        k_header.set_margin_start(20);
-        k_header.set_margin_end(20);
-
-        let k_title = Label::new(Some("Синхронизированный текст песни"));
-        k_title.add_css_class("heading");
-        k_header.append(&k_title);
-
-        let k_badge = Label::new(Some("LRC Karaoke"));
-        k_badge.add_css_class("brand-badge");
-        k_header.append(&k_badge);
+        let k_header = GtkBox::new(Orientation::Horizontal, 0);
+        k_header.set_margin_top(20);
+        k_header.set_margin_start(24);
+        k_header.set_margin_end(24);
 
         let k_close_btn = Button::from_icon_name("window-close-symbolic");
         k_close_btn.set_halign(Align::End);
         k_close_btn.set_hexpand(true);
-        k_close_btn.add_css_class("flat");
         k_close_btn.add_css_class("circular");
+        k_close_btn.add_css_class("karaoke-close-btn");
+        k_close_btn.set_tooltip_text(Some("Закрыть текст песни"));
         k_header.append(&k_close_btn);
         karaoke_box.append(&k_header);
+
+        let countdown_box = GtkBox::new(Orientation::Horizontal, 12);
+        countdown_box.add_css_class("karaoke-countdown-box");
+        countdown_box.set_halign(Align::Center);
+        countdown_box.set_margin_top(8);
+        countdown_box.set_margin_bottom(8);
+        countdown_box.set_visible(false);
+
+        let dot1 = GtkBox::new(Orientation::Horizontal, 0);
+        dot1.add_css_class("countdown-dot");
+        let dot2 = GtkBox::new(Orientation::Horizontal, 0);
+        dot2.add_css_class("countdown-dot");
+        let dot3 = GtkBox::new(Orientation::Horizontal, 0);
+        dot3.add_css_class("countdown-dot");
+
+        countdown_box.append(&dot1);
+        countdown_box.append(&dot2);
+        countdown_box.append(&dot3);
+        karaoke_box.append(&countdown_box);
 
         let lyrics_scrolled = ScrolledWindow::new();
         lyrics_scrolled.set_policy(PolicyType::Never, PolicyType::Automatic);
@@ -233,8 +245,12 @@ impl VolnaWindow {
             let l_data = lyrics_data.clone();
             let l_labels = lyrics_labels.clone();
             let sc_weak = lyrics_scrolled.downgrade();
+            let cnt_box = countdown_box.clone();
+            let d1 = dot1.clone();
+            let d2 = dot2.clone();
+            let d3 = dot3.clone();
 
-            gtk4::glib::timeout_add_local(Duration::from_millis(500), move || {
+            gtk4::glib::timeout_add_local(Duration::from_millis(250), move || {
                 if *is_playing_ref.borrow() {
                     if let Some(pos) = player_clone.audio.position_seconds() {
                         let dur = player_clone.audio.duration_seconds().unwrap_or(240);
@@ -243,11 +259,61 @@ impl VolnaWindow {
                         island_curr_time.set_text(&format_seconds(pos));
                         island_total_time.set_text(&format_seconds(dur));
 
-                        // Синхронизация караоке
+                        // Синхронизация караоке и индикатор обратного отсчета 3..2..1
                         let pos_ms = pos * 1000;
                         let lines = l_data.borrow();
                         let labels = l_labels.borrow();
                         if !lines.is_empty() && lines.len() == labels.len() {
+                            // Проверяем обратный отсчет перед вступлением или длинным проигрышем (> 4 сек)
+                            let next_line_info = match lines.iter().position(|l| l.time_ms > pos_ms) {
+                                Some(0) => {
+                                    // До первой строки песни
+                                    Some(lines[0].time_ms)
+                                }
+                                Some(next_idx) => {
+                                    let prev_time = lines[next_idx - 1].time_ms;
+                                    let next_time = lines[next_idx].time_ms;
+                                    if next_time.saturating_sub(prev_time) >= 4000 {
+                                        Some(next_time)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                None => None,
+                            };
+
+                            let mut counting_down = false;
+                            if let Some(target_time) = next_line_info {
+                                if target_time > pos_ms {
+                                    let diff_ms = target_time - pos_ms;
+                                    if diff_ms <= 3000 {
+                                        counting_down = true;
+                                        cnt_box.set_visible(true);
+                                        // за 3 секунды загорается первая точка (3)
+                                        d1.add_css_class("active");
+                                        // за 2 секунды загорается вторая точка (2)
+                                        if diff_ms <= 2000 {
+                                            d2.add_css_class("active");
+                                        } else {
+                                            d2.remove_css_class("active");
+                                        }
+                                        // за 1 секунду загорается третья точка (1)
+                                        if diff_ms <= 1000 {
+                                            d3.add_css_class("active");
+                                        } else {
+                                            d3.remove_css_class("active");
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !counting_down {
+                                cnt_box.set_visible(false);
+                                d1.remove_css_class("active");
+                                d2.remove_css_class("active");
+                                d3.remove_css_class("active");
+                            }
+
                             let active_idx = lines.iter().rposition(|l| l.time_ms <= pos_ms);
                             if let Some(idx) = active_idx {
                                 for (i, lbl) in labels.iter().enumerate() {
@@ -263,6 +329,8 @@ impl VolnaWindow {
                                     vadj.set_value(target_val.max(0.0));
                                 }
                             }
+                        } else {
+                            cnt_box.set_visible(false);
                         }
                     }
                 }
@@ -283,8 +351,7 @@ impl VolnaWindow {
             lyrics_container,
             lyrics_data,
             lyrics_labels,
-            k_title,
-            k_badge,
+            countdown_box,
         );
 
         Self { window }
@@ -313,8 +380,7 @@ fn setup_event_listener(
     lyrics_container: GtkBox,
     lyrics_data: Rc<RefCell<Vec<LrcLine>>>,
     lyrics_labels: Rc<RefCell<Vec<Label>>>,
-    k_title: Label,
-    k_badge: Label,
+    countdown_box: GtkBox,
 ) {
     let win_weak = window.downgrade();
     gtk4::glib::spawn_future_local(async move {
@@ -336,12 +402,13 @@ fn setup_event_listener(
                     island.title_label.set_text(&track.title);
                     island.artist_label.set_text(&artists);
 
-                    // Сбрасываем текст песни для нового трека
+                    // Сбрасываем текст песни и обратный отсчет для нового трека
                     while let Some(child) = lyrics_container.first_child() {
                         lyrics_container.remove(&child);
                     }
                     *lyrics_data.borrow_mut() = Vec::new();
                     *lyrics_labels.borrow_mut() = Vec::new();
+                    countdown_box.set_visible(false);
 
                     if let Some(dur_ms) = track.duration_ms {
                         let total_secs = dur_ms / 1000;
@@ -390,9 +457,6 @@ fn setup_event_listener(
 
                     let parsed = parse_lrc(&lrc_text);
                     if !parsed.is_empty() {
-                        k_title.set_text("Синхронизированный текст песни");
-                        k_badge.set_text("LRC Karaoke");
-
                         let mut new_labels = Vec::new();
                         for line in &parsed {
                             let lbl = Label::new(Some(&line.text));
@@ -406,14 +470,12 @@ fn setup_event_listener(
                         *lyrics_data.borrow_mut() = parsed;
                         *lyrics_labels.borrow_mut() = new_labels;
                     } else {
+                        countdown_box.set_visible(false);
                         *lyrics_data.borrow_mut() = Vec::new();
                         *lyrics_labels.borrow_mut() = Vec::new();
 
                         let trimmed = lrc_text.trim();
                         if !trimmed.is_empty() {
-                            k_title.set_text("Текст песни");
-                            k_badge.set_text("Текст песни");
-
                             for line in lrc_text.lines() {
                                 let line_trimmed = line.trim();
                                 if line_trimmed.is_empty() {
@@ -429,9 +491,6 @@ fn setup_event_listener(
                                 }
                             }
                         } else {
-                            k_title.set_text("Текст песни");
-                            k_badge.set_text("Текст недоступен");
-
                             let empty_box = GtkBox::new(Orientation::Vertical, 12);
                             empty_box.set_valign(Align::Center);
                             empty_box.set_halign(Align::Center);

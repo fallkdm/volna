@@ -137,9 +137,26 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     let right_box = GtkBox::new(Orientation::Horizontal, 10);
     right_box.set_valign(Align::Center);
 
-    let karaoke_btn = Button::from_icon_name("text-x-generic-symbolic");
+    let karaoke_icon = if std::path::Path::new("/home/philk/volna/data/icons/lyrics-symbolic.svg").exists() {
+        let img = Image::from_file("/home/philk/volna/data/icons/lyrics-symbolic.svg");
+        img.set_pixel_size(18);
+        img
+    } else if std::path::Path::new("data/icons/lyrics-symbolic.svg").exists() {
+        let img = Image::from_file("data/icons/lyrics-symbolic.svg");
+        img.set_pixel_size(18);
+        img
+    } else {
+        let img = Image::from_icon_name("text-x-generic-symbolic");
+        img.set_pixel_size(18);
+        img
+    };
+    karaoke_icon.add_css_class("lyrics-btn-icon");
+
+    let karaoke_btn = Button::new();
+    karaoke_btn.set_child(Some(&karaoke_icon));
     karaoke_btn.add_css_class("flat");
     karaoke_btn.add_css_class("circular");
+    karaoke_btn.add_css_class("karaoke-toggle-btn");
     karaoke_btn.set_tooltip_text(Some("Текст песни"));
     right_box.append(&karaoke_btn);
 
