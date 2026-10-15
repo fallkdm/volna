@@ -127,6 +127,12 @@ impl PlayerManager {
             mgr_eos.on_track_finished();
         });
 
+        // Демо для скриншотов: вымышленный трек, без сети и без пользовательских данных
+        if std::env::var_os("VOLNA_DEMO").is_some() {
+            manager.start_demo();
+            return Ok(manager);
+        }
+
         // Вместо заглушки показываем последний проигранный трек (звук не включается)
         manager.restore_last_track();
 
@@ -134,6 +140,48 @@ impl PlayerManager {
         manager.check_auth_on_startup();
 
         Ok(manager)
+    }
+
+    /// Режим `VOLNA_DEMO=1|2|3` для скриншотов README: вымышленный исполнитель, свои тексты,
+    /// обложка из `VOLNA_DEMO_COVER`, позиция из `VOLNA_DEMO_POS_MS`. Ни токена, ни сети, ни кэша пользователя
+    fn start_demo(&self) {
+        let n: usize = std::env::var("VOLNA_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let (title, artist, accent, average, wave_text) = match n {
+            2 => ("Neon Rain", "Night Courier", "#c95cff", "#5a2a7a", "#f0c8ff"),
+            3 => ("Slow Tide", "Harbor Lights", "#3fa8ff", "#1f4a73", "#bfe3ff"),
+            _ => ("Golden Hour", "Demo Artist", "#ff8a3d", "#7a3a14", "#ffd9b8"),
+        };
+        let track: Track = serde_json::from_value(serde_json::json!({
+            "id": "demo", "title": title, "durationMs": 214_000,
+            "artists": [{"id": "1", "name": artist}],
+            "albums": [{"id": "1", "title": "Sample Album", "year": 2026}],
+            "derivedColors": {"average": average, "accent": accent, "miniPlayer": accent, "waveText": wave_text}
+        })).expect("демо-трек");
+        {
+            let mut state = self.state.lock().unwrap();
+            state.queue = vec![track.clone()];
+            state.current_track = Some(track.clone());
+        }
+        let lrc = [
+            "Evening folds over the harbor wall", "Lamps come on one at a time",
+            "We walk the long way home", "Counting the ships by their light",
+            "Nothing is asked of us now", "The water keeps the time",
+            "Hold the last of the day", "Let it burn down slow",
+            "Carry it into the dark", "And we will know the way",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("[{:02}:{:02}.00] {}", i * 4 / 60, i * 4 % 60, l))
+        .collect::<Vec<_>>()
+        .join("\n");
+        self.emit(PlayerUiEvent::UserLoggedIn("demo".into()));
+        self.emit(PlayerUiEvent::TrackStarted { track, index: 0, total_queue: 1 });
+        if let Ok(path) = std::env::var("VOLNA_DEMO_COVER") {
+            self.emit(PlayerUiEvent::CoverUpdated(path));
+        }
+        self.emit(PlayerUiEvent::StreamQuality("MP3 192".into()));
+        self.emit(PlayerUiEvent::LyricsUpdated(lrc));
+        self.emit(PlayerUiEvent::PlaybackToggled(true));
     }
 
     /// Показывает последний проигранный трек: заголовок, цвета, обложку и текст. Воспроизведение не стартует

@@ -7,6 +7,12 @@
 [![Built with Rust](https://img.shields.io/badge/Built_with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![GTK4 & Libadwaita](https://img.shields.io/badge/GUI-GTK4%20%7C%20Libadwaita-brightgreen.svg)](https://gnome.pages.gitlab.gnome.org/libadwaita/)
 
+<p align="center">
+  <img src="docs/screenshots/wave.png" width="49%" alt="Экран Волны">
+  <img src="docs/screenshots/lyrics.png" width="49%" alt="Текст песни с таймингами">
+</p>
+<p align="center"><sub>Скриншоты сделаны в демо-режиме: вымышленный трек, без аккаунта и сети.</sub></p>
+
 ---
 
 ## 🎯 Зачем этот проект?
@@ -82,6 +88,8 @@ cargo build --release
 ```bash
 ./target/release/volna
 ```
+
+Демо-режим без аккаунта (для скриншотов и проверки интерфейса): `VOLNA_DEMO=1` (или `2`, `3` — другие цвета), необязательно `VOLNA_DEMO_COVER=путь.jpg`, `VOLNA_DEMO_POS_MS=14000` (позиция для подсветки строки), `VOLNA_DEMO_LYRICS=1` (сразу открыть текст песни). Чтобы демо не трогало настоящие настройки, запускайте с отдельными `XDG_CONFIG_HOME` и `XDG_CACHE_HOME`.
 
 Ярлык и иконка для меню приложений — в [`data/`](data/): `data/applications/io.github.fallkdm.Volna.desktop` и `data/icons/io.github.fallkdm.Volna.svg` (путь `Exec` в ярлыке поправьте под себя).
 

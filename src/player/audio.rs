@@ -236,6 +236,10 @@ impl AudioBackend {
 
     /// Текущая позиция воспроизведения в миллисекундах (для точной синхронизации караоке)
     pub fn position_ms(&self) -> Option<u64> {
+        // демо для скриншотов: позиция задана снаружи, звука нет
+        if let Some(ms) = std::env::var("VOLNA_DEMO_POS_MS").ok().and_then(|v| v.parse().ok()) {
+            return Some(ms);
+        }
         self.play.position().map(|t| t.mseconds())
     }
 

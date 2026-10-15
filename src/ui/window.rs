@@ -346,6 +346,12 @@ impl VolnaWindow {
         toast_overlay.set_child(Some(&root_overlay));
         window.set_content(Some(&toast_overlay));
 
+        // демо для скриншотов: сразу открыть текст песни
+        if std::env::var_os("VOLNA_DEMO_LYRICS").is_some() {
+            let btn = island.karaoke_btn.clone();
+            gtk4::glib::timeout_add_local_once(Duration::from_millis(1500), move || btn.emit_clicked());
+        }
+
         // Клик по кнопке авторизации
         {
             let p_clone = player.clone();
@@ -722,7 +728,7 @@ fn setup_event_listener(
         while let Ok(event) = receiver.recv().await {
             match event {
                 PlayerUiEvent::TrackStarted { track, .. } => {
-                    awaiting_start.set(true);
+                    awaiting_start.set(std::env::var_os("VOLNA_DEMO_POS_MS").is_none());
                     let artists = track.artists_string();
                     let album = track.albums.first().and_then(|a| a.title.as_ref()).map(|s| s.as_str()).unwrap_or("");
                     let subtitle = if album.is_empty() {
