@@ -92,7 +92,7 @@ fn grid() -> FlowBox {
 pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.set_margin_top(24);
-    container.set_margin_bottom(110);
+    // отступ под плавающий плеер даёт само содержимое прокрутки: оно уезжает под плеер и докручивается выше него
     container.set_margin_start(32);
     container.set_margin_end(32);
 
@@ -200,6 +200,8 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     }
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
+    results.set_margin_bottom(130);
+    results.set_margin_end(14);
     scrolled.set_child(Some(&results));
     main.append(&scrolled);
 

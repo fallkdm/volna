@@ -1,13 +1,12 @@
 use std::cell::RefCell;
-use std::f64::consts::PI;
 use std::rc::Rc;
-use gtk4::cairo;
 use gtk4::prelude::*;
-use gtk4::{gdk, glib, Align, Box as GtkBox, Button, Label, Orientation, Overlay, Picture};
+use gtk4::{glib, Align, Box as GtkBox, Button, Label, Orientation, Overlay};
 
 use crate::player::PlayerManager;
 
 /// Состояние цветов и параметров живого рендерера «Плавающего нечто»
+#[derive(Clone)]
 pub struct WaveShaderState {
     pub cur_core: [f64; 3],
     pub cur_deep: [f64; 3],
@@ -55,6 +54,26 @@ impl WaveShaderState {
         );
     }
 
+    /// Цвета по самой обложке: у Яндекса `derivedColors` — среднее по картинке, и у яркой обложки
+    /// на тёмном фоне (неон, закат) выходит серо-лиловая каша. Серую обложку оставляем как есть.
+    pub fn update_from_cover(&mut self, path: &str) {
+        let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, 48, 48, false) else { return };
+        let (n, stride) = (pixbuf.n_channels() as usize, pixbuf.rowstride() as usize);
+        let bytes = pixbuf.read_pixel_bytes();
+        let mut px = Vec::with_capacity(48 * 48);
+        for y in 0..pixbuf.height() as usize {
+            for x in 0..pixbuf.width() as usize {
+                let i = y * stride + x * n;
+                if let Some(p) = bytes.get(i..i + 3) {
+                    px.push([p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0]);
+                }
+            }
+        }
+        if let Some((core, deep, ridge)) = palette_from_pixels(&px) {
+            self.set_target_colors(core, deep, ridge);
+        }
+    }
+
     /// `bass_level` — реальный уровень баса 0..1 из аудио-бэкенда
     pub fn tick(&mut self, dt: f64, bass_level: f64) {
         // Плавная интерполяция текущих цветов к целевым цветам текущего трека:
@@ -82,15 +101,15 @@ impl WaveShaderState {
 pub struct WaveViewWidgets {
     pub container: Overlay,
     pub title_label: Label,
+    pub explicit_badge: Label,
     pub artist_label: Label,
     pub play_btn: Button,
     pub play_btn_icon: gtk4::Image,
     pub menu_button: Button,
-    pub drawing_area: Picture,
+    pub drawing_area: gtk4::GLArea,
     pub shader_state: Rc<RefCell<WaveShaderState>>,
-    /// Пока true, фон Волны не перерисовывается (открыт текст песни: освобождаем главный поток для анимации караоке)
-    pub paused: Rc<std::cell::Cell<bool>>,
-    filter_pill: GtkBox,
+    pub content_box: GtkBox,
+    pub filter_pill: GtkBox,
     pill_label: Label,
     option_buttons: Rc<RefCell<Vec<Button>>>,
 }
@@ -129,12 +148,12 @@ pub fn create_wave_view(
     root_overlay.set_vexpand(true);
 
     // ================= Полноэкранный рендерер живого «Плавающего нечто» =================
-    // Кадр рисуется на CPU в уменьшенную текстуру, растягивает её видеокарта (Picture)
-    let drawing_area = Picture::new();
+    // Рисует видеокарта (шейдер в wave_gl.rs); процессор только двигает время и цвета
+    let drawing_area = gtk4::GLArea::new();
     drawing_area.set_hexpand(true);
     drawing_area.set_vexpand(true);
-    drawing_area.set_can_shrink(true);
-    drawing_area.set_content_fit(gtk4::ContentFit::Fill);
+    let play_center = Rc::new(std::cell::Cell::new((0.0_f64, 0.0_f64)));
+    super::wave_gl::attach(&drawing_area, shader_state.clone(), play_center.clone());
 
     // Центральная кнопка Play/Pause (фиксированный размер 72x72)
     let play_btn = Button::new();
@@ -146,26 +165,16 @@ pub fn create_wave_view(
     play_btn_icon.set_pixel_size(32);
     play_btn.set_child(Some(&play_btn_icon));
 
-    // Анимация 60 FPS через add_tick_callback на базе GdkFrameClock
-    let paused = Rc::new(std::cell::Cell::new(false));
+    // Анимация 60 FPS через add_tick_callback на базе GdkFrameClock: шаг состояния и запрос кадра у видеокарты
     {
-        let paused_ref = paused.clone();
         let state_ref = shader_state.clone();
         let is_playing_clone = is_playing_state.clone();
         let audio = player.audio.clone();
         let last_time_ref = Rc::new(RefCell::new(0_i64));
         let play_btn_ref = play_btn.clone();
-        let offscreen: RefCell<RenderBuffers> = RefCell::default();
-        let budget = render_pixel_budget();
-        let profile = std::env::var_os("VOLNA_PROFILE").is_some();
-        let frames = RefCell::new((0u32, std::time::Duration::ZERO));
         let tick_n = std::cell::Cell::new(0u32);
 
         drawing_area.add_tick_callback(move |area, frame_clock| {
-            if paused_ref.get() {
-                *last_time_ref.borrow_mut() = 0;
-                return glib::ControlFlow::Continue;
-            }
             let now = frame_clock.frame_time(); // время в микросекундах
             let mut last = last_time_ref.borrow_mut();
             let dt = if *last == 0 {
@@ -181,7 +190,7 @@ pub fn create_wave_view(
                 state.tick(dt, audio.bass_level() as f64);
             }
 
-            // На паузе плазма еле дрейфует: бас затух — рисуем каждый 4-й кадр (≈15 FPS)
+            // На паузе плазма еле дрейфует: бас затух — кадр каждый 4-й тик (≈15 FPS)
             let n = tick_n.get().wrapping_add(1);
             tick_n.set(n);
             let idle = {
@@ -192,37 +201,13 @@ pub fn create_wave_view(
                 return glib::ControlFlow::Continue;
             }
 
-            let (width, height) = (area.width(), area.height());
-            if width > 0 && height > 0 {
-                let started = std::time::Instant::now();
-                // Центр кнопки Play в координатах фона
-                let (cx, cy) = play_btn_ref
-                    .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
-                    .map(|p| (p.x() as f64, p.y() as f64))
-                    .unwrap_or((width as f64 / 2.0, height as f64 * 0.38));
-                let texture = render_texture(
-                    &mut offscreen.borrow_mut(),
-                    width as f64,
-                    height as f64,
-                    cx,
-                    cy,
-                    &state_ref.borrow(),
-                    budget,
-                );
-                if let Some(t) = texture {
-                    area.set_paintable(Some(&t));
-                }
-
-                if profile {
-                    let mut f = frames.borrow_mut();
-                    f.0 += 1;
-                    f.1 += started.elapsed();
-                    if f.0 == 120 {
-                        eprintln!("[wave] {}x{}: {:.1} мс/кадр, бюджет {:.0} пикс", width, height, f.1.as_secs_f64() * 1000.0 / 120.0, offscreen.borrow().budget);
-                        *f = (0, std::time::Duration::ZERO);
-                    }
-                }
-            }
+            // Центр кнопки Play в координатах фона
+            let center = play_btn_ref
+                .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
+                .map(|p| (p.x() as f64, p.y() as f64))
+                .unwrap_or((area.width() as f64 / 2.0, area.height() as f64 * 0.38));
+            play_center.set(center);
+            area.queue_render();
             glib::ControlFlow::Continue
         });
     }
@@ -249,7 +234,14 @@ pub fn create_wave_view(
     title_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     title_label.set_justify(gtk4::Justification::Center);
     title_label.set_max_width_chars(24);
-    bottom_box.append(&title_label);
+    let explicit_badge = super::collection::explicit_badge();
+    explicit_badge.set_margin_start(12);
+    explicit_badge.add_css_class("hero");
+    let title_row = GtkBox::new(Orientation::Horizontal, 0);
+    title_row.set_halign(Align::Center);
+    title_row.append(&title_label);
+    title_row.append(&explicit_badge);
+    bottom_box.append(&title_row);
 
     let artist_label = Label::new(Some("Нажмите для запуска персонального потока 🌊"));
     artist_label.add_css_class("hero-track-artist");
@@ -574,259 +566,87 @@ pub fn create_wave_view(
     WaveViewWidgets {
         container: root_overlay,
         title_label,
+        explicit_badge,
         artist_label,
         play_btn,
         play_btn_icon,
         menu_button,
         drawing_area,
         shader_state,
-        paused,
+        content_box,
         filter_pill,
         pill_label,
         option_buttons,
     }
 }
 
-// ==============================================================================
-// Роскошный, кинематографичный рендеринг «Luminous Fluid Orb» на Cairo (100% safe)
-// ==============================================================================
-
-/// Сколько пикселей рисуем за кадр (`VOLNA_RENDER_PIXELS` переопределяет; очень большое значение отключает уменьшение)
-fn render_pixel_budget() -> f64 {
-    std::env::var("VOLNA_RENDER_PIXELS").ok().and_then(|v| v.parse().ok()).unwrap_or(600_000.0)
-}
-
-/// Буферы рендера: кадр и кэш сплошной основы (пересчитывается только при смене размера, центра или цветов)
-#[derive(Default)]
-struct RenderBuffers {
-    frame: Option<cairo::ImageSurface>,
-    base: Option<(Vec<i32>, cairo::ImageSurface)>,
-    /// Текущий бюджет пикселей; подстраивается под скорость процессора (0 — взять начальный)
-    budget: f64,
-    avg_ms: f64,
-    frames: u32,
-}
-
-/// Целевое время растеризации кадра: с запасом под остальной интерфейс
-const TARGET_FRAME_MS: f64 = 7.0;
-/// Нижняя и верхняя границы бюджета: ниже заметны пиксели, выше нет смысла
-const MIN_BUDGET: f64 = 160_000.0;
-const MAX_BUDGET: f64 = 2_500_000.0;
-
-impl RenderBuffers {
-    /// Подстраивает разрешение: рисуем как можно чётче, пока кадр укладывается в целевое время
-    fn adapt(&mut self, ms: f64) {
-        self.avg_ms = if self.avg_ms == 0.0 { ms } else { self.avg_ms * 0.9 + ms * 0.1 };
-        self.frames += 1;
-        if self.frames % 30 != 0 {
-            return;
+/// Основной цвет обложки: самый «весомый» оттенок, где вес пикселя растёт с насыщенностью и яркостью.
+/// `None`, если обложка почти бесцветная (тогда остаются цвета Яндекса).
+fn palette_from_pixels(px: &[[f64; 3]]) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
+    const BINS: usize = 18;
+    let mut bins = [(0.0_f64, [0.0_f64; 3]); BINS];
+    let mut total = 0.0;
+    for &[r, g, b] in px {
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        if max < 0.12 {
+            continue;
         }
-        // стоимость растёт примерно линейно с числом пикселей
-        let wanted = self.budget * (TARGET_FRAME_MS / self.avg_ms.max(0.5));
-        // шаги ограничены, чтобы разрешение не прыгало
-        self.budget = wanted.clamp(self.budget * 0.8, self.budget * 1.25).clamp(MIN_BUDGET, MAX_BUDGET);
-    }
-}
-
-/// Рисует кадр в буфер не больше `budget` пикселей: фон и нити мягкие, а стоимость растеризации
-/// на CPU растёт с числом пикселей. Возвращает текстуру, которую растягивает видеокарта.
-fn render_texture(
-    bufs: &mut RenderBuffers,
-    w: f64,
-    h: f64,
-    cx: f64,
-    cy: f64,
-    state: &WaveShaderState,
-    initial_budget: f64,
-) -> Option<gdk::MemoryTexture> {
-    let started = std::time::Instant::now();
-    if bufs.budget == 0.0 {
-        bufs.budget = initial_budget;
-    }
-    let scale = (bufs.budget / (w * h)).sqrt().min(1.0);
-    let (sw, sh) = ((w * scale).ceil() as i32, (h * scale).ceil() as i32);
-    let (fx, fy) = (sw as f64 / w, sh as f64 / h);
-
-    if bufs.frame.as_ref().map(|s| (s.width(), s.height())) != Some((sw, sh)) {
-        bufs.frame = cairo::ImageSurface::create(cairo::Format::ARgb32, sw, sh).ok();
-    }
-
-    // Цвета с точностью до 8 бит: при сходимости переходов ключ перестаёт меняться и основа берётся из кэша
-    let mut key = vec![sw, sh, cx.round() as i32, cy.round() as i32];
-    key.extend(
-        [state.cur_core, state.cur_deep, state.cur_ridge]
-            .iter()
-            .flatten()
-            .map(|c| (c * 255.0).round() as i32),
-    );
-    if bufs.base.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, sw, sh).ok()?;
-        {
-            let cr = cairo::Context::new(&surface).ok()?;
-            cr.scale(fx, fy);
-            paint_base(&cr, w.max(h), cx, cy, state.cur_core, state.cur_deep, state.cur_ridge);
+        let s = (max - min) / max;
+        let hue = if max == min {
+            0.0
+        } else if max == r {
+            ((g - b) / (max - min)).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / (max - min) + 2.0
+        } else {
+            (r - g) / (max - min) + 4.0
+        } / 6.0;
+        let w = s * s * max;
+        let bin = &mut bins[((hue * BINS as f64) as usize).min(BINS - 1)];
+        bin.0 += w;
+        for c in 0..3 {
+            bin.1[c] += [r, g, b][c] * w;
         }
-        bufs.base = Some((key, surface));
+        total += w;
     }
-
-    let surface = bufs.frame.as_mut()?;
-    {
-        let cr = cairo::Context::new(&*surface).ok()?;
-        let base_ready = match &bufs.base {
-            Some((_, base)) => {
-                cr.set_operator(cairo::Operator::Source);
-                cr.set_source_surface(base, 0.0, 0.0).ok()?;
-                cr.paint().ok()?;
-                cr.set_operator(cairo::Operator::Over);
-                true
-            }
-            None => false,
-        };
-        cr.scale(fx, fy);
-        render_live_wave_cairo(&cr, w, h, cx, cy, state, base_ready);
+    if total < 0.03 * px.len() as f64 {
+        return None;
     }
-    surface.flush();
-    let stride = surface.stride() as usize;
-    let data = surface.data().ok()?;
-    // shortcut: B8G8R8A8 соответствует ARgb32 только на little-endian (x86/ARM Linux), на big-endian нужен другой формат
-    let texture = gdk::MemoryTexture::new(
-        sw,
-        sh,
-        gdk::MemoryFormat::B8g8r8a8Premultiplied,
-        &glib::Bytes::from(&data[..]),
-        stride,
-    );
-    drop(data);
-    bufs.adapt(started.elapsed().as_secs_f64() * 1000.0);
-    Some(texture)
-}
-
-/// Сплошная радиальная заливка цветом трека. Меняется только со сменой цветов, поэтому её кэшируют.
-fn paint_base(cr: &cairo::Context, max_dim: f64, cx: f64, cy: f64, core: [f64; 3], deep: [f64; 3], ridge: [f64; 3]) {
-    let base = [
-        core[0] * 0.55 + deep[0] * 0.45,
-        core[1] * 0.55 + deep[1] * 0.45,
-        core[2] * 0.55 + deep[2] * 0.45,
-    ];
-    cr.set_operator(cairo::Operator::Source);
-    let bg_pattern = cairo::RadialGradient::new(cx, cy, 0.0, cx, cy, max_dim * 0.95);
-    bg_pattern.add_color_stop_rgba(0.0, base[0] * 1.25 + ridge[0] * 0.10, base[1] * 1.25 + ridge[1] * 0.10, base[2] * 1.25 + ridge[2] * 0.10, 1.0);
-    bg_pattern.add_color_stop_rgba(0.55, base[0], base[1], base[2], 1.0);
-    bg_pattern.add_color_stop_rgba(1.0, base[0] * 0.45, base[1] * 0.45, base[2] * 0.45, 1.0);
-    let _ = cr.set_source(&bg_pattern);
-    let _ = cr.paint();
-    cr.set_operator(cairo::Operator::Over);
-}
-
-fn render_live_wave_cairo(
-    cr: &cairo::Context,
-    w: f64,
-    h: f64,
-    cx: f64,
-    cy: f64,
-    state: &WaveShaderState,
-    base_ready: bool,
-) {
-    let max_dim = w.max(h);
-    let time = state.time;
-    let bass = state.bass;
-    let core = state.cur_core;
-    let deep = state.cur_deep;
-    let ridge = state.cur_ridge;
-
-    // --------------------------------------------------------------------------
-    // 1. Сплошная заливка цветом трека (как у Яндекс Музыки): без шара и твёрдых форм
-    // --------------------------------------------------------------------------
-    if !base_ready {
-        paint_base(cr, max_dim, cx, cy, core, deep, ridge);
-    }
-
-    // Мягкий свет у кнопки Play, усиливается басом
-    let glow_r = max_dim * 0.42 * (1.0 + bass * 0.35);
-    let glow_pat = cairo::RadialGradient::new(cx, cy, 0.0, cx, cy, glow_r);
-    glow_pat.add_color_stop_rgba(0.0, ridge[0], ridge[1], ridge[2], 0.38 + bass * 0.40);
-    glow_pat.add_color_stop_rgba(0.45, core[0], core[1], core[2], 0.14 + bass * 0.12);
-    glow_pat.add_color_stop_rgba(1.0, core[0], core[1], core[2], 0.0);
-    cr.new_path();
-    cr.arc(cx, cy, glow_r, 0.0, PI * 2.0);
-    let _ = cr.set_source(&glow_pat);
-    let _ = cr.fill();
-
-    // --------------------------------------------------------------------------
-    // 2. Текучие светящиеся нити: замкнутые контуры-«жилки», медленно меняющие форму
-    // --------------------------------------------------------------------------
-    const FILAMENTS: usize = 7;
-    const FILAMENT_POINTS: usize = 72;
-    let light = [
-        ridge[0] * 0.5 + 0.5,
-        ridge[1] * 0.5 + 0.5,
-        ridge[2] * 0.5 + 0.5,
-    ];
-    // Over вместо Screen: у pixman он заметно быстрее, а на полупрозрачных светлых нитях разницы почти нет
-    for k in 0..FILAMENTS {
-        let kf = k as f64;
-        let frac = kf / FILAMENTS as f64;
-        let radius = max_dim * (0.14 + 0.14 * kf);
-        let drift_x = (time * 0.17 + kf * 1.9).sin() * 36.0;
-        let drift_y = (time * 0.13 + kf * 1.1).cos() * 24.0;
-        let speed = 1.0 + kf * 0.09;
-
-        let mut pts = Vec::with_capacity(FILAMENT_POINTS);
-        for i in 0..FILAMENT_POINTS {
-            let theta = (i as f64 / FILAMENT_POINTS as f64) * PI * 2.0;
-            let wave = 0.16 * (theta * 3.0 + time * 0.50 * speed + kf * 1.3).sin()
-                + 0.10 * (theta * 5.0 - time * 0.40 * speed + kf * 0.7).cos()
-                + 0.06 * (theta * 2.0 + time * 0.30 * speed + kf).sin();
-            let r = radius * (1.0 + wave) + bass * 22.0 * (0.4 + frac);
-            pts.push((cx + drift_x + theta.cos() * r, cy + drift_y + theta.sin() * r));
-        }
-
-        let strength = (0.32 + bass * 0.70) * (1.0 - frac * 0.40);
-        // Три обводки разной толщины имитируют размытие нити
-        for (width, alpha) in [(12.0, 0.30), (3.2, 1.0)] {
-            draw_smooth_closed_path(cr, &pts);
-            cr.set_line_width(width);
-            cr.set_source_rgba(light[0], light[1], light[2], (alpha * strength).min(1.0));
-            let _ = cr.stroke();
+    // лучший оттенок вместе с соседями по кругу, чтобы граница корзин не рвала цвет
+    let score = |i: usize| bins[(i + BINS - 1) % BINS].0 + bins[i].0 + bins[(i + 1) % BINS].0;
+    let best = (0..BINS).max_by(|&a, &b| score(a).total_cmp(&score(b)))?;
+    let (mut w, mut rgb) = (0.0, [0.0; 3]);
+    for i in [(best + BINS - 1) % BINS, best, (best + 1) % BINS] {
+        w += bins[i].0;
+        for c in 0..3 {
+            rgb[c] += bins[i].1[c];
         }
     }
-    cr.set_operator(cairo::Operator::Over);
-
-    // --------------------------------------------------------------------------
-    // 3. Плавное затухание в глубокий ночной цвет в нижней части экрана
-    // --------------------------------------------------------------------------
-    let vignette_start = h * 0.54;
-    let vignette_pat = cairo::LinearGradient::new(0.0, vignette_start, 0.0, h);
-    vignette_pat.add_color_stop_rgba(0.0, 0.02, 0.02, 0.03, 0.0);
-    vignette_pat.add_color_stop_rgba(0.35, 0.03, 0.03, 0.04, 0.65);
-    vignette_pat.add_color_stop_rgba(0.70, 0.03, 0.03, 0.05, 0.90);
-    vignette_pat.add_color_stop_rgba(1.0, 0.02, 0.02, 0.03, 0.98);
-
-    cr.new_path();
-    cr.rectangle(0.0, vignette_start, w, h - vignette_start);
-    let _ = cr.set_source(&vignette_pat);
-    let _ = cr.fill();
+    let mut core = rgb.map(|c| c / w);
+    // яркость к 0.9 по старшему каналу: оттенок сохраняется, фон не выходит тусклым
+    let peak = core[0].max(core[1]).max(core[2]).max(1e-6);
+    core = core.map(|c| (c / peak * 0.9).min(1.0));
+    let deep = core.map(|c| c * 0.32);
+    let ridge = core.map(|c| (c * 0.6 + 0.4).min(1.0));
+    Some((core, deep, ridge))
 }
 
-/// Рисует замкнутый гладкий контур Безье через переданные контрольные точки
-fn draw_smooth_closed_path(cr: &cairo::Context, pts: &[(f64, f64)]) {
-    let n = pts.len();
-    if n < 3 {
-        return;
+#[cfg(test)]
+mod palette_tests {
+    use super::palette_from_pixels;
+
+    #[test]
+    fn neon_on_dark_wins_over_gray() {
+        // много серо-синего и тёмного, немного яркого розового неона
+        let mut px = vec![[0.35, 0.36, 0.42]; 300];
+        px.extend(vec![[0.05, 0.05, 0.1]; 300]);
+        px.extend(vec![[1.0, 0.2, 0.6]; 120]);
+        let (core, _, _) = palette_from_pixels(&px).unwrap();
+        assert!(core[0] > core[1] && core[2] > core[1], "{core:?}");
     }
 
-    cr.new_path();
-    let start_mid = (
-        (pts[0].0 + pts[n - 1].0) / 2.0,
-        (pts[0].1 + pts[n - 1].1) / 2.0,
-    );
-    cr.move_to(start_mid.0, start_mid.1);
-
-    for i in 0..n {
-        let p_curr = pts[i];
-        let p_next = pts[(i + 1) % n];
-        let mid = ((p_curr.0 + p_next.0) / 2.0, (p_curr.1 + p_next.1) / 2.0);
-        cr.curve_to(p_curr.0, p_curr.1, p_curr.0, p_curr.1, mid.0, mid.1);
+    #[test]
+    fn gray_cover_keeps_yandex_colors() {
+        assert!(palette_from_pixels(&vec![[0.5, 0.5, 0.52]; 500]).is_none());
     }
-    cr.close_path();
 }

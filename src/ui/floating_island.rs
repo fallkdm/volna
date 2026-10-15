@@ -10,6 +10,7 @@ pub struct FloatingIslandWidgets {
     pub container: GtkBox,
     pub cover_image: Image,
     pub title_label: Label,
+    pub explicit_badge: Label,
     pub artist_label: Label,
     pub like_btn: Button,
     pub dislike_btn: Button,
@@ -81,7 +82,39 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     title_label.set_width_chars(1);
     title_label.set_max_width_chars(1);
-    meta_box.append(&title_label);
+    // Плашка «E» поверх строки названия, сразу за текстом: в обычном ряду длина названия
+    // меняла бы естественную ширину острова, а она должна зависеть только от самого острова
+    let explicit_badge = super::collection::explicit_badge();
+    explicit_badge.set_halign(Align::Start);
+    let title_row = gtk4::Overlay::new();
+    title_row.set_child(Some(&title_label));
+    title_row.add_overlay(&explicit_badge);
+    meta_box.append(&title_row);
+    {
+        let badge = explicit_badge.clone();
+        let last = std::cell::Cell::new((String::new(), -1));
+        title_label.add_tick_callback(move |label, _| {
+            if !badge.is_visible() {
+                if label.margin_end() != 0 {
+                    label.set_margin_end(0);
+                }
+                return glib::ControlFlow::Continue;
+            }
+            // место под плашку справа, текст обрезается многоточием раньше неё
+            let reserve = badge.width().max(16) + 8;
+            if label.margin_end() != reserve {
+                label.set_margin_end(reserve);
+            }
+            let key = (label.text().to_string(), label.width());
+            let prev = last.take();
+            if prev != key {
+                let text_w = label.create_pango_layout(Some(&key.0)).pixel_size().0;
+                badge.set_margin_start(text_w.min(key.1) + 8);
+            }
+            last.set(key);
+            glib::ControlFlow::Continue
+        });
+    }
 
     let artist_label = Label::new(Some("Яндекс Музыка"));
     artist_label.add_css_class("island-artist");
@@ -289,6 +322,7 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
         container,
         cover_image,
         title_label,
+        explicit_badge,
         artist_label,
         like_btn,
         dislike_btn,

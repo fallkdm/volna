@@ -4,6 +4,7 @@ pub mod floating_island;
 pub mod library_view;
 pub mod preferences_dialog;
 pub mod search_view;
+pub mod wave_gl;
 pub mod wave_view;
 pub mod window;
 

@@ -20,7 +20,7 @@ const LIKED_PREVIEW: usize = 6;
 pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.set_margin_top(24);
-    container.set_margin_bottom(110);
+    // отступ под плавающий плеер даёт само содержимое прокрутки: оно уезжает под плеер и докручивается выше него
     container.set_margin_start(32);
     container.set_margin_end(32);
 
@@ -43,6 +43,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     let status = Label::new(None);
     status.set_halign(Align::Start);
     status.add_css_class("dim-label");
+    status.set_visible(false);
     main.append(&status);
 
     // Мне нравится: превью и переход к полному списку
@@ -96,6 +97,8 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
+    main.set_margin_bottom(130);
+    main.set_margin_end(14); // полоса прокрутки не наезжает на строки
     scrolled.set_child(Some(&main));
     stack.add_named(&scrolled, Some("main"));
     stack.set_visible_child_name("main");
@@ -115,16 +118,19 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 let client = p.client.lock().unwrap().clone();
                 if !client.has_token() {
                     status.set_text("Укажите токен в настройках ⚙ для доступа к коллекции");
+                    status.set_visible(true);
                     return;
                 }
                 let uid = match client.get_uid().await {
                     Ok(uid) => uid,
                     Err(e) => {
                         status.set_text(&format!("Ошибка аккаунта: {}", e));
+                        status.set_visible(true);
                         return;
                     }
                 };
                 status.set_text("");
+                status.set_visible(false);
 
                 if let Ok(tracks) = client.get_liked_tracks(&uid).await {
                     liked_count.set_text(&format!("{} треков", tracks.len()));

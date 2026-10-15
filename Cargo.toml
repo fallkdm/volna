@@ -2,6 +2,8 @@
 name = "volna"
 version = "0.1.0"
 license = "GPL-3.0-only"
+description = "Лёгкий нативный клиент Яндекс Музыки для Linux на GTK4 / Libadwaita и GStreamer"
+repository = "https://github.com/fallkdm/volna"
 edition = "2024"
 
 [dependencies]
@@ -19,3 +21,5 @@ gstreamer = { version = "0.25", features = ["v1_28"] }
 gstreamer-play = { version = "0.25", features = ["v1_28"] }
 async-channel = "2"
 mpris-server = { version = "0.10", features = ["tokio"] }
+glow = "0.16"
+libloading = "0.8"

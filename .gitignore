@@ -1,1 +1,7 @@
 /target
+
+# рабочие файлы разработки, не часть программы
+/graphify-out/
+/AGENT_CHAT.md
+/scripts/
+/.gitattributes

@@ -424,6 +424,7 @@ impl YandexMusicClient {
             }
         };
 
+        let mut plain_fallback: Option<String> = None;
         let mut resp = self.lrclib_get(&make_url(duration_secs)).await;
         // Если запрос с точной длительностью вернул 404, повторяем поиск без ограничения длительности
         if matches!(resp, LrclibFetch::NotFound) && duration_secs.is_some() {
@@ -431,27 +432,72 @@ impl YandexMusicClient {
         }
         let resp = match resp {
             LrclibFetch::Found(r) => Some(r),
-            _ => None,
+            // LRCLIB не отвечает (429/5xx/сеть): поиск упрётся туда же и съест таймаут загрузки текста,
+            // а обычный текст Яндекса тогда пропадёт
+            LrclibFetch::Failed => return Ok(None),
+            LrclibFetch::NotFound => None,
         };
 
         if let Some(response) = resp {
             if let Ok(data) = response.json::<LrclibResponse>().await {
                 if let Some(synced) = data.synced_lyrics {
                     let trimmed = synced.trim();
-                    if !trimmed.is_empty() {
+                    if usable_synced(trimmed) {
                         return Ok(Some(trimmed.to_string()));
                     }
                 }
                 if let Some(plain) = data.plain_lyrics {
                     let trimmed = plain.trim();
                     if !trimmed.is_empty() {
-                        return Ok(Some(trimmed.to_string()));
+                        plain_fallback = Some(trimmed.to_string());
                     }
                 }
             }
         }
 
-        Ok(None)
+        // Точное совпадение дало только обычный текст: ищем запись с таймингами (в базе она бывает
+        // отдельно, иногда с перепутанными названием и исполнителем)
+        if let Some(synced) = self.lrclib_search_synced(clean_artist, clean_title, duration_secs).await {
+            return Ok(Some(synced));
+        }
+        Ok(plain_fallback)
+    }
+
+    /// Поиск в LRCLIB записи с синхронизированным текстом той же длительности (±3 с)
+    async fn lrclib_search_synced(&self, artist: &str, title: &str, duration_secs: Option<u64>) -> Option<String> {
+        let url = format!("https://lrclib.net/api/search?q={}", urlencoding_encode(&format!("{title} {artist}")));
+        let LrclibFetch::Found(resp) = self.lrclib_get(&url).await else { return None };
+        let items: Vec<serde_json::Value> = resp.json().await.ok()?;
+        let (title_n, artist_n) = (normalize_name(title), normalize_name(artist));
+        // исполнители у нас через запятую, в LRCLIB бывает один из них: хватает совпадения по первому
+        let first_artist = normalize_name(artist.split(',').next().unwrap_or(artist));
+        // вхождение подстрокой только для имён от 4 символов: иначе «m» совпала бы с кем угодно;
+        // имя из одних знаков («!!!») нормализуется в пустое и сравнивается как есть
+        let raw_artist = artist.trim().to_lowercase();
+        let same_artist = |a: &str, raw: &str| {
+            if artist_n.is_empty() {
+                return raw.trim() == raw_artist;
+            }
+            let long = |x: &str| x.chars().count() >= 4;
+            !a.is_empty()
+                && (a == artist_n
+                    || (long(&first_artist) && a.contains(&first_artist))
+                    || (long(a) && artist_n.contains(a)))
+        };
+        let names_match = |v: &serde_json::Value| {
+            let field = |k: &str| normalize_name(v[k].as_str().unwrap_or(""));
+            let (t, a) = (field("trackName"), field("artistName"));
+            let raw = v["artistName"].as_str().unwrap_or("").to_lowercase();
+            (t == title_n && same_artist(&a, &raw)) || (!artist_n.is_empty() && t == artist_n && a == title_n)
+        };
+        items
+            .iter()
+            .filter(|v| names_match(v))
+            .filter(|v| match (duration_secs, v["duration"].as_f64()) {
+                (Some(want), Some(got)) => (got - want as f64).abs() <= 3.0,
+                _ => true,
+            })
+            .find_map(|v| v["syncedLyrics"].as_str().map(str::trim).filter(|t| usable_synced(t)).map(String::from))
     }
 
     /// Запрос текста песни для плеера:
@@ -469,7 +515,7 @@ impl YandexMusicClient {
         // Синхронизированный текст из кэша: не ходим в сеть повторно и не упираемся в лимиты LRCLIB
         let cache_path = crate::cache::lyrics_cache_path(track_id);
         if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-            if !parse_lrc(&cached).is_empty() {
+            if usable_synced(&cached) {
                 return Ok(Some(cached));
             }
         }
@@ -488,11 +534,13 @@ impl YandexMusicClient {
                         if let Some(full) = supp.result.lyrics.and_then(|l| l.full_lyrics) {
                             let trimmed = full.trim();
                             if !trimmed.is_empty() {
-                                if !parse_lrc(trimmed).is_empty() {
+                                if usable_synced(trimmed) {
                                     save_synced(trimmed);
                                     return Ok(Some(trimmed.to_string()));
                                 } else {
-                                    yandex_plain = Some(trimmed.to_string());
+                                    // огрызок с таймкодами показываем как обычный текст, иначе экран снова
+                                    // станет «караоке» из одной строки
+                                    yandex_plain = Some(strip_lrc_tags(trimmed));
                                 }
                             }
                         }
@@ -505,7 +553,7 @@ impl YandexMusicClient {
         // Запрашиваем открытую глобальную базу LRCLIB (https://lrclib.net)
         if let Ok(Some(lrclib_text)) = self.get_lrclib_lyrics(artist, title, duration_secs).await {
             // Если в LRCLIB есть синхронизированные таймкоды — возвращаем их (полноценное караоке!)
-            if !parse_lrc(&lrclib_text).is_empty() {
+            if usable_synced(&lrclib_text) {
                 save_synced(&lrclib_text);
                 return Ok(Some(lrclib_text));
             }
@@ -639,6 +687,44 @@ impl YandexMusicClient {
     }
 }
 
+/// Синхронизированный текст годится, только если в нём хотя бы несколько строк: в базах встречаются
+/// огрызки из одной строки (например, у Kavinsky — Nightcall), и тогда весь экран показывал одну фразу
+fn usable_synced(text: &str) -> bool {
+    parse_lrc(text).len() >= 4
+}
+
+/// Убирает таймкоды `[mm:ss.xx]` в начале строк, оставляя сам текст
+fn strip_lrc_tags(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let mut l = l.trim_start();
+            while l.starts_with('[') {
+                match l.find(']') {
+                    Some(end) => l = l[end + 1..].trim_start(),
+                    None => break,
+                }
+            }
+            l
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Название для сравнения: без регистра, без скобок («(feat. …)», «[Remix]»), хвоста « - Remastered» и пунктуации
+fn normalize_name(s: &str) -> String {
+    let mut depth = 0u32;
+    let no_brackets: String = s
+        .chars()
+        .filter(|c| match c {
+            '(' | '[' => { depth += 1; false }
+            ')' | ']' => { depth = depth.saturating_sub(1); false }
+            _ => depth == 0,
+        })
+        .collect();
+    let head = no_brackets.split(" - ").next().unwrap_or("");
+    head.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Простое URL кодирование строки
 pub(crate) fn urlencoding_encode(s: &str) -> String {
     let mut encoded = String::new();
@@ -667,6 +753,49 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    /// Доля треков с таймингами среди выдачи по нескольким запросам: `cargo test lyrics_coverage_live -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn lyrics_coverage_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        let (mut total, mut synced) = (0, 0);
+        for q in ["Три дня дождя", "Radiohead", "Katy Perry", "Скриптонит", "Imagine Dragons", "Монеточка"] {
+            let tracks = client.search(q).await.unwrap().tracks.map(|t| t.results).unwrap_or_default();
+            for t in tracks.iter().take(8) {
+                let dur = t.duration_ms.map(|d| d / 1000);
+                let got = client.get_lrclib_lyrics(&t.artists_string(), &t.title, dur).await.ok().flatten();
+                let ok = got.as_deref().is_some_and(|x| !parse_lrc(x).is_empty());
+                total += 1;
+                synced += ok as u32;
+                if !ok { println!("БЕЗ ТАЙМИНГОВ: {} — {} ({})", t.artists_string(), t.title, if got.is_some() { "есть обычный текст" } else { "текста нет" }); }
+            }
+        }
+        println!("LIVE coverage: {synced} из {total}");
+    }
+
+    /// Запись с таймингами лежит в LRCLIB с перепутанными названием и исполнителем
+    #[tokio::test]
+    #[ignore]
+    async fn lyrics_swapped_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        let text = client.get_lrclib_lyrics("Три дня дождя", "Сотни гортензий", Some(169)).await.unwrap().unwrap();
+        println!("LIVE swapped: synced_lines={}", parse_lrc(&text).len());
+        assert!(!parse_lrc(&text).is_empty());
+    }
+
+    /// `cargo test colors_live -- --ignored --nocapture`: какие цвета Яндекс присылает для трека
+    #[tokio::test]
+    #[ignore]
+    async fn colors_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        for q in ["Сплин Линия жизни", "Серега Пират Я поднимаю свою голову вверх"] {
+            let t = client.search(q).await.unwrap().tracks.map(|t| t.results).unwrap_or_default();
+            if let Some(t) = t.first() {
+                println!("LIVE {} — {}: {:?}", t.artists_string(), t.title, t.derived_colors);
+            }
+        }
+    }
+
     /// `cargo test explicit_live -- --ignored --nocapture`: Яндекс должен помечать нецензурные треки
     #[tokio::test]
     #[ignore]
@@ -732,6 +861,24 @@ mod tests {
     fn test_urlencode() {
         assert_eq!(urlencoding_encode("hello world"), "hello+world");
         assert_eq!(urlencoding_encode("кино"), "%D0%BA%D0%B8%D0%BD%D0%BE");
+    }
+
+    #[test]
+    fn strip_lrc_tags_keeps_text() {
+        assert_eq!(strip_lrc_tags("[00:12.42] There is a nightcall\nplain"), "There is a nightcall\nplain");
+        assert!(parse_lrc(&strip_lrc_tags("[00:12.42] There is a nightcall")).is_empty());
+    }
+
+    #[test]
+    fn one_line_lrc_is_not_usable() {
+        assert!(!usable_synced("[00:12.42] There is a nightcall"));
+        assert!(usable_synced("[00:01.00] a\n[00:02.00] b\n[00:03.00] c\n[00:04.00] d"));
+    }
+
+    #[test]
+    fn normalize_name_strips_noise() {
+        assert_eq!(normalize_name("Creep (feat. X) - Remastered"), "creep");
+        assert_eq!(normalize_name("  Don't  Stop! [Live]"), "dont stop");
     }
 
     #[test]

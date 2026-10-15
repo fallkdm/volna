@@ -125,6 +125,12 @@ impl AudioBackend {
         let adapter = PlaySignalAdapter::new(&play);
         let is_playing = Arc::new(Mutex::new(false));
         let bass = BassQueue::default();
+        // Режим загрузки (как у видео в браузере): поток докачивается целиком во временный файл,
+        // и можно узнать, докуда он загружен — для полоски прогрузки в плеере
+        let pipeline = play.pipeline();
+        if pipeline.find_property("flags").is_some() {
+            pipeline.set_property_from_str("flags", "audio+soft-volume+download");
+        }
         // Без анализатора просто играем дальше: орб останется спокойным
         if let Err(e) = attach_bass_analyzer(&play.pipeline(), bass.clone()) {
             eprintln!("Анализатор баса недоступен (нужен плагин spectrum из gst-plugins-good): {}", e);
@@ -208,6 +214,24 @@ impl AudioBackend {
     pub fn seek_seconds(&self, seconds: u64) {
         let time = gstreamer::ClockTime::from_seconds(seconds);
         self.play.seek(time);
+    }
+
+    /// Перемотка с точностью до миллисекунды (переход к строке текста песни)
+    pub fn seek_ms(&self, ms: u64) {
+        self.play.seek(gstreamer::ClockTime::from_mseconds(ms));
+    }
+
+    /// Докуда загружен текущий поток, доля 0..1 (`None`, если источник этого не сообщает)
+    pub fn buffered_fraction(&self) -> Option<f64> {
+        let mut q = gstreamer::query::Buffering::new(gstreamer::Format::Percent);
+        if !self.play.pipeline().query(&mut q) {
+            return None;
+        }
+        let max = 1_000_000.0; // GST_FORMAT_PERCENT_MAX: доли заданы в миллионных
+        let value = |v: gstreamer::GenericFormattedValue| v.value().max(0) as f64;
+        let (_, range_stop, _) = q.range();
+        let stop = q.ranges().map(|(_, stop)| value(stop)).fold(value(range_stop), f64::max);
+        (stop > 0.0).then(|| (stop / max).clamp(0.0, 1.0))
     }
 
     /// Текущая позиция воспроизведения в миллисекундах (для точной синхронизации караоке)

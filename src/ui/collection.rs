@@ -92,8 +92,20 @@ pub fn tile(title: &str, subtitle: &str, url: Option<String>, size: i32, round: 
     btn.set_child(Some(&col));
     btn.add_css_class("flat");
     btn.add_css_class("cover-tile");
+    // подписи внутри растягиваются (hexpand), но сама плитка — нет: иначе несколько плиток расползались на всю ширину
+    btn.set_hexpand(false);
     btn.connect_clicked(move |_| on_click());
     btn
+}
+
+/// Скруглённая плашка «E» для explicit-треков; по умолчанию скрыта
+pub fn explicit_badge() -> Label {
+    let badge = Label::new(Some("E"));
+    badge.add_css_class("explicit-badge");
+    badge.set_valign(Align::Center);
+    badge.set_tooltip_text(Some("Содержит нецензурную лексику"));
+    badge.set_visible(false);
+    badge
 }
 
 /// Строка трека с обложкой и длительностью
@@ -106,10 +118,8 @@ pub fn track_row(track: &Track, on_activate: impl Fn() + 'static) -> ActionRow {
     row.add_prefix(&cover_image(40, track.cover_url(100)));
 
     if track.is_explicit() {
-        let badge = Label::new(Some("E"));
-        badge.add_css_class("explicit-badge");
-        badge.set_valign(Align::Center);
-        badge.set_tooltip_text(Some("Содержит нецензурную лексику"));
+        let badge = explicit_badge();
+        badge.set_visible(true);
         row.add_suffix(&badge);
     }
 
@@ -144,6 +154,8 @@ pub struct DetailPage {
     cover: Image,
     kind: Label,
     title: Label,
+    /// Плашка «E» у названия на странице explicit-трека
+    pub title_badge: Label,
     subtitle: Label,
     list: ListBox,
     tracks: Rc<RefCell<Vec<Track>>>,
@@ -190,6 +202,12 @@ impl DetailPage {
         title.set_xalign(0.0);
         title.set_wrap(true);
         title.add_css_class("detail-title");
+        let title_badge = explicit_badge();
+        title_badge.set_margin_start(12);
+        title_badge.add_css_class("hero");
+        let title_row = GtkBox::new(Orientation::Horizontal, 0);
+        title_row.append(&title);
+        title_row.append(&title_badge);
         let subtitle = Label::new(None);
         subtitle.set_halign(Align::Start);
         subtitle.set_xalign(0.0);
@@ -216,7 +234,7 @@ impl DetailPage {
         info.set_valign(Align::End);
         info.set_hexpand(true);
         info.append(&kind);
-        info.append(&title);
+        info.append(&title_row);
         info.append(&subtitle);
         let wave_btn = Button::new();
         wave_btn.add_css_class("pill");
@@ -244,6 +262,8 @@ impl DetailPage {
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
+        content.set_margin_bottom(130);
+        content.set_margin_end(14);
         scrolled.set_child(Some(&content));
         widget.append(&scrolled);
 
@@ -263,7 +283,7 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, subtitle, list, tracks, player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), about, about_for: Rc::default() })
+        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), about, about_for: Rc::default() })
     }
 
     /// Показывает кнопку «Волна по …»
@@ -439,6 +459,7 @@ impl DetailPage {
     pub fn show(&self, kind: &str, title: &str, subtitle: &str, cover_url: Option<String>, tracks: Vec<Track>) {
         self.kind.set_text(kind);
         self.title.set_text(title);
+        self.title_badge.set_visible(false);
         self.subtitle.set_markup(&glib::markup_escape_text(subtitle));
         self.link_albums.borrow_mut().clear();
         clear_box(&self.about);
@@ -610,6 +631,7 @@ pub fn open_track(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, 
             None => track.artists_string(),
         };
         page.show("Трек", &track.title, &sub, track.cover_url(400), tracks);
+        page.title_badge.set_visible(track.is_explicit());
         page.set_subtitle_links(&track.artists, track.albums.first(), None);
         if let Some(a) = track.artists.first() {
             page.load_about(a.name.clone());
