@@ -183,8 +183,10 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     right_box.set_hexpand(true);
     right_box.set_valign(Align::Center);
 
-    let karaoke_icon = if std::path::Path::new("/home/philk/volna/data/icons/lyrics-symbolic.svg").exists() {
-        let img = Image::from_file("/home/philk/volna/data/icons/lyrics-symbolic.svg");
+    // иконка лежит в исходниках: ищем по пути сборки, затем относительно текущей папки
+    let built_icon = concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons/lyrics-symbolic.svg");
+    let karaoke_icon = if std::path::Path::new(built_icon).exists() {
+        let img = Image::from_file(built_icon);
         img.set_pixel_size(18);
         img
     } else if std::path::Path::new("data/icons/lyrics-symbolic.svg").exists() {

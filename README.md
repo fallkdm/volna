@@ -91,7 +91,7 @@ cargo build --release
 
 Демо-режим без аккаунта (для скриншотов и проверки интерфейса): `VOLNA_DEMO=1` (или `2`, `3` — другие цвета), необязательно `VOLNA_DEMO_COVER=путь.jpg`, `VOLNA_DEMO_POS_MS=14000` (позиция для подсветки строки), `VOLNA_DEMO_LYRICS=1` (сразу открыть текст песни). Чтобы демо не трогало настоящие настройки, запускайте с отдельными `XDG_CONFIG_HOME` и `XDG_CACHE_HOME`.
 
-Ярлык и иконка для меню приложений — в [`data/`](data/): `data/applications/io.github.fallkdm.Volna.desktop` и `data/icons/io.github.fallkdm.Volna.svg` (путь `Exec` в ярлыке поправьте под себя).
+Ярлык и иконка для меню приложений — в [`data/`](data/): `data/applications/io.github.fallkdm.Volna.desktop` и `data/icons/io.github.fallkdm.Volna.svg` (в `Exec` стоит просто `volna`: положите бинарник в `PATH` или впишите полный путь).
 
 Токен авторизации вводится в «Настройках» либо сохраняется в `~/.config/volna/config.json`:
 ```json

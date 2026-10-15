@@ -2,7 +2,7 @@
 Type=Application
 Name=Волна
 Comment=Клиент Яндекс Музыки
-Exec=/home/philk/volna/target/release/volna
+Exec=volna
 Icon=io.github.fallkdm.Volna
 Categories=AudioVideo;Audio;Player;
 StartupWMClass=io.github.fallkdm.Volna
