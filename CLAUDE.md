@@ -19,11 +19,8 @@ PATH=$HOME/.cargo/bin:$PATH cargo test
 # 3. Сборка оптимизированного релизного бинарника
 PATH=$HOME/.cargo/bin:$PATH cargo build --release
 
-# 4. Запуск приложения на дисплее рабочего стола
-env DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_kGbDrQ \
-    XDG_RUNTIME_DIR=/run/user/1000 \
-    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
-    /home/philk/volna/target/release/volna
+# 4. Запуск приложения
+./target/release/volna
 ```
 
 ---
@@ -31,7 +28,7 @@ env DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_kGbDrQ \
 ## 🏛 Архитектура проекта
 
 ```
-/home/philk/volna/
+~/volna/
 ├── Cargo.toml                  # Зависимости: gtk4, libadwaita, gstreamer-play, reqwest, tokio
 ├── data/
 │   ├── applications/           # Ярлык io.github.fallkdm.Volna.desktop
@@ -123,5 +120,5 @@ env DISPLAY=:0 XAUTHORITY=/run/user/1000/xauth_kGbDrQ \
 - В проекте развернут Knowledge Graph в `graphify-out/graph.json`.
 - После любых структурных изменений кода запускай обновление без затрат токенов:
   ```bash
-  graphify update /home/philk/volna
+  graphify update ~/volna
   ```
