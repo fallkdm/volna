@@ -112,6 +112,8 @@ pub struct Track {
     #[serde(rename = "ogImage")]
     pub og_image: Option<String>,
     pub available: Option<bool>,
+    #[serde(rename = "contentWarning")]
+    pub content_warning: Option<String>,
     #[serde(rename = "derivedColors")]
     pub derived_colors: Option<DerivedColors>,
 }
@@ -172,6 +174,11 @@ impl DerivedColors {
 }
 
 impl Track {
+    /// Трек с пометкой «explicit» (нецензурная лексика)
+    pub fn is_explicit(&self) -> bool {
+        self.content_warning.as_deref() == Some("explicit")
+    }
+
     /// Возвращает имена артистов через запятую
     pub fn artists_string(&self) -> String {
         if self.artists.is_empty() {

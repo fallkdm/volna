@@ -16,6 +16,14 @@ pub fn covers_cache_dir() -> PathBuf {
     dir
 }
 
+/// Путь к кэшу синхронизированного текста песни (~/.cache/volna/lyrics/ID.lrc)
+pub fn lyrics_cache_path(track_id: &str) -> PathBuf {
+    let dir = covers_cache_dir().parent().map(|p| p.join("lyrics")).unwrap_or_else(|| PathBuf::from("lyrics"));
+    let _ = create_dir_all(&dir);
+    let safe: String = track_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    dir.join(format!("{}.lrc", safe))
+}
+
 /// Вычисляет хэш для имени файла обложки
 pub fn cover_cache_path(url: &str) -> PathBuf {
     let mut hasher = Md5::new();

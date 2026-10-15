@@ -118,15 +118,23 @@ impl VolnaWindow {
 
         // Нижний плавающий остров плеера
         let island = create_floating_island(&player);
-        root_overlay.add_overlay(&island.container);
+
+        // Закрытие текста песни: задаётся ниже, когда создан экран караоке; переходы по клику из плеера закрывают его,
+        // иначе страница открывалась бы под текстом
+        let close_karaoke: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::default();
 
         // Клик по названию трека или артисту (в плеере и на экране волны) открывает его страницу
         let open_from_player = |label: &gtk4::Label, artist: bool| {
             let click = gtk4::GestureClick::new();
             let (p, vs) = (player.clone(), view_stack.clone());
             let (show_artist, show_track) = (search_view.show_artist.clone(), search_view.show_track.clone());
+            let close = close_karaoke.clone();
             click.connect_released(move |_, _, _, _| {
                 let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
+                let f = close.borrow().clone();
+                if let Some(f) = f {
+                    f();
+                }
                 if artist {
                     // shortcut: у трека с несколькими артистами открывается первый, для выбора нужен popover
                     let Some(a) = track.artists.first() else { return };
@@ -149,8 +157,13 @@ impl VolnaWindow {
         {
             let click = gtk4::GestureClick::new();
             let (p, vs, show_album) = (player.clone(), view_stack.clone(), search_view.show_album.clone());
+            let close = close_karaoke.clone();
             click.connect_released(move |_, _, _, _| {
                 let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
+                let f = close.borrow().clone();
+                if let Some(f) = f {
+                    f();
+                }
                 let Some(mut album) = track.albums.first().cloned() else { return };
                 if album.artists.is_empty() {
                     album.artists = track.artists.clone();
@@ -179,10 +192,20 @@ impl VolnaWindow {
         let lyrics_container = GtkBox::new(Orientation::Vertical, 14);
         lyrics_container.set_valign(Align::Start);
         lyrics_container.set_halign(Align::Center);
-        lyrics_container.set_margin_top(260);
+        lyrics_container.set_margin_top(60);
         lyrics_container.set_margin_bottom(90);
 
         lyrics_scrolled.set_child(Some(&lyrics_container));
+        // Синхронизированный текст: поля сверху и снизу в полвысоты окна, чтобы любая строка (в том числе
+        // первая и последняя) могла встать строго по центру; размер окна меняется — поля пересчитываются
+        {
+            let (container, scrolled) = (lyrics_container.clone(), lyrics_scrolled.downgrade());
+            lyrics_scrolled.vadjustment().connect_page_size_notify(move |_| {
+                if let Some(scrolled) = scrolled.upgrade() {
+                    apply_lyrics_margins(&container, &scrolled);
+                }
+            });
+        }
         karaoke_overlay.set_child(Some(&lyrics_scrolled));
 
         // 2. Абсолютно зафиксированная шапка (слой поверх текста, Align::Start по вертикали)
@@ -233,21 +256,33 @@ impl VolnaWindow {
         karaoke_overlay.add_overlay(&countdown_label);
 
         root_overlay.add_overlay(&karaoke_overlay);
+        // плеер добавляем после караоке, чтобы он оставался поверх текста песни (оверлеи рисуются в порядке добавления)
+        root_overlay.add_overlay(&island.container);
 
         let lyrics_data: Rc<RefCell<Vec<LrcLine>>> = Rc::new(RefCell::new(Vec::new()));
         let lyrics_labels: Rc<RefCell<Vec<Label>>> = Rc::new(RefCell::new(Vec::new()));
 
         // Управление показом караоке
         {
-            let k_overlay_clone = karaoke_overlay.clone();
+            let (overlay, paused) = (karaoke_overlay.clone(), wave_view.paused.clone());
+            *close_karaoke.borrow_mut() = Some(Rc::new(move || {
+                overlay.set_visible(false);
+                paused.set(false);
+            }));
+        }
+        // пока текст песни открыт, фон Волны не перерисовывается: главный поток нужен анимации караоке
+        {
+            let (k_overlay_clone, paused) = (karaoke_overlay.clone(), wave_view.paused.clone());
             island.karaoke_btn.connect_clicked(move |_| {
                 k_overlay_clone.set_visible(true);
+                paused.set(true);
             });
         }
         {
-            let k_overlay_clone = karaoke_overlay.clone();
+            let (k_overlay_clone, paused) = (karaoke_overlay.clone(), wave_view.paused.clone());
             k_close_btn.connect_clicked(move |_| {
                 k_overlay_clone.set_visible(false);
+                paused.set(false);
             });
         }
 
@@ -309,21 +344,58 @@ impl VolnaWindow {
             let is_playing_ref = is_playing_state.clone();
             let l_data = lyrics_data.clone();
             let l_labels = lyrics_labels.clone();
-            let sc_weak = lyrics_scrolled.downgrade();
             let cnt_label = countdown_label.clone();
             let sc_clone = lyrics_scrolled.clone();
 
-            gtk4::glib::timeout_add_local(Duration::from_millis(200), move || {
+            // Активная строка: цель прокрутки считается по её текущему положению на каждом кадре,
+            // поэтому прокрутка следует за плавным ростом строки, а не за её конечным размером
+            let active_label: Rc<RefCell<Option<Label>>> = Rc::default();
+            let last_sec = Rc::new(std::cell::Cell::new(u64::MAX));
+            let last_active = Rc::new(std::cell::Cell::new(usize::MAX));
+
+            {
+                let (sc, active) = (lyrics_scrolled.clone(), active_label.clone());
+                let last_frame = std::cell::Cell::new(0_i64);
+                lyrics_scrolled.add_tick_callback(move |_, clock| {
+                    let now = clock.frame_time();
+                    let dt = if last_frame.get() == 0 { 0.016 } else { ((now - last_frame.get()) as f64 / 1e6).clamp(0.001, 0.1) };
+                    last_frame.set(now);
+                    // положение строки считаем в координатах содержимого: к границам внутри контейнера
+                    // добавляем его верхнее поле (оно и есть полвысоты окна)
+                    let bounds = active.borrow().as_ref().and_then(|l| {
+                        let c = l.parent()?;
+                        l.compute_bounds(&c).map(|b| (b, f64::from(c.margin_top())))
+                    });
+                    if let (true, Some((b, top_margin))) = (sc.is_mapped(), bounds) {
+                        let vadj = sc.vadjustment();
+                        let max = (vadj.upper() - vadj.page_size()).max(0.0);
+                        let goal = (top_margin + f64::from(b.y() + b.height() / 2.0) - vadj.page_size() / 2.0).clamp(0.0, max);
+                        let cur = vadj.value();
+                        if (goal - cur).abs() > 0.5 {
+                            // экспоненциальное сглаживание: плавно и независимо от частоты кадров
+                            vadj.set_value(cur + (goal - cur) * (1.0 - (-dt * 9.0).exp()));
+                        }
+                    }
+                    gtk4::glib::ControlFlow::Continue
+                });
+            }
+
+            // 50 мс: подсветка строки привязана к позиции с точностью до миллисекунд
+            gtk4::glib::timeout_add_local(Duration::from_millis(50), move || {
                 if *is_playing_ref.borrow() {
-                    if let Some(pos) = player_clone.audio.position_seconds() {
-                        let dur = player_clone.audio.duration_seconds().unwrap_or(240);
-                        island_seek.set_range(0.0, dur as f64);
-                        island_seek.set_value(pos as f64);
-                        island_curr_time.set_text(&format_seconds(pos));
-                        island_total_time.set_text(&format_seconds(dur));
+                    if let Some(pos_ms) = player_clone.audio.position_ms() {
+                        let pos = pos_ms / 1000;
+                        // полоса прогресса и время обновляются раз в секунду
+                        if last_sec.get() != pos {
+                            last_sec.set(pos);
+                            let dur = player_clone.audio.duration_seconds().unwrap_or(240);
+                            island_seek.set_range(0.0, dur as f64);
+                            island_seek.set_value(pos as f64);
+                            island_curr_time.set_text(&format_seconds(pos));
+                            island_total_time.set_text(&format_seconds(dur));
+                        }
 
                         // Синхронизация караоке и индикатор обратного отсчета 3..2..1
-                        let pos_ms = pos * 1000;
                         let lines = l_data.borrow();
                         let labels = l_labels.borrow();
                         if !lines.is_empty() && lines.len() == labels.len() {
@@ -339,7 +411,6 @@ impl VolnaWindow {
                                     let diff_ms = target_time - pos_ms;
                                     if diff_ms <= 3000 && diff_ms > 0 {
                                         counting_down = true;
-                                        cnt_label.set_visible(true);
                                         let digit_str = if diff_ms > 2000 {
                                             "3"
                                         } else if diff_ms > 1000 {
@@ -347,35 +418,53 @@ impl VolnaWindow {
                                         } else {
                                             "1"
                                         };
-                                        cnt_label.set_text(digit_str);
-                                        sc_clone.set_opacity(0.0);
+                                        let newly_shown = !cnt_label.is_visible();
+                                        if newly_shown {
+                                            cnt_label.set_visible(true);
+                                        }
+                                        if newly_shown || cnt_label.text() != digit_str {
+                                            cnt_label.set_text(digit_str);
+                                            animate_countdown_digit(&cnt_label);
+                                        }
+                                        if sc_clone.opacity() != 0.0 {
+                                            sc_clone.set_opacity(0.0);
+                                        }
                                     }
                                 }
                             }
 
                             if !counting_down {
-                                cnt_label.set_visible(false);
-                                sc_clone.set_opacity(1.0);
+                                if cnt_label.is_visible() {
+                                    cnt_label.set_visible(false);
+                                }
+                                if sc_clone.opacity() != 1.0 {
+                                    sc_clone.set_opacity(1.0);
+                                }
                             }
 
                             let active_idx = lines.iter().rposition(|l| l.time_ms <= pos_ms);
                             if let Some(idx) = active_idx {
-                                for (i, lbl) in labels.iter().enumerate() {
-                                    if i == idx {
-                                        lbl.add_css_class("active");
-                                    } else {
-                                        lbl.remove_css_class("active");
+                                // CSS и цель прокрутки меняем только при смене строки, а не каждые 50 мс
+                                if last_active.get() != idx || labels.get(idx).map_or(false, |l| !l.has_css_class("active")) {
+                                    last_active.set(idx);
+                                    for (i, lbl) in labels.iter().enumerate() {
+                                        if i == idx {
+                                            lbl.add_css_class("active");
+                                        } else {
+                                            lbl.remove_css_class("active");
+                                        }
                                     }
-                                }
-                                if let Some(sc) = sc_weak.upgrade() {
-                                    let vadj = sc.vadjustment();
-                                    let target_val = (idx as f64 * 45.0).min(vadj.upper() - vadj.page_size());
-                                    vadj.set_value(target_val.max(0.0));
+                                    *active_label.borrow_mut() = labels.get(idx).cloned();
                                 }
                             }
                         } else {
-                            cnt_label.set_visible(false);
-                            sc_clone.set_opacity(1.0);
+                            last_active.set(usize::MAX);
+                            if cnt_label.is_visible() {
+                                cnt_label.set_visible(false);
+                            }
+                            if sc_clone.opacity() != 1.0 {
+                                sc_clone.set_opacity(1.0);
+                            }
                         }
                     }
                 }
@@ -408,6 +497,43 @@ impl VolnaWindow {
     pub fn present(&self) {
         self.window.present();
     }
+}
+
+/// Появление цифры отсчёта: плавное проявление, лёгкий «наплыв» сверху вниз и затухание к концу секунды.
+/// Меняются только прозрачность и верхний отступ одной метки, поэтому это дёшево.
+fn animate_countdown_digit(label: &Label) {
+    const BASE_MARGIN: i32 = 90;
+    let target_label = label.clone();
+    let target = libadwaita::CallbackAnimationTarget::new(move |v| {
+        let opacity = if v < 0.25 {
+            v / 0.25
+        } else if v > 0.75 {
+            (1.0 - v) / 0.25
+        } else {
+            1.0
+        };
+        // ease-out: цифра быстро «садится» на место и дальше стоит
+        let t = (v / 0.4).min(1.0);
+        let slide = (1.0 - (1.0 - (1.0 - t) * (1.0 - t))) * 36.0;
+        target_label.set_opacity(opacity.clamp(0.0, 1.0));
+        target_label.set_margin_top(BASE_MARGIN - 36 + (36.0 - slide) as i32);
+    });
+    let animation = libadwaita::TimedAnimation::new(label, 0.0, 1.0, 900, target);
+    animation.set_easing(libadwaita::Easing::Linear);
+    animation.play();
+}
+
+/// Поля текста песни: у синхронизированного — полвысоты окна сверху и снизу (любая строка может встать по центру),
+/// у обычного статического текста — небольшие отступы, чтобы он начинался сверху
+fn apply_lyrics_margins(container: &GtkBox, scrolled: &ScrolledWindow) {
+    let (top, bottom) = if container.has_css_class("synced") {
+        let half = (scrolled.vadjustment().page_size() / 2.0) as i32;
+        (half, half)
+    } else {
+        (60, 90)
+    };
+    container.set_margin_top(top);
+    container.set_margin_bottom(bottom);
 }
 
 fn format_seconds(secs: u64) -> String {
@@ -529,6 +655,13 @@ fn setup_event_listener(
                     }
 
                     let parsed = parse_lrc(&lrc_text);
+                    if parsed.is_empty() {
+                        lyrics_container.remove_css_class("synced");
+                    } else {
+                        lyrics_container.add_css_class("synced");
+                    }
+                    apply_lyrics_margins(&lyrics_container, &lyrics_scrolled);
+                    lyrics_scrolled.vadjustment().set_value(0.0);
                     if !parsed.is_empty() {
                         let mut new_labels = Vec::new();
                         for line in &parsed {

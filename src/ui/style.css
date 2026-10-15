@@ -329,7 +329,8 @@ popover.rotor-popover > contents {
     background: transparent;
     border: none;
     border-radius: 0;
-    transition: all 250ms ease;
+    /* цвет и размер шрифта; тень (размытие) не анимируем: она дороже всего */
+    transition: color 250ms ease, font-size 250ms ease;
 }
 
 .karaoke-line.active {
@@ -542,4 +543,16 @@ toast {
     padding: 4px 6px 4px 16px;
     font-weight: 700;
     color: white;
+}
+
+/* Значок «E» (explicit) у треков */
+.explicit-badge {
+  font-size: 10px;
+  font-weight: 800;
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: alpha(white, 0.18);
+  color: alpha(white, 0.8);
 }

@@ -57,6 +57,13 @@ fn pick_download_info<'a>(infos: &'a [DownloadInfo], quality: &str) -> Option<&'
     }
 }
 
+/// Результат запроса к LRCLIB
+enum LrclibFetch {
+    Found(reqwest::Response),
+    NotFound,
+    Failed,
+}
+
 /// Клиент для работы с API Яндекс Музыки
 #[derive(Clone)]
 pub struct YandexMusicClient {
@@ -369,6 +376,24 @@ impl YandexMusicClient {
         Ok(full_tracks.result)
     }
 
+    /// GET к LRCLIB с повтором: сервис нередко отвечает 429 (лимит на общий IP) или 5xx, а 404 означает «текста нет»
+    async fn lrclib_get(&self, url: &str) -> LrclibFetch {
+        for attempt in 0..3u64 {
+            let sent = self
+                .client
+                .get(url)
+                .header("User-Agent", "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)")
+                .send()
+                .await;
+            match sent {
+                Ok(r) if r.status().is_success() => return LrclibFetch::Found(r),
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => return LrclibFetch::NotFound,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(700 * (attempt + 1))).await,
+            }
+        }
+        LrclibFetch::Failed
+    }
+
     /// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net)
     pub async fn get_lrclib_lyrics(
         &self,
@@ -399,41 +424,13 @@ impl YandexMusicClient {
             }
         };
 
-        let primary_url = make_url(duration_secs);
-        let resp = self
-            .client
-            .get(&primary_url)
-            .header(
-                "User-Agent",
-                "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
-            )
-            .send()
-            .await;
-
+        let mut resp = self.lrclib_get(&make_url(duration_secs)).await;
+        // Если запрос с точной длительностью вернул 404, повторяем поиск без ограничения длительности
+        if matches!(resp, LrclibFetch::NotFound) && duration_secs.is_some() {
+            resp = self.lrclib_get(&make_url(None)).await;
+        }
         let resp = match resp {
-            Ok(r) if r.status().is_success() => Some(r),
-            // Если запрос с точной длительностью вернул 404, повторяем поиск без ограничения длительности
-            Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND && duration_secs.is_some() => {
-                let fallback_url = make_url(None);
-                if let Ok(r2) = self
-                    .client
-                    .get(&fallback_url)
-                    .header(
-                        "User-Agent",
-                        "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
-                    )
-                    .send()
-                    .await
-                {
-                    if r2.status().is_success() {
-                        Some(r2)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+            LrclibFetch::Found(r) => Some(r),
             _ => None,
         };
 
@@ -469,6 +466,17 @@ impl YandexMusicClient {
         title: &str,
         duration_secs: Option<u64>,
     ) -> Result<Option<String>, ApiError> {
+        // Синхронизированный текст из кэша: не ходим в сеть повторно и не упираемся в лимиты LRCLIB
+        let cache_path = crate::cache::lyrics_cache_path(track_id);
+        if let Ok(cached) = std::fs::read_to_string(&cache_path) {
+            if !parse_lrc(&cached).is_empty() {
+                return Ok(Some(cached));
+            }
+        }
+        let save_synced = |text: &str| {
+            let _ = std::fs::write(&cache_path, text);
+        };
+
         let mut yandex_plain: Option<String> = None;
 
         // 1. Текст из /tracks/{track_id}/supplement (без подписи)
@@ -481,6 +489,7 @@ impl YandexMusicClient {
                             let trimmed = full.trim();
                             if !trimmed.is_empty() {
                                 if !parse_lrc(trimmed).is_empty() {
+                                    save_synced(trimmed);
                                     return Ok(Some(trimmed.to_string()));
                                 } else {
                                     yandex_plain = Some(trimmed.to_string());
@@ -497,6 +506,7 @@ impl YandexMusicClient {
         if let Ok(Some(lrclib_text)) = self.get_lrclib_lyrics(artist, title, duration_secs).await {
             // Если в LRCLIB есть синхронизированные таймкоды — возвращаем их (полноценное караоке!)
             if !parse_lrc(&lrclib_text).is_empty() {
+                save_synced(&lrclib_text);
                 return Ok(Some(lrclib_text));
             }
             // Если в LRCLIB только статический текст, а у Яндекса текста не было вовсе
@@ -657,6 +667,37 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    /// `cargo test explicit_live -- --ignored --nocapture`: Яндекс должен помечать нецензурные треки
+    #[tokio::test]
+    #[ignore]
+    async fn explicit_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        let res = client.search("Eminem Lose Yourself").await.unwrap();
+        let tracks = res.tracks.map(|t| t.results).unwrap_or_default();
+        let marked = tracks.iter().filter(|t| t.is_explicit()).count();
+        println!("LIVE explicit: {marked} из {}", tracks.len());
+        assert!(marked > 0);
+    }
+
+    /// Ходит в сеть, токен берёт из конфига: `cargo test lyrics_live -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn lyrics_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        let supp = client.get_track_lyrics("5705627", "Deftones", "Rosemary", Some(413)).await;
+        match supp {
+            Ok(Some(text)) => println!("LIVE lyrics: synced_lines={} first={:?}", parse_lrc(&text).len(), text.lines().next()),
+            Ok(None) => println!("LIVE lyrics: none"),
+            Err(e) => println!("LIVE lyrics error: {e}"),
+        }
+        let lr = client.get_lrclib_lyrics("Deftones", "Rosemary", Some(413)).await;
+        match lr {
+            Ok(Some(text)) => println!("LIVE lrclib: synced_lines={} first={:?}", parse_lrc(&text).len(), text.lines().next()),
+            Ok(None) => println!("LIVE lrclib: none"),
+            Err(e) => println!("LIVE lrclib error: {e}"),
+        }
+    }
+
     #[test]
     fn quality_picks_expected_stream() {
         let mk = |codec: &str, kbps| DownloadInfo { codec: codec.into(), bitrate_in_kbps: kbps, download_info_url: String::new(), direct: false };

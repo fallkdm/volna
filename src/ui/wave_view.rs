@@ -88,6 +88,8 @@ pub struct WaveViewWidgets {
     pub menu_button: Button,
     pub drawing_area: Picture,
     pub shader_state: Rc<RefCell<WaveShaderState>>,
+    /// Пока true, фон Волны не перерисовывается (открыт текст песни: освобождаем главный поток для анимации караоке)
+    pub paused: Rc<std::cell::Cell<bool>>,
     filter_pill: GtkBox,
     pill_label: Label,
     option_buttons: Rc<RefCell<Vec<Button>>>,
@@ -145,7 +147,9 @@ pub fn create_wave_view(
     play_btn.set_child(Some(&play_btn_icon));
 
     // Анимация 60 FPS через add_tick_callback на базе GdkFrameClock
+    let paused = Rc::new(std::cell::Cell::new(false));
     {
+        let paused_ref = paused.clone();
         let state_ref = shader_state.clone();
         let is_playing_clone = is_playing_state.clone();
         let audio = player.audio.clone();
@@ -158,6 +162,10 @@ pub fn create_wave_view(
         let tick_n = std::cell::Cell::new(0u32);
 
         drawing_area.add_tick_callback(move |area, frame_clock| {
+            if paused_ref.get() {
+                *last_time_ref.borrow_mut() = 0;
+                return glib::ControlFlow::Continue;
+            }
             let now = frame_clock.frame_time(); // время в микросекундах
             let mut last = last_time_ref.borrow_mut();
             let dt = if *last == 0 {
@@ -572,6 +580,7 @@ pub fn create_wave_view(
         menu_button,
         drawing_area,
         shader_state,
+        paused,
         filter_pill,
         pill_label,
         option_buttons,

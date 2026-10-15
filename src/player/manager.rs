@@ -65,6 +65,8 @@ pub struct PlayerState {
     pub wave: bool,
     /// Подпись Волны по артисту/треку (у простой Волны её нет)
     pub wave_label: Option<String>,
+    /// Показан сохранённый последний трек, воспроизведение ещё не запускалось
+    pub restored: bool,
 }
 
 impl Default for PlayerState {
@@ -85,6 +87,7 @@ impl Default for PlayerState {
             repeat: RepeatMode::Off,
             wave: false,
             wave_label: None,
+            restored: false,
         }
     }
 }
@@ -124,10 +127,44 @@ impl PlayerManager {
             mgr_eos.on_track_finished();
         });
 
+        // Вместо заглушки показываем последний проигранный трек (звук не включается)
+        manager.restore_last_track();
+
         // Проверяем статус авторизации при старте
         manager.check_auth_on_startup();
 
         Ok(manager)
+    }
+
+    /// Показывает последний проигранный трек: заголовок, цвета, обложку и текст. Воспроизведение не стартует
+    fn restore_last_track(&self) {
+        let Some(track) = crate::api::history::load_last_track() else { return };
+        {
+            let mut state = self.state.lock().unwrap();
+            state.queue = vec![track.clone()];
+            state.current_index = 0;
+            state.current_track = Some(track.clone());
+            state.restored = true;
+        }
+        self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index: 0, total_queue: 1 });
+        let client = self.client.lock().unwrap().clone();
+        spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
+    }
+
+    /// Если на экране сохранённый трек, первое нажатие Play/вперёд/назад запускает его (с продолжением Волной по треку)
+    fn resume_restored(&self) -> bool {
+        let track = {
+            let mut state = self.state.lock().unwrap();
+            if !state.restored {
+                return false;
+            }
+            state.restored = false;
+            state.current_track.clone()
+        };
+        if let Some(track) = track {
+            self.play_single_track(track);
+        }
+        true
     }
 
     /// Отправляет событие во все зарегистрированные каналы (UI, MPRIS)
@@ -174,6 +211,9 @@ impl PlayerManager {
 
     /// Запускает или переключает воспроизведение (Play/Pause)
     pub fn toggle_play(&self) {
+        if self.resume_restored() {
+            return;
+        }
         let has_tracks = {
             let state = self.state.lock().unwrap();
             !state.queue.is_empty()
@@ -289,6 +329,9 @@ impl PlayerManager {
 
     /// Запускает следующий трек
     pub fn next_track(&self) {
+        if self.resume_restored() {
+            return;
+        }
         let (next_track, idx, total) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
@@ -361,6 +404,7 @@ impl PlayerManager {
                 let updated_queue = {
                     let mut state = state_clone.lock().unwrap();
                     state.batch_id = station_tracks.batch_id;
+                    let new_tracks = dedup_tracks(&state.queue, new_tracks);
                     state.queue.extend(new_tracks);
                     state.queue.clone()
                 };
@@ -372,6 +416,9 @@ impl PlayerManager {
 
     /// Запускает предыдущий трек
     pub fn prev_track(&self) {
+        if self.resume_restored() {
+            return;
+        }
         let (prev_track, idx, total) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
@@ -457,6 +504,7 @@ impl PlayerManager {
             match result {
                 Ok(station) => {
                     let mut tracks: Vec<Track> = station.sequence.into_iter().map(|s| s.track).collect();
+                    tracks = dedup_tracks(&[], tracks);
                     // за время загрузки пользователь мог запустить другую станцию
                     if me.state.lock().unwrap().station_id != station_id {
                         return;
@@ -464,9 +512,10 @@ impl PlayerManager {
                     me.state.lock().unwrap().batch_id = station.batch_id;
                     match &first {
                         Some(seed) => {
-                            tracks.retain(|t| t.id != seed.id);
                             let queue = {
                                 let mut state = me.state.lock().unwrap();
+                                let tracks = dedup_tracks(std::slice::from_ref(seed), tracks);
+                                let tracks = dedup_tracks(&state.queue, tracks);
                                 state.queue.extend(tracks);
                                 state.queue.clone()
                             };
@@ -599,13 +648,8 @@ impl PlayerManager {
 
     /// Загружает прямую ссылку на трек, кэширует обложку и начинает воспроизведение через GStreamer
     fn play_track_stream(&self, track: &Track) {
-        let client_clone = self.client.clone();
         let audio_clone = self.audio.clone();
         let track_id = track.id.clone();
-        let track_title = track.title.clone();
-        let track_artist = track.artists_string();
-        let track_duration_secs = track.duration_ms.map(|d| d / 1000);
-        let cover_url = track.cover_url(400);
         let station_id = self.state.lock().unwrap().station_id.clone();
         let batch_id = self.state.lock().unwrap().batch_id.clone();
         let senders = self.event_senders.clone();
@@ -613,38 +657,12 @@ impl PlayerManager {
         let current_gen = self.generation.clone();
         let is_stale = move || current_gen.load(Ordering::SeqCst) != epoch;
 
+        let client = self.client.lock().unwrap().clone();
+        spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
+        crate::api::history::save_last_track(track);
+        self.state.lock().unwrap().restored = false;
+
         tokio::spawn(async move {
-            // Кэшируем обложку трека
-            if let Some(c_url) = cover_url {
-                if let Some(cached_path) = crate::cache::fetch_cover_cached(&c_url).await {
-                    if is_stale() {
-                        return;
-                    }
-                    emit_all(&senders, PlayerUiEvent::CoverUpdated(
-                        cached_path.to_string_lossy().to_string(),
-                    ));
-                }
-            }
-
-            // Запрашиваем текст песни (Lyrics)
-            let client = client_clone.lock().unwrap().clone();
-            if client.has_token() {
-                if let Ok(Some(lyrics)) = client
-                    .get_track_lyrics(
-                        &track_id,
-                        &track_artist,
-                        &track_title,
-                        track_duration_secs,
-                    )
-                    .await
-                {
-                    if is_stale() {
-                        return;
-                    }
-                    emit_all(&senders, PlayerUiEvent::LyricsUpdated(lyrics));
-                }
-            }
-
             if client.has_token() {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
                 let result = client.get_track_direct_url(&track_id).await;
@@ -708,6 +726,7 @@ impl PlayerManager {
             state.current_language = language.clone();
             state.current_character = character.clone();
             state.station_id = station_id.clone();
+            state.restored = false;
         }
         self.set_wave(true);
         // плашку с выбранным фильтром рисует сам интерфейс; для простой Волны плашка убирается
@@ -739,7 +758,7 @@ impl PlayerManager {
                 character.as_deref(),
             ).await {
                 Ok(station_tracks) => {
-                    let tracks: Vec<Track> = station_tracks.sequence.into_iter().map(|s| s.track).collect();
+                    let tracks = dedup_tracks(&[], station_tracks.sequence.into_iter().map(|s| s.track).collect());
                     let first_track = tracks.first().cloned();
 
                     if let Ok(mut state) = state_clone.lock() {
@@ -760,17 +779,9 @@ impl PlayerManager {
                             total_queue: tracks.len(),
                         });
 
-                        // Обложка первого трека Волны (в остальных случаях её грузит play_track_stream)
-                        if let Some(c_url) = track.cover_url(400) {
-                            let (senders, current_gen) = (senders.clone(), current_gen.clone());
-                            tokio::spawn(async move {
-                                if let Some(path) = crate::cache::fetch_cover_cached(&c_url).await {
-                                    if current_gen.load(Ordering::SeqCst) == epoch {
-                                        emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
-                                    }
-                                }
-                            });
-                        }
+                        // Обложка и текст первого трека Волны (в остальных случаях их грузит play_track_stream)
+                        spawn_cover_and_lyrics(&senders, client.clone(), &track, epoch, &current_gen);
+                        crate::api::history::save_last_track(&track);
 
                         // Сразу запускаем воспроизведение первого трека Волны
                         let track_id = track.id.clone();
@@ -805,6 +816,47 @@ impl PlayerManager {
     }
 }
 
+/// Обложка и текст песни грузятся отдельными задачами, чтобы не задерживать воспроизведение.
+/// Если у трека текста нет, UI получает пустую строку: старый текст предыдущего трека не остаётся.
+fn spawn_cover_and_lyrics(
+    senders: &[Sender<PlayerUiEvent>],
+    client: YandexMusicClient,
+    track: &Track,
+    epoch: u64,
+    generation: &Arc<AtomicU64>,
+) {
+    if let Some(cover_url) = track.cover_url(400) {
+        let (senders, generation) = (senders.to_vec(), generation.clone());
+        tokio::spawn(async move {
+            if let Some(path) = crate::cache::fetch_cover_cached(&cover_url).await {
+                if generation.load(Ordering::SeqCst) == epoch {
+                    emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
+                }
+            }
+        });
+    }
+
+    let (senders, generation) = (senders.to_vec(), generation.clone());
+    let (track_id, title, artist) = (track.id.clone(), track.title.clone(), track.artists_string());
+    let duration = track.duration_ms.map(|d| d / 1000);
+    tokio::spawn(async move {
+        if !client.has_token() {
+            return;
+        }
+        // без ограничения по времени зависший запрос навсегда оставлял бы экран текста пустым
+        let lookup = client.get_track_lyrics(&track_id, &artist, &title, duration);
+        let text = tokio::time::timeout(std::time::Duration::from_secs(12), lookup)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
+            .unwrap_or_default();
+        if generation.load(Ordering::SeqCst) == epoch {
+            emit_all(&senders, PlayerUiEvent::LyricsUpdated(text));
+        }
+    });
+}
+
 /// Следующий режим повтора по кругу; «вся очередь» пропускается для Волны
 fn next_repeat(mode: RepeatMode, wave: bool) -> RepeatMode {
     match (mode, wave) {
@@ -814,10 +866,42 @@ fn next_repeat(mode: RepeatMode, wave: bool) -> RepeatMode {
     }
 }
 
+/// Один и тот же трек в Яндексе бывает в нескольких альбомах (сингл, сборка) под разными id:
+/// узнаём его по названию и исполнителям
+fn track_key(t: &Track) -> String {
+    let artists: Vec<String> = t.artists.iter().map(|a| a.name.trim().to_lowercase()).collect();
+    format!("{}|{}", t.title.trim().to_lowercase(), artists.join(","))
+}
+
+/// Оставляет в `new` только треки, которых ещё нет в `existing` и среди самих `new`
+fn dedup_tracks(existing: &[Track], new: Vec<Track>) -> Vec<Track> {
+    let mut seen: std::collections::HashSet<String> = existing.iter().map(track_key).collect();
+    new.into_iter().filter(|t| seen.insert(track_key(t))).collect()
+}
+
 /// Рассылает событие во все переданные каналы
 fn emit_all(senders: &[Sender<PlayerUiEvent>], event: PlayerUiEvent) {
     for s in senders {
         let _ = s.send_blocking(event.clone());
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn track(id: &str, title: &str, artist: &str) -> Track {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "title": title, "artists": [{"id": "1", "name": artist}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn same_song_from_other_album_is_dropped() {
+        let queue = vec![track("1", "Firework", "Katy Perry")];
+        let new = vec![track("2", "Firework ", "katy perry"), track("3", "Roar", "Katy Perry"), track("4", "Roar", "Katy Perry")];
+        let kept: Vec<_> = dedup_tracks(&queue, new).into_iter().map(|t| t.id).collect();
+        assert_eq!(kept, ["3"]);
     }
 }
 

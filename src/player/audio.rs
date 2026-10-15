@@ -210,6 +210,11 @@ impl AudioBackend {
         self.play.seek(time);
     }
 
+    /// Текущая позиция воспроизведения в миллисекундах (для точной синхронизации караоке)
+    pub fn position_ms(&self) -> Option<u64> {
+        self.play.position().map(|t| t.mseconds())
+    }
+
     /// Текущая позиция воспроизведения в секундах
     pub fn position_seconds(&self) -> Option<u64> {
         self.play.position().map(|t| t.seconds())

@@ -24,6 +24,9 @@ pub struct AppConfig {
     /// Ключ API Last.fm (справка об исполнителях)
     #[serde(default)]
     pub lastfm_key: Option<String>,
+    /// Последний проигранный трек: при запуске показывается вместо заглушки
+    #[serde(default)]
+    pub last_track: Option<serde_json::Value>,
     /// История поиска: открытые результаты (см. `history.rs`); элементы разбираются по одному
     #[serde(default)]
     pub history_items: Vec<serde_json::Value>,

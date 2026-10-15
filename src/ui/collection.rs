@@ -105,6 +105,14 @@ pub fn track_row(track: &Track, on_activate: impl Fn() + 'static) -> ActionRow {
         .build();
     row.add_prefix(&cover_image(40, track.cover_url(100)));
 
+    if track.is_explicit() {
+        let badge = Label::new(Some("E"));
+        badge.add_css_class("explicit-badge");
+        badge.set_valign(Align::Center);
+        badge.set_tooltip_text(Some("Содержит нецензурную лексику"));
+        row.add_suffix(&badge);
+    }
+
     let dur = Label::new(Some(&track.formatted_duration()));
     dur.add_css_class("dim-label");
     row.add_suffix(&dur);

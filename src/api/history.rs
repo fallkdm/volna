@@ -50,6 +50,19 @@ pub fn push_history(item: HistoryItem) {
     let _ = save_config(&config);
 }
 
+/// Запоминает последний проигранный трек
+pub fn save_last_track(track: &Track) {
+    let mut config = load_config().unwrap_or_default();
+    config.last_track = serde_json::to_value(track).ok();
+    let _ = save_config(&config);
+}
+
+/// Последний проигранный трек, если он сохранён и читается
+pub fn load_last_track() -> Option<Track> {
+    let value = load_config().ok()?.last_track?;
+    serde_json::from_value(value).ok()
+}
+
 pub fn clear_history() {
     let mut config = load_config().unwrap_or_default();
     config.history_items.clear();
