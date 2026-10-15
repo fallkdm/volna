@@ -133,6 +133,10 @@ struct Gl {
 
 /// Достаёт функции OpenGL через EGL (GTK 4 работает через EGL и на Wayland, и на X11)
 fn load_gl() -> Option<glow::Context> {
+    // VOLNA_NO_GL=1 имитирует отсутствие OpenGL: так проверяют запасной фон
+    if std::env::var_os("VOLNA_NO_GL").is_some() {
+        return None;
+    }
     // shortcut: только EGL; если GTK запущен с GLX (GDK_DEBUG=gl-glx), фон не нарисуется
     let lib = unsafe { libloading::Library::new("libEGL.so.1") }.ok()?;
     let get: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_void> =
@@ -170,7 +174,8 @@ fn compile(gl: &glow::Context, es: bool) -> Result<(glow::Program, glow::VertexA
 }
 
 /// Подключает рендер к GLArea. `center` — центр кнопки Play, обновляется вызывающим перед каждым кадром.
-pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cell<(f64, f64)>>) {
+/// `on_fail` вызывается, если OpenGL не поднялся (нет EGL, драйвер без GLSL 3.30/ES 3.0): вызывающий показывает запасной фон.
+pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cell<(f64, f64)>>, on_fail: impl Fn() + 'static) {
     let gl_state: Rc<RefCell<Option<Gl>>> = Rc::default();
 
     let s = gl_state.clone();
@@ -178,16 +183,21 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
         area.make_current();
         if let Some(err) = area.error() {
             eprintln!("[wave] OpenGL недоступен: {err}");
+            on_fail();
             return;
         }
         let Some(gl) = load_gl() else {
             eprintln!("[wave] не удалось загрузить libEGL");
+            on_fail();
             return;
         };
         let es = area.context().is_some_and(|c| c.uses_es());
         match compile(&gl, es) {
             Ok((program, vao)) => *s.borrow_mut() = Some(Gl { gl, program, vao }),
-            Err(e) => eprintln!("[wave] шейдер не собрался: {e}"),
+            Err(e) => {
+                eprintln!("[wave] шейдер не собрался: {e}");
+                on_fail();
+            }
         }
     });
 

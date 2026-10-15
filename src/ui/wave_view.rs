@@ -153,7 +153,16 @@ pub fn create_wave_view(
     drawing_area.set_hexpand(true);
     drawing_area.set_vexpand(true);
     let play_center = Rc::new(std::cell::Cell::new((0.0_f64, 0.0_f64)));
-    super::wave_gl::attach(&drawing_area, shader_state.clone(), play_center.clone());
+    // Запасной фон под GLArea: статичный градиент темы; показывается, только если OpenGL недоступен
+    let fallback = GtkBox::new(Orientation::Vertical, 0);
+    fallback.add_css_class("ambient-backdrop");
+    fallback.set_hexpand(true);
+    fallback.set_vexpand(true);
+    fallback.set_visible(false);
+    {
+        let fb = fallback.clone();
+        super::wave_gl::attach(&drawing_area, shader_state.clone(), play_center.clone(), move || fb.set_visible(true));
+    }
 
     // Центральная кнопка Play/Pause (фиксированный размер 72x72)
     let play_btn = Button::new();
@@ -212,7 +221,8 @@ pub fn create_wave_view(
         });
     }
 
-    root_overlay.set_child(Some(&drawing_area));
+    root_overlay.set_child(Some(&fallback));
+    root_overlay.add_overlay(&drawing_area);
 
     // ================= Центральный блок интерфейса поверх фона =================
     // Вертикальная компоновка: кнопка Play по центру сферы, а текст и настройки строго ПОД сферой!

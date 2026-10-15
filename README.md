@@ -75,7 +75,9 @@
 ```bash
 sudo pacman -S gtk4 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad mesa
 ```
-`gst-plugins-good` нужен для анализатора баса (`spectrum`), `mesa` (или другой драйвер OpenGL/EGL) — для фона Волны.
+`gst-plugins-good` нужен для анализатора баса (`spectrum`), `mesa` (или другой драйвер OpenGL/EGL) — для анимированного фона Волны; без OpenGL приложение работает, а фон остаётся статичным градиентом.
+
+Готовая сборка для x86_64: [Releases](https://github.com/fallkdm/volna/releases) (предрелиз; нужны GTK 4.24+, libadwaita 1.10+, GStreamer 1.28+).
 
 ### Сборка из исходников:
 ```bash
