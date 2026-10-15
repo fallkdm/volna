@@ -3,7 +3,7 @@ use std::f64::consts::PI;
 use std::rc::Rc;
 use gtk4::cairo;
 use gtk4::prelude::*;
-use gtk4::{glib, Align, Box as GtkBox, Button, DrawingArea, Label, Orientation, Overlay};
+use gtk4::{gdk, glib, Align, Box as GtkBox, Button, Label, Orientation, Overlay, Picture};
 
 use crate::player::PlayerManager;
 
@@ -86,11 +86,28 @@ pub struct WaveViewWidgets {
     pub play_btn: Button,
     pub play_btn_icon: gtk4::Image,
     pub menu_button: Button,
-    pub drawing_area: DrawingArea,
+    pub drawing_area: Picture,
     pub shader_state: Rc<RefCell<WaveShaderState>>,
+    filter_pill: GtkBox,
+    pill_label: Label,
+    option_buttons: Rc<RefCell<Vec<Button>>>,
 }
 
 impl WaveViewWidgets {
+    /// Плашка типа Волны (по артисту или треку); `None` — убрать плашку
+    pub fn set_context(&self, label: Option<&str>) {
+        match label {
+            Some(text) => {
+                self.pill_label.set_text(text);
+                self.filter_pill.set_visible(true);
+                for b in self.option_buttons.borrow().iter() {
+                    b.remove_css_class("selected");
+                }
+            }
+            None => self.filter_pill.set_visible(false),
+        }
+    }
+
     /// Обновляет целевые цвета шейдера при переключении трека из derivedColors
     pub fn update_track_colors(&self, track: &crate::api::models::Track) {
         self.shader_state.borrow_mut().update_from_track(track);
@@ -110,9 +127,12 @@ pub fn create_wave_view(
     root_overlay.set_vexpand(true);
 
     // ================= Полноэкранный рендерер живого «Плавающего нечто» =================
-    let drawing_area = DrawingArea::new();
+    // Кадр рисуется на CPU в уменьшенную текстуру, растягивает её видеокарта (Picture)
+    let drawing_area = Picture::new();
     drawing_area.set_hexpand(true);
     drawing_area.set_vexpand(true);
+    drawing_area.set_can_shrink(true);
+    drawing_area.set_content_fit(gtk4::ContentFit::Fill);
 
     // Центральная кнопка Play/Pause (фиксированный размер 72x72)
     let play_btn = Button::new();
@@ -124,27 +144,18 @@ pub fn create_wave_view(
     play_btn_icon.set_pixel_size(32);
     play_btn.set_child(Some(&play_btn_icon));
 
-    // Отрисовка органического живого фона на Cairo
-    {
-        let state_ref = shader_state.clone();
-        let play_btn_ref = play_btn.clone();
-        drawing_area.set_draw_func(move |area, cr, width, height| {
-            let state = state_ref.borrow();
-            // Вычисляем точный центр кнопки Play в координатах холста
-            let (cx, cy) = play_btn_ref
-                .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
-                .map(|p| (p.x() as f64, p.y() as f64))
-                .unwrap_or((width as f64 / 2.0, height as f64 * 0.38));
-            render_live_wave_cairo(cr, width as f64, height as f64, cx, cy, &state);
-        });
-    }
-
     // Анимация 60 FPS через add_tick_callback на базе GdkFrameClock
     {
         let state_ref = shader_state.clone();
         let is_playing_clone = is_playing_state.clone();
         let audio = player.audio.clone();
         let last_time_ref = Rc::new(RefCell::new(0_i64));
+        let play_btn_ref = play_btn.clone();
+        let offscreen: RefCell<RenderBuffers> = RefCell::default();
+        let budget = render_pixel_budget();
+        let profile = std::env::var_os("VOLNA_PROFILE").is_some();
+        let frames = RefCell::new((0u32, std::time::Duration::ZERO));
+        let tick_n = std::cell::Cell::new(0u32);
 
         drawing_area.add_tick_callback(move |area, frame_clock| {
             let now = frame_clock.frame_time(); // время в микросекундах
@@ -162,7 +173,48 @@ pub fn create_wave_view(
                 state.tick(dt, audio.bass_level() as f64);
             }
 
-            area.queue_draw();
+            // На паузе плазма еле дрейфует: бас затух — рисуем каждый 4-й кадр (≈15 FPS)
+            let n = tick_n.get().wrapping_add(1);
+            tick_n.set(n);
+            let idle = {
+                let st = state_ref.borrow();
+                !st.is_playing && st.bass < 0.005
+            };
+            if idle && n % 4 != 0 {
+                return glib::ControlFlow::Continue;
+            }
+
+            let (width, height) = (area.width(), area.height());
+            if width > 0 && height > 0 {
+                let started = std::time::Instant::now();
+                // Центр кнопки Play в координатах фона
+                let (cx, cy) = play_btn_ref
+                    .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
+                    .map(|p| (p.x() as f64, p.y() as f64))
+                    .unwrap_or((width as f64 / 2.0, height as f64 * 0.38));
+                let texture = render_texture(
+                    &mut offscreen.borrow_mut(),
+                    width as f64,
+                    height as f64,
+                    cx,
+                    cy,
+                    &state_ref.borrow(),
+                    budget,
+                );
+                if let Some(t) = texture {
+                    area.set_paintable(Some(&t));
+                }
+
+                if profile {
+                    let mut f = frames.borrow_mut();
+                    f.0 += 1;
+                    f.1 += started.elapsed();
+                    if f.0 == 120 {
+                        eprintln!("[wave] {}x{}: {:.1} мс/кадр, бюджет {:.0} пикс", width, height, f.1.as_secs_f64() * 1000.0 / 120.0, offscreen.borrow().budget);
+                        *f = (0, std::time::Duration::ZERO);
+                    }
+                }
+            }
             glib::ControlFlow::Continue
         });
     }
@@ -178,12 +230,12 @@ pub fn create_wave_view(
 
     content_box.append(&play_btn);
 
-    // Блок метаданных и кнопки настроек: размещен строго под сферой с отступом 175px
+    // Блок метаданных и кнопки настроек: размещен под кнопкой Play; отступ подобран, чтобы кнопка настроек не уходила под плеер
     let bottom_box = GtkBox::new(Orientation::Vertical, 6);
     bottom_box.set_halign(Align::Center);
-    bottom_box.set_margin_top(175);
+    bottom_box.set_margin_top(110);
 
-    let title_label = Label::new(Some("Моя волна"));
+    let title_label = Label::new(Some("Волна"));
     title_label.add_css_class("hero-track-title");
     title_label.set_wrap(true);
     title_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
@@ -196,7 +248,7 @@ pub fn create_wave_view(
     artist_label.set_wrap(true);
     artist_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     artist_label.set_justify(gtk4::Justification::Center);
-    artist_label.set_max_width_chars(38);
+    artist_label.set_max_width_chars(48);
     bottom_box.append(&artist_label);
 
     // Центральная кнопка фильтров Ротора «Настроить волну»
@@ -211,7 +263,22 @@ pub fn create_wave_view(
     menu_button.set_halign(Align::Center);
     menu_button.set_margin_top(14);
 
-    // Панель настройки Моей волны внутри окна: затемнение + карточка по центру экрана волны
+    // Плашка сверху: какой тип Волны включён; у простой Волны плашки нет, крестик сбрасывает фильтр
+    let filter_pill = GtkBox::new(Orientation::Horizontal, 6);
+    filter_pill.add_css_class("wave-filter-pill");
+    filter_pill.set_halign(Align::Center);
+    filter_pill.set_valign(Align::Start);
+    filter_pill.set_margin_top(18);
+    filter_pill.set_visible(false);
+    let pill_label = Label::new(None);
+    let pill_close = Button::from_icon_name("window-close-symbolic");
+    pill_close.add_css_class("flat");
+    pill_close.add_css_class("circular");
+    pill_close.set_tooltip_text(Some("Сбросить фильтр"));
+    filter_pill.append(&pill_label);
+    filter_pill.append(&pill_close);
+
+    // Панель настройки Волны внутри окна: затемнение + карточка по центру экрана волны
     let popover = GtkBox::new(Orientation::Vertical, 0);
     popover.add_css_class("wave-scrim");
     popover.set_visible(false);
@@ -371,7 +438,7 @@ pub fn create_wave_view(
             let accent_clone = accent_color.clone();
             let da_weak = drawing_area.downgrade();
             let pop_weak = popover.downgrade();
-            let label_clone = menu_label.clone();
+            let (pill_label_clone, pill_clone) = (pill_label.clone(), filter_pill.clone());
             let buttons_clone = option_buttons.clone();
             let shader_state_clone = shader_state.clone();
 
@@ -385,7 +452,8 @@ pub fn create_wave_view(
                 if let Some(pop) = pop_weak.upgrade() {
                     pop.set_visible(false);
                 }
-                label_clone.set_text(opt_label);
+                pill_label_clone.set_text(opt_label);
+                pill_clone.set_visible(true);
                 for b in buttons_clone.borrow().iter() {
                     b.remove_css_class("selected");
                 }
@@ -431,15 +499,15 @@ pub fn create_wave_view(
         let accent_clone = accent_color.clone();
         let da_weak = drawing_area.downgrade();
         let pop_weak = popover.downgrade();
-        let label_clone = menu_label.clone();
+        let pill_clone = filter_pill.clone();
         let buttons_clone = option_buttons.clone();
         let shader_state_clone = shader_state.clone();
 
-        reset_btn.connect_clicked(move |_| {
+        let reset_filters: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(pop) = pop_weak.upgrade() {
                 pop.set_visible(false);
             }
-            label_clone.set_text("Настроить волну");
+            pill_clone.set_visible(false);
             for b in buttons_clone.borrow().iter() {
                 b.remove_css_class("selected");
             }
@@ -456,6 +524,9 @@ pub fn create_wave_view(
 
             player_clone.apply_rotor_filter(None, None, None);
         });
+        let r = reset_filters.clone();
+        reset_btn.connect_clicked(move |_| r());
+        pill_close.connect_clicked(move |_| reset_filters());
     }
 
     popover_box.append(&reset_btn);
@@ -489,6 +560,7 @@ pub fn create_wave_view(
     }
 
     root_overlay.add_overlay(&content_box);
+    root_overlay.add_overlay(&filter_pill);
     root_overlay.add_overlay(&popover);
 
     WaveViewWidgets {
@@ -500,6 +572,9 @@ pub fn create_wave_view(
         menu_button,
         drawing_area,
         shader_state,
+        filter_pill,
+        pill_label,
+        option_buttons,
     }
 }
 
@@ -507,24 +582,118 @@ pub fn create_wave_view(
 // Роскошный, кинематографичный рендеринг «Luminous Fluid Orb» на Cairo (100% safe)
 // ==============================================================================
 
-fn render_live_wave_cairo(
-    cr: &cairo::Context,
+/// Сколько пикселей рисуем за кадр (`VOLNA_RENDER_PIXELS` переопределяет; очень большое значение отключает уменьшение)
+fn render_pixel_budget() -> f64 {
+    std::env::var("VOLNA_RENDER_PIXELS").ok().and_then(|v| v.parse().ok()).unwrap_or(600_000.0)
+}
+
+/// Буферы рендера: кадр и кэш сплошной основы (пересчитывается только при смене размера, центра или цветов)
+#[derive(Default)]
+struct RenderBuffers {
+    frame: Option<cairo::ImageSurface>,
+    base: Option<(Vec<i32>, cairo::ImageSurface)>,
+    /// Текущий бюджет пикселей; подстраивается под скорость процессора (0 — взять начальный)
+    budget: f64,
+    avg_ms: f64,
+    frames: u32,
+}
+
+/// Целевое время растеризации кадра: с запасом под остальной интерфейс
+const TARGET_FRAME_MS: f64 = 7.0;
+/// Нижняя и верхняя границы бюджета: ниже заметны пиксели, выше нет смысла
+const MIN_BUDGET: f64 = 160_000.0;
+const MAX_BUDGET: f64 = 2_500_000.0;
+
+impl RenderBuffers {
+    /// Подстраивает разрешение: рисуем как можно чётче, пока кадр укладывается в целевое время
+    fn adapt(&mut self, ms: f64) {
+        self.avg_ms = if self.avg_ms == 0.0 { ms } else { self.avg_ms * 0.9 + ms * 0.1 };
+        self.frames += 1;
+        if self.frames % 30 != 0 {
+            return;
+        }
+        // стоимость растёт примерно линейно с числом пикселей
+        let wanted = self.budget * (TARGET_FRAME_MS / self.avg_ms.max(0.5));
+        // шаги ограничены, чтобы разрешение не прыгало
+        self.budget = wanted.clamp(self.budget * 0.8, self.budget * 1.25).clamp(MIN_BUDGET, MAX_BUDGET);
+    }
+}
+
+/// Рисует кадр в буфер не больше `budget` пикселей: фон и нити мягкие, а стоимость растеризации
+/// на CPU растёт с числом пикселей. Возвращает текстуру, которую растягивает видеокарта.
+fn render_texture(
+    bufs: &mut RenderBuffers,
     w: f64,
     h: f64,
     cx: f64,
     cy: f64,
     state: &WaveShaderState,
-) {
-    let max_dim = w.max(h);
-    let time = state.time;
-    let bass = state.bass;
-    let core = state.cur_core;
-    let deep = state.cur_deep;
-    let ridge = state.cur_ridge;
+    initial_budget: f64,
+) -> Option<gdk::MemoryTexture> {
+    let started = std::time::Instant::now();
+    if bufs.budget == 0.0 {
+        bufs.budget = initial_budget;
+    }
+    let scale = (bufs.budget / (w * h)).sqrt().min(1.0);
+    let (sw, sh) = ((w * scale).ceil() as i32, (h * scale).ceil() as i32);
+    let (fx, fy) = (sw as f64 / w, sh as f64 / h);
 
-    // --------------------------------------------------------------------------
-    // 1. Сплошная заливка цветом трека (как у Яндекс Музыки): без шара и твёрдых форм
-    // --------------------------------------------------------------------------
+    if bufs.frame.as_ref().map(|s| (s.width(), s.height())) != Some((sw, sh)) {
+        bufs.frame = cairo::ImageSurface::create(cairo::Format::ARgb32, sw, sh).ok();
+    }
+
+    // Цвета с точностью до 8 бит: при сходимости переходов ключ перестаёт меняться и основа берётся из кэша
+    let mut key = vec![sw, sh, cx.round() as i32, cy.round() as i32];
+    key.extend(
+        [state.cur_core, state.cur_deep, state.cur_ridge]
+            .iter()
+            .flatten()
+            .map(|c| (c * 255.0).round() as i32),
+    );
+    if bufs.base.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, sw, sh).ok()?;
+        {
+            let cr = cairo::Context::new(&surface).ok()?;
+            cr.scale(fx, fy);
+            paint_base(&cr, w.max(h), cx, cy, state.cur_core, state.cur_deep, state.cur_ridge);
+        }
+        bufs.base = Some((key, surface));
+    }
+
+    let surface = bufs.frame.as_mut()?;
+    {
+        let cr = cairo::Context::new(&*surface).ok()?;
+        let base_ready = match &bufs.base {
+            Some((_, base)) => {
+                cr.set_operator(cairo::Operator::Source);
+                cr.set_source_surface(base, 0.0, 0.0).ok()?;
+                cr.paint().ok()?;
+                cr.set_operator(cairo::Operator::Over);
+                true
+            }
+            None => false,
+        };
+        cr.scale(fx, fy);
+        render_live_wave_cairo(&cr, w, h, cx, cy, state, base_ready);
+    }
+    surface.flush();
+    let stride = surface.stride() as usize;
+    let data = surface.data().ok()?;
+    // shortcut: B8G8R8A8 соответствует ARgb32 только на little-endian (x86/ARM Linux), на big-endian нужен другой формат
+    let texture = gdk::MemoryTexture::new(
+        sw,
+        sh,
+        gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &glib::Bytes::from(&data[..]),
+        stride,
+    );
+    drop(data);
+    bufs.adapt(started.elapsed().as_secs_f64() * 1000.0);
+    Some(texture)
+}
+
+/// Сплошная радиальная заливка цветом трека. Меняется только со сменой цветов, поэтому её кэшируют.
+fn paint_base(cr: &cairo::Context, max_dim: f64, cx: f64, cy: f64, core: [f64; 3], deep: [f64; 3], ridge: [f64; 3]) {
     let base = [
         core[0] * 0.55 + deep[0] * 0.45,
         core[1] * 0.55 + deep[1] * 0.45,
@@ -538,6 +707,30 @@ fn render_live_wave_cairo(
     let _ = cr.set_source(&bg_pattern);
     let _ = cr.paint();
     cr.set_operator(cairo::Operator::Over);
+}
+
+fn render_live_wave_cairo(
+    cr: &cairo::Context,
+    w: f64,
+    h: f64,
+    cx: f64,
+    cy: f64,
+    state: &WaveShaderState,
+    base_ready: bool,
+) {
+    let max_dim = w.max(h);
+    let time = state.time;
+    let bass = state.bass;
+    let core = state.cur_core;
+    let deep = state.cur_deep;
+    let ridge = state.cur_ridge;
+
+    // --------------------------------------------------------------------------
+    // 1. Сплошная заливка цветом трека (как у Яндекс Музыки): без шара и твёрдых форм
+    // --------------------------------------------------------------------------
+    if !base_ready {
+        paint_base(cr, max_dim, cx, cy, core, deep, ridge);
+    }
 
     // Мягкий свет у кнопки Play, усиливается басом
     let glow_r = max_dim * 0.42 * (1.0 + bass * 0.35);
@@ -556,11 +749,11 @@ fn render_live_wave_cairo(
     const FILAMENTS: usize = 7;
     const FILAMENT_POINTS: usize = 72;
     let light = [
-        ridge[0] * 0.7 + 0.3,
-        ridge[1] * 0.7 + 0.3,
-        ridge[2] * 0.7 + 0.3,
+        ridge[0] * 0.5 + 0.5,
+        ridge[1] * 0.5 + 0.5,
+        ridge[2] * 0.5 + 0.5,
     ];
-    cr.set_operator(cairo::Operator::Screen);
+    // Over вместо Screen: у pixman он заметно быстрее, а на полупрозрачных светлых нитях разницы почти нет
     for k in 0..FILAMENTS {
         let kf = k as f64;
         let frac = kf / FILAMENTS as f64;
@@ -579,9 +772,9 @@ fn render_live_wave_cairo(
             pts.push((cx + drift_x + theta.cos() * r, cy + drift_y + theta.sin() * r));
         }
 
-        let strength = (0.16 + bass * 0.70) * (1.0 - frac * 0.55);
+        let strength = (0.32 + bass * 0.70) * (1.0 - frac * 0.40);
         // Три обводки разной толщины имитируют размытие нити
-        for (width, alpha) in [(18.0, 0.16), (7.0, 0.34), (2.2, 0.85)] {
+        for (width, alpha) in [(12.0, 0.30), (3.2, 1.0)] {
             draw_smooth_closed_path(cr, &pts);
             cr.set_line_width(width);
             cr.set_source_rgba(light[0], light[1], light[2], (alpha * strength).min(1.0));

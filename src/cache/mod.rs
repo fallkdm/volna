@@ -48,3 +48,21 @@ pub async fn fetch_cover_cached(url: &str) -> Option<PathBuf> {
 
     Some(path)
 }
+
+/// Размер кэша обложек в байтах
+pub fn covers_cache_size() -> u64 {
+    std::fs::read_dir(covers_cache_dir())
+        .map(|d| d.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .unwrap_or(0)
+}
+
+/// Удаляет файлы кэша обложек, возвращает освобождённые байты
+pub fn clear_covers_cache() -> u64 {
+    let freed = covers_cache_size();
+    if let Ok(dir) = std::fs::read_dir(covers_cache_dir()) {
+        for entry in dir.flatten().filter(|e| e.path().is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    freed
+}

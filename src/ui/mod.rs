@@ -1,4 +1,5 @@
 pub mod auth_dialog;
+pub mod collection;
 pub mod floating_island;
 pub mod library_view;
 pub mod preferences_dialog;

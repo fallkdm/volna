@@ -27,7 +27,7 @@
     letter-spacing: 0.4px;
 }
 
-/* Центральный экран «Моя волна» */
+/* Центральный экран «Волна» */
 .hero-container {
     padding: 20px 24px 110px 24px;
 }
@@ -511,3 +511,35 @@ toast {
     margin-bottom: 115px;
 }
 
+
+.about-card {
+    background: alpha(white, 0.05);
+    border-radius: 14px;
+    padding: 14px 18px;
+}
+
+.repeat-btn {
+    opacity: 0.5;
+}
+
+.repeat-btn.active {
+    opacity: 1;
+    color: #ffb59f;
+    background: rgba(255, 181, 159, 0.16);
+}
+
+/* «1» внутри значка повтора */
+.repeat-one {
+    font-size: 7px;
+    font-weight: 900;
+    margin-top: 0;
+}
+
+/* Плашка активного типа Волны сверху */
+.wave-filter-pill {
+    background: rgba(0, 0, 0, 0.32);
+    border-radius: 9999px;
+    padding: 4px 6px 4px 16px;
+    font-weight: 700;
+    color: white;
+}

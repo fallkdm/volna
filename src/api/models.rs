@@ -42,6 +42,57 @@ pub struct Album {
     pub year: Option<u32>,
     #[serde(rename = "coverUri")]
     pub cover_uri: Option<String>,
+    #[serde(default)]
+    pub artists: Vec<Artist>,
+    #[serde(rename = "trackCount")]
+    pub track_count: Option<u32>,
+}
+
+/// Плейлист (в поиске и в списке плейлистов пользователя)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Playlist {
+    #[serde(deserialize_with = "deserialize_id")]
+    pub uid: String,
+    #[serde(deserialize_with = "deserialize_id")]
+    pub kind: String,
+    pub title: String,
+    #[serde(rename = "trackCount")]
+    pub track_count: Option<u32>,
+    #[serde(rename = "ogImage")]
+    pub og_image: Option<String>,
+}
+
+/// Формирует URL обложки из uri вида `avatars.yandex.net/.../%%` (например, 200, 400)
+pub fn cover_url(uri: &str, size: u32) -> String {
+    let path = uri.replace("%%", &format!("{}x{}", size, size));
+    if path.starts_with("http://") || path.starts_with("https://") {
+        path
+    } else {
+        format!("https://{}", path)
+    }
+}
+
+impl Artist {
+    pub fn cover_url(&self, size: u32) -> Option<String> {
+        self.cover.as_ref()?.uri.as_deref().map(|u| cover_url(u, size))
+    }
+}
+
+impl Album {
+    pub fn cover_url(&self, size: u32) -> Option<String> {
+        self.cover_uri.as_deref().map(|u| cover_url(u, size))
+    }
+
+    /// Имена артистов через запятую
+    pub fn artists_string(&self) -> String {
+        self.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+impl Playlist {
+    pub fn cover_url(&self, size: u32) -> Option<String> {
+        self.og_image.as_deref().map(|u| cover_url(u, size))
+    }
 }
 
 /// Трек
@@ -136,14 +187,7 @@ impl Track {
 
     /// Формирует URL обложки с заданным размером (например, 200, 400)
     pub fn cover_url(&self, size: u32) -> Option<String> {
-        let uri = self.cover_uri.as_ref().or(self.og_image.as_ref())?;
-        let size_str = format!("{}x{}", size, size);
-        let path = uri.replace("%%", &size_str);
-        if path.starts_with("http://") || path.starts_with("https://") {
-            Some(path)
-        } else {
-            Some(format!("https://{}", path))
-        }
+        self.cover_uri.as_ref().or(self.og_image.as_ref()).map(|u| cover_url(u, size))
     }
 
     /// Возвращает длительность в формате "MM:SS"
@@ -209,7 +253,7 @@ pub struct RotorIcon {
     pub image_url: Option<String>,
 }
 
-/// Станция Ротора («Моя волна» и др.)
+/// Станция Ротора («Волна» и др.)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RotorStation {
     pub id: RotorStationId,
@@ -311,15 +355,59 @@ pub struct DownloadInfo {
 // ================= Модели Поиска =================
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SearchResultTracks {
-    #[serde(default)]
-    pub items: Vec<Track>,
-    pub total: Option<u64>,
+pub struct SearchSection<T> {
+    #[serde(default = "Vec::new")]
+    pub results: Vec<T>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SearchResult {
-    pub tracks: Option<SearchResultTracks>,
+    pub tracks: Option<SearchSection<Track>>,
+    pub albums: Option<SearchSection<Album>>,
+    pub playlists: Option<SearchSection<Playlist>>,
+    pub artists: Option<SearchSection<Artist>>,
+}
+
+/// Краткая страница артиста (`/artists/{id}/brief-info`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistBrief {
+    pub artist: Artist,
+    #[serde(default)]
+    pub albums: Vec<Album>,
+    #[serde(default, rename = "popularTracks")]
+    pub popular_tracks: Vec<Track>,
+}
+
+/// Похожие треки (`/tracks/{id}/similar`)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SimilarTracks {
+    #[serde(default, rename = "similarTracks")]
+    pub similar_tracks: Vec<Track>,
+}
+
+/// Альбом с треками (`/albums/{id}/with-tracks`)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlbumWithTracks {
+    #[serde(default)]
+    pub volumes: Vec<Vec<Track>>,
+}
+
+/// Плейлист с треками (`/users/{uid}/playlists/{kind}`)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaylistWithTracks {
+    #[serde(default)]
+    pub tracks: Vec<PlaylistTrackItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaylistTrackItem {
+    pub track: Option<Track>,
+}
+
+/// Элемент `/users/{uid}/likes/albums?rich=true`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LikedAlbumItem {
+    pub album: Album,
 }
 
 // ================= Модели Аккаунта и Медиатеки =================
@@ -504,5 +592,14 @@ mod tests {
 
         let ridge = track.ridge_rgb();
         assert!(ridge[0] > 0.9);
+    }
+
+    #[test]
+    fn test_search_duplicate_keys() {
+        // Яндекс отдаёт `albums` дважды: через Value (как в client.rs) разбор должен проходить
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"result":{"albums":{"results":[]},"albums":{"results":[]}}}"#).unwrap();
+        let r: YandexApiResponse<SearchResult> = serde_json::from_value(v).unwrap();
+        assert!(r.result.albums.is_some());
     }
 }

@@ -1,32 +1,20 @@
-use base64::prelude::*;
 use chrono::Utc;
-use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
-use sha2::Sha256;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use std::fmt;
 
 use super::models::{
-    parse_lrc, AccountStatus, DownloadInfo, LikedTracksResult, LrclibResponse, RotorFeedback,
-    RotorFeedbackType, RotorStationTracks, SearchResult, Track, TrackLyricsResult, TrackSupplement,
+    parse_lrc, AccountStatus, Album, AlbumWithTracks, ArtistBrief, DownloadInfo, LikedAlbumItem, LikedTracksResult, Playlist,
+    PlaylistWithTracks, SimilarTracks, LrclibResponse, RotorFeedback,
+    RotorFeedbackType, RotorStationTracks, SearchResult, Track, TrackSupplement,
     YandexApiResponse,
 };
 
 const BASE_API_URL: &str = "https://api.music.yandex.net";
-const USER_AGENT_VALUE: &str = "YandexMusic/2024.1 (Linux; Volna Desktop)";
-const MD5_SALT: &str = "XGRlBW9FXlekgb0rTaf0yN";
-const LYRICS_SIGN_KEY: &[u8] = b"p93jhgh689SBReK6ghtw62";
-
-type HmacSha256 = Hmac<Sha256>;
-
-fn sign_lyrics_request(track_id: &str, timestamp: i64) -> String {
-    let mut mac = HmacSha256::new_from_slice(LYRICS_SIGN_KEY).expect("HMAC supports any key size");
-    let payload = format!("{}{}", track_id, timestamp);
-    mac.update(payload.as_bytes());
-    let code = mac.finalize();
-    BASE64_STANDARD.encode(code.into_bytes())
-}
-
+const USER_AGENT_VALUE: &str = "Volna/0.1 (Linux; unofficial client)";
+/// Соль подписи ссылок `get-mp3`: публичное значение `SIGN_SALT` из библиотеки MarshalX/yandex-music-api
+/// (yandex_music/download_info.py). Сервер на 2026-10-14 подпись не проверяет (принимает и пустую соль).
+const MD5_SALT: &str = "XGRlBW9FXlekgbPrRHuSiA";
 #[derive(Debug)]
 pub enum ApiError {
     Request(reqwest::Error),
@@ -51,6 +39,21 @@ impl std::error::Error for ApiError {}
 impl From<reqwest::Error> for ApiError {
     fn from(err: reqwest::Error) -> Self {
         Self::Request(err)
+    }
+}
+
+/// Выбирает поток по настройке качества среди MP3 (или, если их нет, среди всех): `best` — максимальный
+/// битрейт, `economy` — минимальный, `balanced` — средний по возрастанию.
+fn pick_download_info<'a>(infos: &'a [DownloadInfo], quality: &str) -> Option<&'a DownloadInfo> {
+    let mut pool: Vec<&DownloadInfo> = infos.iter().filter(|i| i.codec == "mp3").collect();
+    if pool.is_empty() {
+        pool = infos.iter().collect();
+    }
+    pool.sort_by_key(|i| i.bitrate_in_kbps);
+    match quality {
+        "economy" => pool.first().copied(),
+        "balanced" => pool.get(pool.len() / 2).copied(),
+        _ => pool.last().copied(),
     }
 }
 
@@ -104,7 +107,7 @@ impl YandexMusicClient {
         headers
     }
 
-    /// Получает треки станции Ротора (по умолчанию «Моя волна» - "user:onyourwave")
+    /// Получает треки станции Ротора (по умолчанию «Волна» - "user:onyourwave")
     pub async fn get_station_tracks(&self, station_id: &str) -> Result<RotorStationTracks, ApiError> {
         self.get_station_tracks_with_params(station_id, None, None, None).await
     }
@@ -176,8 +179,8 @@ impl YandexMusicClient {
         Ok(api_response.result)
     }
 
-    /// Получает прямую ссылку на скачивание/стриминг MP3 файла трека через download-info
-    pub async fn get_track_direct_url(&self, track_id: &str) -> Result<String, ApiError> {
+    /// Получает прямую ссылку на MP3-поток трека через download-info и подпись качества вида «MP3 192»
+    pub async fn get_track_direct_url(&self, track_id: &str) -> Result<(String, String), ApiError> {
         let download_infos = self.get_track_download_info(track_id).await?;
         if download_infos.is_empty() {
             return Err(ApiError::MissingData(format!(
@@ -186,12 +189,9 @@ impl YandexMusicClient {
             )));
         }
 
-        let best_info = download_infos
-            .iter()
-            .filter(|i| i.codec == "mp3")
-            .max_by_key(|i| i.bitrate_in_kbps)
-            .or_else(|| download_infos.first())
+        let best_info = pick_download_info(&download_infos, &super::auth::load_quality())
             .ok_or_else(|| ApiError::MissingData("Не найден подходящий аудиопоток".into()))?;
+        let label = format!("{} {}", best_info.codec.to_uppercase(), best_info.bitrate_in_kbps);
 
         let xml_resp = self
             .client
@@ -224,15 +224,14 @@ impl YandexMusicClient {
         let sign_hex: String = sign_result.iter().map(|b| format!("{:02x}", b)).collect();
 
         let direct_url = format!("https://{}/get-mp3/{}/{}{}", host, sign_hex, ts, path);
-        Ok(direct_url)
+        Ok((direct_url, label))
     }
 
-    /// Поиск треков по поисковому запросу
-    pub async fn search(&self, query: &str) -> Result<Vec<Track>, ApiError> {
-        let url = format!("{}/search?text={}&type=track&page=0", self.base_url, urlencoding_encode(query));
+    /// GET с разбором `result`; общий для новых запросов каталога
+    async fn get_result<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
         let resp = self
             .client
-            .get(&url)
+            .get(format!("{}{}", self.base_url, path))
             .headers(self.headers())
             .send()
             .await?;
@@ -243,9 +242,61 @@ impl YandexMusicClient {
             return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
         }
 
-        let api_response: YandexApiResponse<SearchResult> = resp.json().await?;
-        let tracks = api_response.result.tracks.map(|t| t.items).unwrap_or_default();
-        Ok(tracks)
+        let bytes = resp.bytes().await?;
+        // Через Value: поиск Яндекса отдаёт ключ `albums` дважды, а прямой разбор в структуру на этом падает.
+        // Ошибка serde_json точнее общего «error decoding response body».
+        let api_response: YandexApiResponse<T> = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .and_then(serde_json::from_value)
+            .map_err(|e| ApiError::InvalidResponse(format!("{} ({})", e, path)))?;
+        Ok(api_response.result)
+    }
+
+    /// Поиск по запросу: треки, альбомы и плейлисты
+    pub async fn search(&self, query: &str) -> Result<SearchResult, ApiError> {
+        self.get_result(&format!("/search?text={}&type=all&page=0", urlencoding_encode(query))).await
+    }
+
+    /// Треки альбома (все тома подряд)
+    pub async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>, ApiError> {
+        let album: AlbumWithTracks = self.get_result(&format!("/albums/{}/with-tracks", album_id)).await?;
+        Ok(album.volumes.into_iter().flatten().collect())
+    }
+
+    /// Треки плейлиста
+    pub async fn get_playlist_tracks(&self, uid: &str, kind: &str) -> Result<Vec<Track>, ApiError> {
+        let playlist: PlaylistWithTracks = self.get_result(&format!("/users/{}/playlists/{}", uid, kind)).await?;
+        Ok(playlist.tracks.into_iter().filter_map(|t| t.track).collect())
+    }
+
+    /// Плейлисты пользователя
+    pub async fn get_user_playlists(&self, uid: &str) -> Result<Vec<Playlist>, ApiError> {
+        self.get_result(&format!("/users/{}/playlists/list", uid)).await
+    }
+
+    /// Любимые альбомы пользователя
+    pub async fn get_liked_albums(&self, uid: &str) -> Result<Vec<Album>, ApiError> {
+        let items: Vec<LikedAlbumItem> = self.get_result(&format!("/users/{}/likes/albums?rich=true", uid)).await?;
+        Ok(items.into_iter().map(|i| i.album).collect())
+    }
+
+    /// Страница артиста: популярные треки и альбомы
+    pub async fn get_artist_brief(&self, artist_id: &str) -> Result<ArtistBrief, ApiError> {
+        self.get_result(&format!("/artists/{}/brief-info", artist_id)).await
+    }
+
+    /// Похожие на трек
+    pub async fn get_similar_tracks(&self, track_id: &str) -> Result<Vec<Track>, ApiError> {
+        let similar: SimilarTracks = self.get_result(&format!("/tracks/{}/similar", track_id)).await?;
+        Ok(similar.similar_tracks)
+    }
+
+    /// UID текущего пользователя
+    pub async fn get_uid(&self) -> Result<String, ApiError> {
+        let uid = self.get_account_status().await?.account.map(|a| a.uid).unwrap_or_default();
+        if uid.is_empty() {
+            return Err(ApiError::InvalidResponse("не удалось определить UID пользователя".into()));
+        }
+        Ok(uid)
     }
 
     /// Получение статуса аккаунта пользователя (включая UID)
@@ -291,7 +342,7 @@ impl YandexMusicClient {
         }
 
         // Запрашиваем первые 50 полных треков
-        let ids: Vec<String> = track_items.into_iter().take(50).map(|t| t.id).collect();
+        let ids: Vec<String> = track_items.into_iter().take(300).map(|t| t.id).collect();
         let ids_param = ids.join(",");
 
         let tracks_url = format!("{}/tracks", self.base_url);
@@ -407,8 +458,8 @@ impl YandexMusicClient {
     }
 
     /// Запрос текста песни для плеера:
-    /// - Если Яндекс Музыка вернула синхронизированный LRC с таймкодами — используем его.
-    /// - Если Яндекс Музыка вернула статический текст (без таймкодов) или ошибку — запрашиваем LRCLIB.
+    /// - Если /supplement вернул синхронизированный LRC с таймкодами — используем его.
+    /// - Если вернул статический текст (без таймкодов) или ошибку — запрашиваем LRCLIB.
     /// - Если LRCLIB нашел синхронизированный LRC — отдаем его (полноценное караоке!).
     /// - Если LRCLIB ничего не нашел — отдаем статический текст Яндекса.
     pub async fn get_track_lyrics(
@@ -420,41 +471,7 @@ impl YandexMusicClient {
     ) -> Result<Option<String>, ApiError> {
         let mut yandex_plain: Option<String> = None;
 
-        // 1. Пробуем запросить официальный синхронизированный LRC из Яндекса
-        let timestamp = chrono::Utc::now().timestamp();
-        let sign = sign_lyrics_request(track_id, timestamp);
-        let lrc_url = format!(
-            "{}/tracks/{}/lyrics?format=LRC&timeStamp={}&sign={}",
-            self.base_url,
-            track_id,
-            timestamp,
-            urlencoding_encode(&sign)
-        );
-
-        let mut headers = self.headers();
-        headers.insert(
-            HeaderName::from_static("x-yandex-music-client"),
-            HeaderValue::from_static("YandexMusicAndroid/24023231"),
-        );
-
-        if let Ok(resp) = self.client.get(&lrc_url).headers(headers).send().await {
-            if resp.status().is_success() {
-                if let Ok(lrc_resp) = resp.json::<YandexApiResponse<TrackLyricsResult>>().await {
-                    if let Some(lrc_text) = lrc_resp.result.lyrics.or(lrc_resp.result.full_lyrics) {
-                        let trimmed = lrc_text.trim();
-                        if !trimmed.is_empty() {
-                            if !parse_lrc(trimmed).is_empty() {
-                                return Ok(Some(trimmed.to_string()));
-                            } else {
-                                yandex_plain = Some(trimmed.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Если Яндекс не вернул LRC, пробуем /tracks/{track_id}/supplement на случай статического текста
+        // 1. Текст из /tracks/{track_id}/supplement (без подписи)
         if yandex_plain.is_none() {
             let supp_url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
             if let Ok(resp) = self.client.get(&supp_url).headers(self.headers()).send().await {
@@ -613,7 +630,7 @@ impl YandexMusicClient {
 }
 
 /// Простое URL кодирование строки
-fn urlencoding_encode(s: &str) -> String {
+pub(crate) fn urlencoding_encode(s: &str) -> String {
     let mut encoded = String::new();
     for b in s.as_bytes() {
         match *b {
@@ -640,6 +657,16 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quality_picks_expected_stream() {
+        let mk = |codec: &str, kbps| DownloadInfo { codec: codec.into(), bitrate_in_kbps: kbps, download_info_url: String::new(), direct: false };
+        let infos = vec![mk("mp3", 192), mk("aac", 256), mk("mp3", 64), mk("mp3", 128)];
+        assert_eq!(pick_download_info(&infos, "best").unwrap().bitrate_in_kbps, 192);
+        assert_eq!(pick_download_info(&infos, "economy").unwrap().bitrate_in_kbps, 64);
+        assert_eq!(pick_download_info(&infos, "balanced").unwrap().bitrate_in_kbps, 128);
+        assert_eq!(pick_download_info(&[mk("mp3", 192)], "economy").unwrap().bitrate_in_kbps, 192);
+    }
+
     use super::*;
 
     #[test]
@@ -664,13 +691,6 @@ mod tests {
     fn test_urlencode() {
         assert_eq!(urlencoding_encode("hello world"), "hello+world");
         assert_eq!(urlencoding_encode("кино"), "%D0%BA%D0%B8%D0%BD%D0%BE");
-    }
-
-    #[test]
-    fn test_sign_lyrics_request() {
-        let sign = sign_lyrics_request("12345", 1728840000);
-        assert!(!sign.is_empty());
-        assert_eq!(sign, sign_lyrics_request("12345", 1728840000));
     }
 
     #[test]

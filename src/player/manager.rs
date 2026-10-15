@@ -1,9 +1,19 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use async_channel::Sender;
 
 use crate::api::client::YandexMusicClient;
 use crate::api::models::Track;
 use super::audio::AudioBackend;
+
+/// Режим повтора: нет, один трек, вся очередь (для Волны «вся очередь» недоступна)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    One,
+    All,
+}
 
 /// События плеера для обновления интерфейса
 #[derive(Debug, Clone)]
@@ -23,6 +33,11 @@ pub enum PlayerUiEvent {
     QueueUpdated(Vec<Track>),
     CoverUpdated(String),
     LyricsUpdated(String),
+    RepeatChanged(RepeatMode),
+    /// Тип включённой Волны для плашки сверху: «По артисту: …», «По треку: …»; `None` — простая Волна или не Волна
+    WaveContext(Option<String>),
+    /// Реальный формат потока, например «MP3 192»
+    StreamQuality(String),
     LoadingState(bool),
     AuthRequired,
     UserLoggedIn(String),
@@ -45,6 +60,11 @@ pub struct PlayerState {
     pub current_language: Option<String>,
     pub current_character: Option<String>,
     pub user_login: Option<String>,
+    pub repeat: RepeatMode,
+    /// Очередь из станции Ротора (бесконечная): повтор всей очереди ей не нужен
+    pub wave: bool,
+    /// Подпись Волны по артисту/треку (у простой Волны её нет)
+    pub wave_label: Option<String>,
 }
 
 impl Default for PlayerState {
@@ -62,6 +82,9 @@ impl Default for PlayerState {
             current_language: None,
             current_character: None,
             user_login: None,
+            repeat: RepeatMode::Off,
+            wave: false,
+            wave_label: None,
         }
     }
 }
@@ -73,6 +96,8 @@ pub struct PlayerManager {
     pub client: Arc<Mutex<YandexMusicClient>>,
     pub state: Arc<Mutex<PlayerState>>,
     pub event_senders: Vec<Sender<PlayerUiEvent>>,
+    /// Номер последнего запроса воспроизведения: устаревшие асинхронные задачи (быстрые клики) отбрасываются
+    generation: Arc<AtomicU64>,
 }
 
 impl PlayerManager {
@@ -90,6 +115,7 @@ impl PlayerManager {
             client,
             state,
             event_senders,
+            generation: Arc::new(AtomicU64::new(0)),
         };
 
         // Подключаем автоматический переход к следующему треку по окончании воспроизведения
@@ -158,11 +184,11 @@ impl PlayerManager {
             if !has_token {
                 self.emit(PlayerUiEvent::AuthRequired);
                 self.emit(PlayerUiEvent::StatusMessage(
-                    "Для запуска Моей волны выполните вход через Яндекс ID".to_string(),
+                    "Для запуска Волны выполните вход через Яндекс ID".to_string(),
                 ));
             } else {
                 self.emit(PlayerUiEvent::StatusMessage(
-                    "Загружаем персональную Мою волну... 🌊".to_string(),
+                    "Загружаем персональную Волну... 🌊".to_string(),
                 ));
                 self.fetch_wave_tracks("onyourwave");
             }
@@ -204,7 +230,61 @@ impl PlayerManager {
             });
         }
 
+        let (mode, wave, at_end, current) = {
+            let state = self.state.lock().unwrap();
+            (state.repeat, state.wave, state.current_index + 1 >= state.queue.len(), state.current_track.clone())
+        };
+        match (mode, current) {
+            (RepeatMode::One, Some(track)) => {
+                self.play_track_stream(&track);
+                return;
+            }
+            // обычная очередь без повтора на последнем треке заканчивается; Волна идёт бесконечно
+            (RepeatMode::Off, _) if !wave && at_end => {
+                self.emit(PlayerUiEvent::PlaybackToggled(false));
+                return;
+            }
+            _ => {}
+        }
         self.next_track();
+    }
+
+    /// Переключает повтор по кругу: нет → один трек → вся очередь (кроме Волны) → нет
+    pub fn cycle_repeat(&self) {
+        let next = {
+            let mut state = self.state.lock().unwrap();
+            state.repeat = next_repeat(state.repeat, state.wave);
+            state.repeat
+        };
+        self.emit(PlayerUiEvent::RepeatChanged(next));
+    }
+
+    /// Запоминает, что играет: станция Ротора или обычная очередь; для Волны повтор очереди сбрасывается
+    fn set_wave(&self, wave: bool) {
+        let reset = {
+            let mut state = self.state.lock().unwrap();
+            state.wave = wave;
+            if !wave {
+                state.wave_label = None;
+            }
+            let reset = wave && state.repeat == RepeatMode::All;
+            if reset {
+                state.repeat = RepeatMode::Off;
+            }
+            reset
+        };
+        if reset {
+            self.emit(PlayerUiEvent::RepeatChanged(RepeatMode::Off));
+        }
+        if !wave {
+            self.emit(PlayerUiEvent::WaveContext(None));
+        }
+    }
+
+    /// Запоминает и показывает подпись Волны по артисту/треку
+    fn set_wave_label(&self, label: Option<String>) {
+        self.state.lock().unwrap().wave_label = label.clone();
+        self.emit(PlayerUiEvent::WaveContext(label));
     }
 
     /// Запускает следующий трек
@@ -322,23 +402,86 @@ impl PlayerManager {
         self.play_track_stream(&prev_track);
     }
 
-    /// Воспроизводит конкретный трек (например, из поиска)
+    /// Воспроизводит трек и продолжает «Моей волной по этому треку»
     pub fn play_single_track(&self, track: Track) {
+        let station = format!("track:{}", track.id);
+        let label = format!("По треку: {}", track.title);
+        self.start_station(station, Some(track), label);
+    }
+
+    /// Запускает «Волну по артисту»
+    pub fn play_artist_wave(&self, artist_id: &str, artist_name: &str) {
+        self.start_station(format!("artist:{}", artist_id), None, format!("По артисту: {}", artist_name));
+    }
+
+    /// Запускает станцию Ротора (`track:ID`, `artist:ID`). Если задан `first`, он играет сразу,
+    /// а треки станции дописываются в очередь следом.
+    fn start_station(&self, station_id: String, first: Option<Track>, label: String) {
         {
             let mut state = self.state.lock().unwrap();
-            state.queue.insert(0, track.clone());
-            state.current_index = 0;
-            state.current_track = Some(track.clone());
-            state.is_liked = false;
-            state.is_disliked = false;
+            state.station_id = station_id.clone();
+            state.batch_id = None;
+            state.current_mood = None;
+            state.current_language = None;
+            state.current_character = None;
+            if let Some(t) = &first {
+                state.queue = vec![t.clone()];
+                state.current_index = 0;
+                state.current_track = Some(t.clone());
+                state.is_liked = false;
+                state.is_disliked = false;
+            }
+        }
+        self.set_wave(true);
+        self.set_wave_label(Some(label.clone()));
+
+        match &first {
+            Some(t) => {
+                self.emit(PlayerUiEvent::TrackStarted { track: t.clone(), index: 0, total_queue: 1 });
+                self.play_track_stream(t);
+            }
+            None => self.emit(PlayerUiEvent::LoadingState(true)),
         }
 
-        self.emit(PlayerUiEvent::TrackStarted {
-            track: track.clone(),
-            index: 0,
-            total_queue: 1,
+        let me = self.clone();
+        tokio::spawn(async move {
+            let client = me.client.lock().unwrap().clone();
+            if !client.has_token() {
+                me.emit(PlayerUiEvent::AuthRequired);
+                return;
+            }
+            let result = client.get_station_tracks(&station_id).await;
+            if first.is_none() {
+                me.emit(PlayerUiEvent::LoadingState(false));
+            }
+            match result {
+                Ok(station) => {
+                    let mut tracks: Vec<Track> = station.sequence.into_iter().map(|s| s.track).collect();
+                    // за время загрузки пользователь мог запустить другую станцию
+                    if me.state.lock().unwrap().station_id != station_id {
+                        return;
+                    }
+                    me.state.lock().unwrap().batch_id = station.batch_id;
+                    match &first {
+                        Some(seed) => {
+                            tracks.retain(|t| t.id != seed.id);
+                            let queue = {
+                                let mut state = me.state.lock().unwrap();
+                                state.queue.extend(tracks);
+                                state.queue.clone()
+                            };
+                            me.emit(PlayerUiEvent::QueueUpdated(queue));
+                        }
+                        None => {
+                            me.set_queue_and_play(tracks, 0);
+                            me.set_wave(true);
+                            me.set_wave_label(Some(label));
+                        }
+                    }
+                }
+                Err(e) => me.emit(PlayerUiEvent::Error(format!("Ошибка загрузки Волны: {}", e))),
+            }
         });
-        self.play_track_stream(&track);
     }
 
     /// Задает новую очередь треков и запускает воспроизведение
@@ -358,6 +501,7 @@ impl PlayerManager {
             state.is_disliked = false;
         }
 
+        self.set_wave(false);
         self.emit(PlayerUiEvent::QueueUpdated(tracks.clone()));
         self.emit(PlayerUiEvent::TrackStarted {
             track: track.clone(),
@@ -465,11 +609,17 @@ impl PlayerManager {
         let station_id = self.state.lock().unwrap().station_id.clone();
         let batch_id = self.state.lock().unwrap().batch_id.clone();
         let senders = self.event_senders.clone();
+        let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_gen = self.generation.clone();
+        let is_stale = move || current_gen.load(Ordering::SeqCst) != epoch;
 
         tokio::spawn(async move {
             // Кэшируем обложку трека
             if let Some(c_url) = cover_url {
                 if let Some(cached_path) = crate::cache::fetch_cover_cached(&c_url).await {
+                    if is_stale() {
+                        return;
+                    }
                     emit_all(&senders, PlayerUiEvent::CoverUpdated(
                         cached_path.to_string_lossy().to_string(),
                     ));
@@ -488,15 +638,23 @@ impl PlayerManager {
                     )
                     .await
                 {
+                    if is_stale() {
+                        return;
+                    }
                     emit_all(&senders, PlayerUiEvent::LyricsUpdated(lyrics));
                 }
             }
 
             if client.has_token() {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
-                match client.get_track_direct_url(&track_id).await {
-                    Ok(url) => {
+                let result = client.get_track_direct_url(&track_id).await;
+                if is_stale() {
+                    return;
+                }
+                match result {
+                    Ok((url, label)) => {
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                        emit_all(&senders, PlayerUiEvent::StreamQuality(label));
                         audio_clone.play_url(&url);
                         emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
                         let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
@@ -551,15 +709,24 @@ impl PlayerManager {
             state.current_character = character.clone();
             state.station_id = station_id.clone();
         }
+        self.set_wave(true);
+        // плашку с выбранным фильтром рисует сам интерфейс; для простой Волны плашка убирается
+        if mood.is_none() && language.is_none() && character.is_none() {
+            self.set_wave_label(None);
+        } else {
+            self.state.lock().unwrap().wave_label = None;
+        }
 
         let audio_clone = self.audio.clone();
+        let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let current_gen = self.generation.clone();
 
         tokio::spawn(async move {
             let client = client_clone.lock().unwrap().clone();
             if !client.has_token() {
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
-                    "Войдите в Яндекс ID для запуска персональной Моей волны".to_string(),
+                    "Войдите в Яндекс ID для запуска персональной Волны".to_string(),
                 ));
                 return;
             }
@@ -593,11 +760,28 @@ impl PlayerManager {
                             total_queue: tracks.len(),
                         });
 
+                        // Обложка первого трека Волны (в остальных случаях её грузит play_track_stream)
+                        if let Some(c_url) = track.cover_url(400) {
+                            let (senders, current_gen) = (senders.clone(), current_gen.clone());
+                            tokio::spawn(async move {
+                                if let Some(path) = crate::cache::fetch_cover_cached(&c_url).await {
+                                    if current_gen.load(Ordering::SeqCst) == epoch {
+                                        emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
+                                    }
+                                }
+                            });
+                        }
+
                         // Сразу запускаем воспроизведение первого трека Волны
                         let track_id = track.id.clone();
                         let batch_id = station_tracks.batch_id;
-                        match client.get_track_direct_url(&track_id).await {
-                            Ok(url) => {
+                        let result = client.get_track_direct_url(&track_id).await;
+                        if current_gen.load(Ordering::SeqCst) != epoch {
+                            return;
+                        }
+                        match result {
+                            Ok((url, label)) => {
+                                emit_all(&senders, PlayerUiEvent::StreamQuality(label));
                                 audio_clone.play_url(&url);
                                 emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
                                 let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
@@ -621,9 +805,37 @@ impl PlayerManager {
     }
 }
 
+/// Следующий режим повтора по кругу; «вся очередь» пропускается для Волны
+fn next_repeat(mode: RepeatMode, wave: bool) -> RepeatMode {
+    match (mode, wave) {
+        (RepeatMode::Off, _) => RepeatMode::One,
+        (RepeatMode::One, false) => RepeatMode::All,
+        _ => RepeatMode::Off,
+    }
+}
+
 /// Рассылает событие во все переданные каналы
 fn emit_all(senders: &[Sender<PlayerUiEvent>], event: PlayerUiEvent) {
     for s in senders {
         let _ = s.send_blocking(event.clone());
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    #[test]
+    fn repeat_cycle_skips_all_for_wave() {
+        let cycle = |wave| {
+            let (mut m, mut seen) = (RepeatMode::Off, vec![]);
+            for _ in 0..3 {
+                m = next_repeat(m, wave);
+                seen.push(m);
+            }
+            seen
+        };
+        assert_eq!(cycle(false), [RepeatMode::One, RepeatMode::All, RepeatMode::Off]);
+        assert_eq!(cycle(true), [RepeatMode::One, RepeatMode::Off, RepeatMode::One]);
     }
 }

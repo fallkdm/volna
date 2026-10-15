@@ -188,10 +188,10 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
 
                         p.emit(crate::player::PlayerUiEvent::UserLoggedIn(login.clone()));
                         p.emit(crate::player::PlayerUiEvent::StatusMessage(
-                            format!("Добро пожаловать, {}! Запускаем Мою волну 🌊", login)
+                            format!("Добро пожаловать, {}! Запускаем Волну 🌊", login)
                         ));
 
-                        // Сразу запускаем реальную Мою волну
+                        // Сразу запускаем реальную Волну
                         p.fetch_wave_tracks("onyourwave");
 
                         if let Some(d) = d_weak.upgrade() {

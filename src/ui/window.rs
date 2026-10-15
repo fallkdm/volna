@@ -12,7 +12,7 @@ use libadwaita::{
 };
 
 use crate::api::models::{parse_lrc, LrcLine};
-use crate::player::{PlayerManager, PlayerUiEvent};
+use crate::player::{PlayerManager, PlayerUiEvent, RepeatMode};
 use super::auth_dialog::show_auth_dialog;
 use super::floating_island::{create_floating_island, FloatingIslandWidgets};
 use super::library_view::create_library_view;
@@ -98,9 +98,9 @@ impl VolnaWindow {
         let is_playing_state = Rc::new(RefCell::new(false));
         let accent_color = Rc::new(RefCell::new([1.0_f64, 0.42_f64, 0.29_f64])); // #ff6b4a
 
-        // Экран 1: Моя волна
+        // Экран 1: Волна
         let wave_view = create_wave_view(&player, is_playing_state.clone(), accent_color);
-        let wave_page = view_stack.add_titled(&wave_view.container, Some("wave"), "Моя волна");
+        let wave_page = view_stack.add_titled(&wave_view.container, Some("wave"), "Волна");
         wave_page.set_icon_name(Some("audio-volume-high-symbolic"));
 
         // Экран 2: Поиск
@@ -119,6 +119,48 @@ impl VolnaWindow {
         // Нижний плавающий остров плеера
         let island = create_floating_island(&player);
         root_overlay.add_overlay(&island.container);
+
+        // Клик по названию трека или артисту (в плеере и на экране волны) открывает его страницу
+        let open_from_player = |label: &gtk4::Label, artist: bool| {
+            let click = gtk4::GestureClick::new();
+            let (p, vs) = (player.clone(), view_stack.clone());
+            let (show_artist, show_track) = (search_view.show_artist.clone(), search_view.show_track.clone());
+            click.connect_released(move |_, _, _, _| {
+                let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
+                if artist {
+                    // shortcut: у трека с несколькими артистами открывается первый, для выбора нужен popover
+                    let Some(a) = track.artists.first() else { return };
+                    vs.set_visible_child_name("search");
+                    show_artist(a.id.clone());
+                } else {
+                    vs.set_visible_child_name("search");
+                    show_track(track);
+                }
+            });
+            label.add_controller(click);
+            label.set_cursor_from_name(Some("pointer"));
+        };
+        open_from_player(&island.title_label, false);
+        open_from_player(&island.artist_label, true);
+        open_from_player(&wave_view.title_label, false);
+        open_from_player(&wave_view.artist_label, true);
+
+        // Клик по обложке в плеере открывает альбом текущего трека
+        {
+            let click = gtk4::GestureClick::new();
+            let (p, vs, show_album) = (player.clone(), view_stack.clone(), search_view.show_album.clone());
+            click.connect_released(move |_, _, _, _| {
+                let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
+                let Some(mut album) = track.albums.first().cloned() else { return };
+                if album.artists.is_empty() {
+                    album.artists = track.artists.clone();
+                }
+                vs.set_visible_child_name("search");
+                show_album(album);
+            });
+            island.cover_image.add_controller(click);
+            island.cover_image.set_cursor_from_name(Some("pointer"));
+        }
 
         // ================= Оверлей текста песни (Karaoke Overlay) =================
         let karaoke_overlay = Overlay::new();
@@ -155,7 +197,7 @@ impl VolnaWindow {
         k_track_info.set_valign(Align::Center);
         k_track_info.set_halign(Align::Start);
 
-        let k_track_title = Label::new(Some("Моя волна"));
+        let k_track_title = Label::new(Some("Волна"));
         k_track_title.add_css_class("heading");
         k_track_title.set_halign(Align::Start);
         k_track_title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
@@ -246,9 +288,14 @@ impl VolnaWindow {
         {
             let p_clone = player.clone();
             let win_weak = window.downgrade();
+            let (vs, wave_btn) = (view_stack.clone(), wave_view.menu_button.clone());
             settings_btn.connect_clicked(move |_| {
                 if let Some(w) = win_weak.upgrade() {
-                    show_preferences_dialog(&w, &p_clone);
+                    let (vs, wave_btn) = (vs.clone(), wave_btn.clone());
+                    show_preferences_dialog(&w, &p_clone, move || {
+                        vs.set_visible_child_name("wave");
+                        wave_btn.emit_clicked();
+                    });
                 }
             });
         }
@@ -455,6 +502,24 @@ fn setup_event_listener(
                         island.dislike_btn.remove_css_class("disliked");
                     }
                 }
+                PlayerUiEvent::WaveContext(label) => wave_view.set_context(label.as_deref()),
+                PlayerUiEvent::RepeatChanged(mode) => {
+                    let tip = match mode {
+                        RepeatMode::Off => "Повтор: выключен",
+                        RepeatMode::One => "Повтор: один трек",
+                        RepeatMode::All => "Повтор: вся очередь",
+                    };
+                    island.repeat_one.set_visible(mode == RepeatMode::One);
+                    island.repeat_btn.set_tooltip_text(Some(tip));
+                    if mode == RepeatMode::Off {
+                        island.repeat_btn.remove_css_class("active");
+                    } else {
+                        island.repeat_btn.add_css_class("active");
+                    }
+                }
+                PlayerUiEvent::StreamQuality(label) => {
+                    island.quality_badge.set_text(&label);
+                }
                 PlayerUiEvent::CoverUpdated(path) => {
                     island.cover_image.set_from_file(Some(&path));
                 }
@@ -537,11 +602,11 @@ fn setup_event_listener(
                     auth_btn.remove_css_class("flat");
                     auth_btn.add_css_class("suggested-action");
 
-                    wave_view.title_label.set_text("Моя волна");
+                    wave_view.title_label.set_text("Волна");
                     wave_view.artist_label.set_text("Войдите в Яндекс ID для запуска потока");
-                    island.title_label.set_text("Моя волна");
+                    island.title_label.set_text("Волна");
                     island.artist_label.set_text("Яндекс Музыка");
-                    island.cover_image.set_icon_name(Some("audio-x-generic-symbolic"));
+                    island.cover_image.clear(); // пустая картинка = CSS-заглушка обложки
                 }
                 PlayerUiEvent::StatusMessage(msg) => {
                     let toast = Toast::new(&msg);

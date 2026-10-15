@@ -3,7 +3,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
-/// Официальный рабочий client_id Яндекс Музыки
+/// Публичный OAuth client_id приложения Яндекс Музыки; то же значение в открытом проекте
+/// MarshalX/yandex-music-token (MIT): web-app/src/api.ts и browser-extension/src/background.js.
 pub const CLIENT_ID: &str = "23cabbbdc6cd418abb4b39c32c41195d";
 
 /// Официальный OAuth URL для быстрого получения токена
@@ -14,6 +15,18 @@ pub const OAUTH_AUTHORIZE_URL: &str = "https://oauth.yandex.ru/authorize?respons
 pub struct AppConfig {
     /// OAuth токен Яндекс Музыки
     pub token: Option<String>,
+    /// Качество звука: `best` (по умолчанию), `balanced` или `economy`
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Клиентский токен Genius (справка об исполнителях, если нет в Википедии)
+    #[serde(default)]
+    pub genius_token: Option<String>,
+    /// Ключ API Last.fm (справка об исполнителях)
+    #[serde(default)]
+    pub lastfm_key: Option<String>,
+    /// История поиска: открытые результаты (см. `history.rs`); элементы разбираются по одному
+    #[serde(default)]
+    pub history_items: Vec<serde_json::Value>,
 }
 
 /// Возвращает путь к файлу конфигурации (~/.config/volna/config.json)
@@ -59,6 +72,47 @@ pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error +
 /// Получает сохраненный токен или None
 pub fn load_token() -> Option<String> {
     load_config().ok().and_then(|cfg| cfg.token).filter(|t| !t.trim().is_empty())
+}
+
+/// Ключ Last.fm или None, если не задан
+pub fn load_lastfm_key() -> Option<String> {
+    load_config().ok().and_then(|c| c.lastfm_key).filter(|t| !t.trim().is_empty())
+}
+
+/// Сохраняет ключ Last.fm (пустая строка удаляет)
+pub fn save_lastfm_key(key: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    let key = key.trim();
+    config.lastfm_key = if key.is_empty() { None } else { Some(key.to_string()) };
+    save_config(&config)
+}
+
+/// Токен Genius или None, если не задан
+pub fn load_genius_token() -> Option<String> {
+    load_config().ok().and_then(|c| c.genius_token).filter(|t| !t.trim().is_empty())
+}
+
+/// Сохраняет токен Genius (пустая строка удаляет)
+pub fn save_genius_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    let token = token.trim();
+    config.genius_token = if token.is_empty() { None } else { Some(token.to_string()) };
+    save_config(&config)
+}
+
+/// Выбранное качество звука (`best`, `balanced`, `economy`); при отсутствии или ошибке — `best`
+pub fn load_quality() -> String {
+    match load_config().ok().and_then(|c| c.quality).as_deref() {
+        Some(q @ ("balanced" | "economy")) => q.to_string(),
+        _ => "best".to_string(),
+    }
+}
+
+/// Сохраняет выбранное качество звука
+pub fn save_quality(quality: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.quality = Some(quality.to_string());
+    save_config(&config)
 }
 
 /// Сохраняет токен в файл конфигурации
