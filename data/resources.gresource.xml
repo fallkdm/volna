@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
   <gresource prefix="/io/github/fallkdm/Volna/icons">
-    <file preprocess="xml-stripblanks" alias="hicolor/scalable/actions/lyrics-symbolic.svg">icons/lyrics-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/lyrics-symbolic.svg">icons/lyrics-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="scalable/actions/emblem-favorite-symbolic.svg">icons/emblem-favorite-symbolic.svg</file>
   </gresource>
 </gresources>

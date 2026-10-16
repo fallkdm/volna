@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Скрипт аудита иконок Adwaita для приложения «Волна»
-set -u
+# Скрипт аудита иконок для приложения «Волна»
+# Проверяет, что все иконки, вызываемые в коде src/, присутствуют либо в системной теме Adwaita,
+# либо во встроенных ресурсах приложения (data/resources.gresource.xml).
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SEARCH_DIR="${1:-}"
 
@@ -17,47 +22,45 @@ if [ -z "$SEARCH_DIR" ]; then
     fi
 fi
 
+GRESOURCE_XML="$REPO_ROOT/data/resources.gresource.xml"
+
 echo "================================================================="
-echo "Аудит иконок в каталоге темы: $SEARCH_DIR"
+echo "Аудит иконок приложения «Волна»"
+echo "Каталог темы Adwaita: $SEARCH_DIR"
+echo "Манифест GResource:  $GRESOURCE_XML"
 echo "================================================================="
 
-ICONS=(
-    "action-unavailable-symbolic"
-    "audio-volume-high-symbolic"
-    "audio-x-generic-symbolic"
-    "avatar-default-symbolic"
-    "edit-paste-symbolic"
-    "emblem-favorite-symbolic"
-    "emblem-system-symbolic"
-    "folder-music-symbolic"
-    "go-next-symbolic"
-    "go-previous-symbolic"
-    "media-playback-pause-symbolic"
-    "media-playback-start-symbolic"
-    "media-playlist-repeat-symbolic"
-    "media-skip-backward-symbolic"
-    "media-skip-forward-symbolic"
-    "pan-down-symbolic"
-    "preferences-system-symbolic"
-    "system-search-symbolic"
-    "text-x-generic-symbolic"
-    "window-close-symbolic"
+# Динамическое извлечение имён иконок из исходного кода src/
+mapfile -t ICONS < <(
+    {
+        grep -roh -E '(from_icon_name|set_icon_name)\s*\(\s*(Some\()?\s*"[^"]+"' "$REPO_ROOT/src" | sed -E 's/.*"([^"]+)".*/\1/'
+        grep -roh -E 'icon_name\s*=\s*(if[^{]+)?\s*"[^"]+"' "$REPO_ROOT/src" | sed -E 's/.*"([^"]+)".*/\1/'
+        grep -roh -E '"[a-zA-Z0-9_-]+-symbolic"' "$REPO_ROOT/src" | tr -d '"'
+    } | sort -u
 )
+
+if [ "${#ICONS[@]}" -eq 0 ]; then
+    echo "[ERROR] Не удалось извлечь ни одной иконки из $REPO_ROOT/src!"
+    exit 1
+fi
 
 FOUND_COUNT=0
 MISSING_COUNT=0
 MISSING_LIST=()
 
-printf "%-35s | %-10s | %s\n" "Имя иконки" "Статус" "Путь к файлу"
+printf "%-35s | %-18s | %s\n" "Имя иконки" "Статус" "Источник / Путь"
 echo "--------------------------------------------------------------------------------------------------"
 
 for icon in "${ICONS[@]}"; do
-    FILE_PATH=$(find "$SEARCH_DIR" \( -name "${icon}.svg" -o -name "${icon}.png" \) 2>/dev/null | head -n 1)
+    FILE_PATH=$(find "$SEARCH_DIR" \( -name "${icon}.svg" -o -name "${icon}.png" \) 2>/dev/null | head -n 1 || true)
     if [ -n "$FILE_PATH" ]; then
-        printf "%-35s | %-10s | %s\n" "$icon" "FOUND" "$FILE_PATH"
+        printf "%-35s | %-18s | %s\n" "$icon" "FOUND (Adwaita)" "$FILE_PATH"
+        FOUND_COUNT=$((FOUND_COUNT + 1))
+    elif [ -f "$GRESOURCE_XML" ] && grep -q "${icon}.svg" "$GRESOURCE_XML"; then
+        printf "%-35s | %-18s | %s\n" "$icon" "FOUND (GResource)" "data/resources.gresource.xml"
         FOUND_COUNT=$((FOUND_COUNT + 1))
     else
-        printf "%-35s | %-10s | %s\n" "$icon" "MISSING" "-"
+        printf "%-35s | %-18s | %s\n" "$icon" "MISSING" "-"
         MISSING_COUNT=$((MISSING_COUNT + 1))
         MISSING_LIST+=("$icon")
     fi
@@ -66,12 +69,14 @@ done
 echo "================================================================="
 echo "Итог аудита: Найдено: $FOUND_COUNT / ${#ICONS[@]}, Отсутствует: $MISSING_COUNT"
 if [ "$MISSING_COUNT" -gt 0 ]; then
-    echo "Отсутствующие в Adwaita иконки:"
+    echo "[ERROR] Отсутствующие иконки, не найденные ни в Adwaita, ни в GResource:"
     for m in "${MISSING_LIST[@]}"; do
         echo "  - $m"
     done
+    echo "================================================================="
+    exit 1
 fi
-echo "================================================================="
 
-# Скрипт не завершается с ошибкой при отсутствующих иконках, чтобы CI зафиксировал аудит в логе
+echo "[SUCCESS] Все иконки гарантированно доступны для отображения!"
+echo "================================================================="
 exit 0
