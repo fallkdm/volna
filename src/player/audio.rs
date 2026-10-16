@@ -302,4 +302,50 @@ mod tests {
         }
         assert!(m.level < 0.05);
     }
+
+    #[test]
+    fn test_gstreamer_required_elements() {
+        gstreamer::init().expect("Не удалось инициализировать GStreamer");
+
+        let required_elements = [
+            "playbin3",
+            "spectrum",
+            "audioconvert",
+            "volume",
+            "souphttpsrc",
+            "decodebin",
+            "filesrc",
+            "appsink",
+            "videoconvert",
+            "videoscale",
+            "qtdemux",
+            "autoaudiosink",
+        ];
+
+        let mut missing = Vec::new();
+
+        for name in required_elements {
+            if gstreamer::ElementFactory::find(name).is_none() {
+                missing.push(name.to_string());
+            }
+        }
+
+        // Декодер MP3: хотя бы один из mpg123audiodec или avdec_mp3
+        let mp3_decoders = ["mpg123audiodec", "avdec_mp3"];
+        if !mp3_decoders.iter().any(|name| gstreamer::ElementFactory::find(name).is_some()) {
+            missing.push("mp3_decoder (ни один из mpg123audiodec, avdec_mp3 не найден)".to_string());
+        }
+
+        // Декодер H.264: хотя бы один из avdec_h264, mfh264dec, d3d11h264dec
+        let h264_decoders = ["avdec_h264", "mfh264dec", "d3d11h264dec"];
+        if !h264_decoders.iter().any(|name| gstreamer::ElementFactory::find(name).is_some()) {
+            missing.push("h264_decoder (ни один из avdec_h264, mfh264dec, d3d11h264dec не найден)".to_string());
+        }
+
+        assert!(
+            missing.is_empty(),
+            "Отсутствуют необходимые плагины/элементы GStreamer:\n{}",
+            missing.join("\n")
+        );
+    }
 }

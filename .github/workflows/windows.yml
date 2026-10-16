@@ -40,10 +40,10 @@ jobs:
           cargo --version
           pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0 librsvg-2.0
 
-      - name: Cargo check
-        shell: msys2 {0}
-        run: cargo check --verbose
-
       - name: Cargo build (release)
         shell: msys2 {0}
         run: cargo build --release --verbose
+
+      - name: Cargo test (release)
+        shell: msys2 {0}
+        run: cargo test --release --verbose
