@@ -71,9 +71,25 @@ pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error +
 
     let json = serde_json::to_string_pretty(config)?;
     // в файле токен аккаунта: читать его может только владелец (права ставим и на уже созданный файл)
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+
     file.write_all(json.as_bytes())?;
     Ok(())
 }
