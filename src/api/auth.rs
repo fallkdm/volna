@@ -37,14 +37,7 @@ pub struct AppConfig {
 
 /// Возвращает путь к файлу конфигурации (~/.config/volna/config.json)
 pub fn config_file_path() -> PathBuf {
-    let base_dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".config")
-        });
-
-    base_dir.join("volna").join("config.json")
+    glib::user_config_dir().join("volna").join("config.json")
 }
 
 /// Загружает конфигурацию из ~/.config/volna/config.json
@@ -234,4 +227,22 @@ mod tests {
             "y0_MyToken"
         );
     }
+
+    #[test]
+    fn test_glib_config_dir_without_gtk_init() {
+        // Вызов glib::user_config_dir() без gtk::init работает штатно и не падает
+        let cfg_dir = glib::user_config_dir();
+        assert!(!cfg_dir.as_os_str().is_empty());
+
+        if let Ok(expected) = std::env::var("XDG_CONFIG_HOME") {
+            assert_eq!(cfg_dir, PathBuf::from(&expected));
+        }
+
+        let file_path = config_file_path();
+        assert!(file_path.ends_with(PathBuf::from("volna").join("config.json")));
+        if let Ok(expected) = std::env::var("XDG_CONFIG_HOME") {
+            assert_eq!(file_path, PathBuf::from(expected).join("volna").join("config.json"));
+        }
+    }
 }
+

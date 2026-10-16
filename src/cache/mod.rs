@@ -3,22 +3,21 @@ use std::io::Write;
 use std::path::PathBuf;
 use md5::{Digest, Md5};
 
+/// Возвращает базовый каталог кэша приложения (~/.cache/volna)
+pub fn volna_cache_dir() -> PathBuf {
+    glib::user_cache_dir().join("volna")
+}
+
 /// Возвращает путь к директории кэша обложек (~/.cache/volna/covers/)
 pub fn covers_cache_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".cache")
-        });
-    let dir = base.join("volna").join("covers");
+    let dir = volna_cache_dir().join("covers");
     let _ = create_dir_all(&dir);
     dir
 }
 
 /// Путь к кэшу синхронизированного текста песни (~/.cache/volna/lyrics/ID.lrc)
 pub fn lyrics_cache_path(track_id: &str) -> PathBuf {
-    let dir = covers_cache_dir().parent().map(|p| p.join("lyrics")).unwrap_or_else(|| PathBuf::from("lyrics"));
+    let dir = volna_cache_dir().join("lyrics");
     let _ = create_dir_all(&dir);
     let safe: String = track_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     dir.join(format!("{}.lrc", safe))
@@ -77,10 +76,7 @@ pub fn clear_covers_cache() -> u64 {
 
 /// Папка кэша клипов (~/.cache/volna/clips/)
 pub fn clips_cache_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string())).join(".cache"));
-    let dir = base.join("volna").join("clips");
+    let dir = volna_cache_dir().join("clips");
     let _ = create_dir_all(&dir);
     dir
 }
@@ -127,3 +123,26 @@ pub fn clear_clips_cache() -> u64 {
     }
     freed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_glib_cache_dir_without_gtk_init() {
+        // Вызов glib::user_cache_dir() без gtk::init работает штатно и не падает
+        let cache_dir = glib::user_cache_dir();
+        assert!(!cache_dir.as_os_str().is_empty());
+
+        if let Ok(expected) = std::env::var("XDG_CACHE_HOME") {
+            assert_eq!(cache_dir, PathBuf::from(&expected));
+        }
+
+        let vdir = volna_cache_dir();
+        assert!(vdir.ends_with("volna"));
+        if let Ok(expected) = std::env::var("XDG_CACHE_HOME") {
+            assert_eq!(vdir, PathBuf::from(expected).join("volna"));
+        }
+    }
+}
+
