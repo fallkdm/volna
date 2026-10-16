@@ -53,3 +53,14 @@ jobs:
       - name: Cargo test (release)
         shell: msys2 {0}
         run: cargo test --release --verbose
+
+      - name: Bundle portable folder
+        shell: msys2 {0}
+        run: bash scripts/bundle_win.sh
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: volna-windows
+          path: dist/volna
+          retention-days: 14
