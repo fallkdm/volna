@@ -34,10 +34,7 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
     open_browser_btn.add_css_class("suggested-action");
 
     open_browser_btn.connect_clicked(|_| {
-        let _ = gio::AppInfo::launch_default_for_uri(
-            OAUTH_AUTHORIZE_URL,
-            None::<&gio::AppLaunchContext>,
-        );
+        open_uri(OAUTH_AUTHORIZE_URL);
     });
 
     step1_row.add_suffix(&open_browser_btn);
@@ -86,10 +83,7 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
 
     let open_device_btn = Button::with_label("Открыть ya.ru/device ↗");
     open_device_btn.connect_clicked(|_| {
-        let _ = gio::AppInfo::launch_default_for_uri(
-            "https://ya.ru/device",
-            None::<&gio::AppLaunchContext>,
-        );
+        open_uri("https://ya.ru/device");
     });
     code_row.add_suffix(&open_device_btn);
     device_group.add(&code_row);
@@ -102,6 +96,10 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
     status_label.set_margin_top(8);
     status_label.add_css_class("error");
     status_label.set_visible(false);
+
+    let status_group = PreferencesGroup::new();
+    status_group.add(&status_label);
+    page.add(&status_group);
 
     dialog.add(&page);
 
@@ -213,4 +211,23 @@ pub fn show_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManager)
     }
 
     dialog.present(Some(parent));
+}
+
+
+/// Открывает ссылку в браузере по умолчанию. На Windows у GIO нет обработчика
+/// ссылок в портативной сборке, поэтому идём через системный url.dll.
+fn open_uri(uri: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", uri])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = gio::AppInfo::launch_default_for_uri(uri, None::<&gio::AppLaunchContext>);
+    }
 }
