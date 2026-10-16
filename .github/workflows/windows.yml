@@ -32,6 +32,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gst-libav
             mingw-w64-ucrt-x86_64-glib-networking
             mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
 
       - name: Check toolchain and library versions
         shell: msys2 {0}
@@ -39,6 +40,10 @@ jobs:
           rustc --version
           cargo --version
           pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0 librsvg-2.0
+
+      - name: Audit Adwaita icons
+        shell: msys2 {0}
+        run: bash scripts/check_icons.sh
 
       - name: Cargo build (release)
         shell: msys2 {0}

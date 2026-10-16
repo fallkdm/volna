@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 pub mod api;
 pub mod cache;
 pub mod mpris;
@@ -54,6 +56,9 @@ fn main() {
     #[cfg(windows)]
     init_windows_environment();
 
+    // Регистрируем встроенные GResource ресурсы (иконки и ассеты)
+    gio::resources_register_include!("volna.gresource").expect("Не удалось зарегистрировать GResource");
+
     // Инициализируем многопоточный Tokio runtime для фоновых сетевых запросов и MPRIS D-Bus
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -69,6 +74,12 @@ fn main() {
     app.connect_activate(|app| {
         // Подключаем кастомные стили оформления
         ui::load_css();
+
+        // Регистрируем ресурсный путь к встроенным иконкам
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let icon_theme = gtk4::IconTheme::for_display(&display);
+            icon_theme.add_resource_path("/io/github/fallkdm/Volna/icons");
+        }
 
         // Загружаем сохраненный токен и создаем клиент API
         let token = load_token();

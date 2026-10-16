@@ -267,6 +267,7 @@ impl AudioBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gio::prelude::*;
 
     #[test]
     fn test_bass_meter() {
@@ -341,6 +342,21 @@ mod tests {
         if !h264_decoders.iter().any(|name| gstreamer::ElementFactory::find(name).is_some()) {
             missing.push("h264_decoder (ни один из avdec_h264, mfh264dec, d3d11h264dec не найден)".to_string());
         }
+
+        #[cfg(windows)]
+        {
+            let win_sinks = ["wasapi2sink", "wasapisink", "directsoundsink"];
+            if !win_sinks.iter().any(|name| gstreamer::ElementFactory::find(name).is_some()) {
+                missing.push("windows_audio_sink (ни один из wasapi2sink, wasapisink, directsoundsink не найден)".to_string());
+            }
+        }
+
+        // Проверка поддержки TLS сетевого потока HTTPS через glib-networking
+        let tls_backend = gio::TlsBackend::default();
+        assert!(
+            tls_backend.supports_tls(),
+            "TLS backend не поддерживается (требуется пакет glib-networking)"
+        );
 
         assert!(
             missing.is_empty(),

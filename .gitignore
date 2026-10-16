@@ -4,4 +4,5 @@
 /graphify-out/
 /AGENT_CHAT.md
 /scripts/
+!/scripts/check_icons.sh
 /.gitattributes
