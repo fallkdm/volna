@@ -33,13 +33,14 @@ jobs:
             mingw-w64-ucrt-x86_64-glib-networking
             mingw-w64-ucrt-x86_64-librsvg
             mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-libepoxy
 
       - name: Check toolchain and library versions
         shell: msys2 {0}
         run: |
           rustc --version
           cargo --version
-          pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0 librsvg-2.0
+          pkg-config --modversion gtk4 libadwaita-1 gstreamer-1.0 librsvg-2.0 epoxy
 
       - name: Audit Adwaita icons
         shell: msys2 {0}

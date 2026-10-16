@@ -145,23 +145,51 @@ struct Gl {
     clip_size: (i32, i32),
 }
 
-/// Достаёт функции OpenGL через EGL (GTK 4 работает через EGL и на Wayland, и на X11)
+fn epoxy_library() -> Option<&'static libloading::Library> {
+    use std::sync::OnceLock;
+
+    static EPOXY: OnceLock<Option<libloading::Library>> = OnceLock::new();
+
+    EPOXY
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            let filename = "libepoxy.0.dylib";
+            #[cfg(all(unix, not(target_os = "macos")))]
+            let filename = "libepoxy.so.0";
+            #[cfg(windows)]
+            let filename = "libepoxy-0.dll";
+
+            let library = unsafe { libloading::Library::new(filename) };
+
+            #[cfg(windows)]
+            let library = library.or_else(|_| unsafe { libloading::Library::new("epoxy-0.dll") });
+
+            library.ok()
+        })
+        .as_ref()
+}
+
+/// Достаёт функции OpenGL через libepoxy (кроссплатформенно: EGL на Wayland, GLX/EGL на X11, WGL на Windows).
+/// В libepoxy символы `epoxy_<name>` являются элементами глобальной таблицы диспетчеризации
+/// и требуют однократного разыменования указателя для получения адреса вызова в текущем GL-контексте.
 fn load_gl() -> Option<glow::Context> {
     // VOLNA_NO_GL=1 имитирует отсутствие OpenGL: так проверяют запасной фон
     if std::env::var_os("VOLNA_NO_GL").is_some() {
         return None;
     }
-    // shortcut: только EGL; если GTK запущен с GLX (GDK_DEBUG=gl-glx), фон не нарисуется
-    let lib = unsafe { libloading::Library::new("libEGL.so.1") }.ok()?;
-    let get: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char) -> *const std::ffi::c_void> =
-        unsafe { lib.get(b"eglGetProcAddress\0") }.ok()?;
+    let library = epoxy_library()?;
     let ctx = unsafe {
         glow::Context::from_loader_function(|name| {
-            let name = std::ffi::CString::new(name).unwrap();
-            get(name.as_ptr())
+            let symbol = format!("epoxy_{name}\0");
+            library
+                .get::<*const std::ffi::c_void>(symbol.as_bytes())
+                .map(|sym| {
+                    let entry = sym.try_as_raw_ptr().unwrap() as *const *const std::ffi::c_void;
+                    *entry
+                })
+                .unwrap_or(std::ptr::null())
         })
     };
-    std::mem::forget(lib); // функции нужны до конца работы приложения
     Some(ctx)
 }
 
@@ -188,7 +216,7 @@ fn compile(gl: &glow::Context, es: bool) -> Result<(glow::Program, glow::VertexA
 }
 
 /// Подключает рендер к GLArea. `center` — центр кнопки Play, обновляется вызывающим перед каждым кадром.
-/// `on_fail` вызывается, если OpenGL не поднялся (нет EGL, драйвер без GLSL 3.30/ES 3.0): вызывающий показывает запасной фон.
+/// `on_fail` вызывается, если OpenGL не поднялся (драйвер без GLSL 3.30/ES 3.0, VOLNA_NO_GL=1): вызывающий показывает запасной фон.
 pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cell<(f64, f64)>>, clip: std::sync::Arc<super::wave_clip::ClipShared>, on_fail: impl Fn() + 'static) {
     let gl_state: Rc<RefCell<Option<Gl>>> = Rc::default();
 
@@ -201,7 +229,7 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
             return;
         }
         let Some(gl) = load_gl() else {
-            eprintln!("[wave] не удалось загрузить libEGL");
+            eprintln!("[wave] не удалось загрузить OpenGL (libepoxy)");
             on_fail();
             return;
         };
