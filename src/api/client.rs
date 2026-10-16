@@ -500,6 +500,19 @@ impl YandexMusicClient {
             .find_map(|v| v["syncedLyrics"].as_str().map(str::trim).filter(|t| usable_synced(t)).map(String::from))
     }
 
+    /// Ссылка на превью-клип трека из `/supplement` (поле `clips[0].previewUrl`); у многих треков клипа нет
+    pub async fn get_track_clip_url(&self, track_id: &str) -> Option<String> {
+        let url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
+        let resp = self.client.get(&url).headers(self.headers()).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let link = body["result"]["clips"][0]["previewUrl"].as_str()?;
+        // только https и только хост Яндекса: ссылка приходит из ответа сервера
+        (link.starts_with("https://") && link.contains(".yandex.net/")).then(|| link.to_string())
+    }
+
     /// Запрос текста песни для плеера:
     /// - Если /supplement вернул синхронизированный LRC с таймкодами — используем его.
     /// - Если вернул статический текст (без таймкодов) или ошибку — запрашиваем LRCLIB.

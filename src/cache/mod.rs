@@ -74,3 +74,56 @@ pub fn clear_covers_cache() -> u64 {
     }
     freed
 }
+
+/// Папка кэша клипов (~/.cache/volna/clips/)
+pub fn clips_cache_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string())).join(".cache"));
+    let dir = base.join("volna").join("clips");
+    let _ = create_dir_all(&dir);
+    dir
+}
+
+/// Скачивает превью-клип в кэш (несколько МБ), повторно берёт с диска. Лимит размера ответа — защита от подмены ссылки
+pub async fn fetch_clip_cached(url: &str) -> Option<PathBuf> {
+    let mut hasher = Md5::new();
+    hasher.update(url.as_bytes());
+    let name: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    let path = clips_cache_dir().join(format!("{name}.mp4"));
+    if path.exists() {
+        return Some(path);
+    }
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() || resp.content_length().is_some_and(|n| n > 30_000_000) {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() > 30_000_000 {
+        return None;
+    }
+    // во временный файл и переименование: оборванная загрузка не должна остаться «готовым» клипом
+    let tmp = path.with_extension("part");
+    File::create(&tmp).ok()?.write_all(&bytes).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
+/// Размер кэша клипов в байтах
+pub fn clips_cache_size() -> u64 {
+    std::fs::read_dir(clips_cache_dir())
+        .map(|d| d.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
+        .unwrap_or(0)
+}
+
+/// Удаляет кэш клипов, возвращает освобождённые байты
+pub fn clear_clips_cache() -> u64 {
+    let freed = clips_cache_size();
+    if let Ok(dir) = std::fs::read_dir(clips_cache_dir()) {
+        for entry in dir.flatten().filter(|e| e.path().is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    freed
+}

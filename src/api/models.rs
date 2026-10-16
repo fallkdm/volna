@@ -491,6 +491,32 @@ pub struct LrcLine {
 }
 
 /// Парсит LRC текст формата `[mm:ss.xx] Текст`
+/// Чинит «кракозябры» в тексте песни: в LRCLIB встречаются записи, где UTF-8 прочитали как Windows-1252
+/// (`can’t` превращается в `canâ€™t`). Строка чинится, только если получается целиком корректный UTF-8.
+pub fn fix_mojibake(text: &str) -> String {
+    // единицы cp1252 в диапазоне 0x80–0x9F, которых нет в Latin-1
+    fn byte_of(c: char) -> Option<u8> {
+        let b = match c {
+            '€' => 0x80, '‚' => 0x82, 'ƒ' => 0x83, '„' => 0x84, '…' => 0x85, '†' => 0x86, '‡' => 0x87,
+            'ˆ' => 0x88, '‰' => 0x89, 'Š' => 0x8A, '‹' => 0x8B, 'Œ' => 0x8C, 'Ž' => 0x8E, '‘' => 0x91,
+            '’' => 0x92, '“' => 0x93, '”' => 0x94, '•' => 0x95, '–' => 0x96, '—' => 0x97, '˜' => 0x98,
+            '™' => 0x99, 'š' => 0x9A, '›' => 0x9B, 'œ' => 0x9C, 'ž' => 0x9E, 'Ÿ' => 0x9F,
+            c if (c as u32) <= 0xFF => c as u32 as u8,
+            _ => return None,
+        };
+        Some(b)
+    }
+    // типичное начало испорченной последовательности: â, Ã, Â перед символом из 0x80–0xBF
+    if !text.chars().any(|c| matches!(c, 'â' | 'Ã' | 'Â')) {
+        return text.to_string();
+    }
+    let bytes: Option<Vec<u8>> = text.chars().map(byte_of).collect();
+    match bytes.and_then(|b| String::from_utf8(b).ok()) {
+        Some(fixed) if fixed.chars().count() < text.chars().count() => fixed,
+        _ => text.to_string(),
+    }
+}
+
 pub fn parse_lrc(lrc_text: &str) -> Vec<LrcLine> {
     let mut lines = Vec::new();
     for raw_line in lrc_text.lines() {
@@ -501,7 +527,7 @@ pub fn parse_lrc(lrc_text: &str) -> Vec<LrcLine> {
 
         if let Some(close_bracket) = trimmed.find(']') {
             let time_part = &trimmed[1..close_bracket];
-            let text = trimmed[close_bracket + 1..].trim().to_string();
+            let text = fix_mojibake(trimmed[close_bracket + 1..].trim());
 
             // mm:ss.xx
             if let Some((min_str, sec_str)) = time_part.split_once(':') {
@@ -518,6 +544,16 @@ pub fn parse_lrc(lrc_text: &str) -> Vec<LrcLine> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mojibake_is_repaired_per_line() {
+        use super::fix_mojibake;
+        assert_eq!(fix_mojibake("But you can\u{e2}\u{20ac}\u{2122}t put your finger"), "But you can’t put your finger");
+        assert_eq!(fix_mojibake("But you can't put your finger"), "But you can't put your finger");
+        // нормальные «â» и «Ã» не портим
+        assert_eq!(fix_mojibake("Voilà, âge"), "Voilà, âge");
+        assert_eq!(fix_mojibake("Привет"), "Привет");
+    }
+
     use super::*;
 
     #[test]

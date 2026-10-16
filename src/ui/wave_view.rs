@@ -110,6 +110,8 @@ pub struct WaveViewWidgets {
     pub shader_state: Rc<RefCell<WaveShaderState>>,
     pub content_box: GtkBox,
     pub filter_pill: GtkBox,
+    /// Клип на фоне (превью-ролик трека)
+    pub clip: Rc<super::wave_clip::ClipController>,
     pill_label: Label,
     option_buttons: Rc<RefCell<Vec<Button>>>,
 }
@@ -153,6 +155,9 @@ pub fn create_wave_view(
     drawing_area.set_hexpand(true);
     drawing_area.set_vexpand(true);
     let play_center = Rc::new(std::cell::Cell::new((0.0_f64, 0.0_f64)));
+    // Клип на фоне: декодер пишет кадры в общую ячейку, шейдер их показывает
+    let clip_shared = std::sync::Arc::new(super::wave_clip::ClipShared::default());
+    let clip = Rc::new(super::wave_clip::ClipController::new(clip_shared.clone()));
     // Запасной фон под GLArea: статичный градиент темы; показывается, только если OpenGL недоступен
     let fallback = GtkBox::new(Orientation::Vertical, 0);
     fallback.add_css_class("ambient-backdrop");
@@ -161,7 +166,7 @@ pub fn create_wave_view(
     fallback.set_visible(false);
     {
         let fb = fallback.clone();
-        super::wave_gl::attach(&drawing_area, shader_state.clone(), play_center.clone(), move || fb.set_visible(true));
+        super::wave_gl::attach(&drawing_area, shader_state.clone(), play_center.clone(), clip_shared.clone(), move || fb.set_visible(true));
     }
 
     // Центральная кнопка Play/Pause (фиксированный размер 72x72)
@@ -182,6 +187,7 @@ pub fn create_wave_view(
         let last_time_ref = Rc::new(RefCell::new(0_i64));
         let play_btn_ref = play_btn.clone();
         let tick_n = std::cell::Cell::new(0u32);
+        let clip_for_tick = clip_shared.clone();
 
         drawing_area.add_tick_callback(move |area, frame_clock| {
             let now = frame_clock.frame_time(); // время в микросекундах
@@ -204,7 +210,7 @@ pub fn create_wave_view(
             tick_n.set(n);
             let idle = {
                 let st = state_ref.borrow();
-                !st.is_playing && st.bass < 0.005
+                !st.is_playing && st.bass < 0.005 && !clip_for_tick.active()
             };
             if idle && n % 4 != 0 {
                 return glib::ControlFlow::Continue;
@@ -584,6 +590,7 @@ pub fn create_wave_view(
         drawing_area,
         shader_state,
         content_box,
+        clip,
         filter_pill,
         pill_label,
         option_buttons,

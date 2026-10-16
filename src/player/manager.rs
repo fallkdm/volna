@@ -33,6 +33,8 @@ pub enum PlayerUiEvent {
     QueueUpdated(Vec<Track>),
     CoverUpdated(String),
     LyricsUpdated(String),
+    /// Путь к скачанному превью-клипу трека для фона Волны; `None` — клипа нет или он выключен
+    ClipUpdated(Option<String>),
     RepeatChanged(RepeatMode),
     /// Тип включённой Волны для плашки сверху: «По артисту: …», «По треку: …»; `None` — простая Волна или не Волна
     WaveContext(Option<String>),
@@ -178,6 +180,9 @@ impl PlayerManager {
         self.emit(PlayerUiEvent::TrackStarted { track, index: 0, total_queue: 1 });
         if let Ok(path) = std::env::var("VOLNA_DEMO_COVER") {
             self.emit(PlayerUiEvent::CoverUpdated(path));
+        }
+        if let Ok(path) = std::env::var("VOLNA_DEMO_CLIP") {
+            self.emit(PlayerUiEvent::ClipUpdated(Some(path)));
         }
         self.emit(PlayerUiEvent::StreamQuality("MP3 192".into()));
         self.emit(PlayerUiEvent::LyricsUpdated(lrc));
@@ -880,6 +885,19 @@ fn spawn_cover_and_lyrics(
                 if generation.load(Ordering::SeqCst) == epoch {
                     emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
                 }
+            }
+        });
+    }
+
+    if crate::api::auth::load_clips() {
+        let (senders, generation, client, track_id) = (senders.to_vec(), generation.clone(), client.clone(), track.id.clone());
+        tokio::spawn(async move {
+            let path = match client.get_track_clip_url(&track_id).await {
+                Some(url) => crate::cache::fetch_clip_cached(&url).await,
+                None => None,
+            };
+            if generation.load(Ordering::SeqCst) == epoch {
+                emit_all(&senders, PlayerUiEvent::ClipUpdated(path.map(|p| p.to_string_lossy().to_string())));
             }
         });
     }

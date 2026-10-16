@@ -4,9 +4,9 @@ use libadwaita::prelude::*;
 use libadwaita::{ActionRow, ComboRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup, PreferencesPage};
 
 use crate::api::auth::{
-    load_genius_token, load_lastfm_key, load_quality, load_token, save_genius_token, save_lastfm_key, save_quality, save_token,
+    load_clips, save_clips, load_genius_token, load_lastfm_key, load_quality, load_token, save_genius_token, save_lastfm_key, save_quality, save_token,
 };
-use crate::cache::{clear_covers_cache, covers_cache_size};
+use crate::cache::{clear_clips_cache, clear_covers_cache, clips_cache_size, covers_cache_size};
 use crate::player::PlayerManager;
 
 fn size_text(bytes: u64) -> String {
@@ -68,14 +68,33 @@ pub fn show_preferences_dialog(
     quality_group.add(&quality_row);
     page.add(&quality_group);
 
+    // Клипы на фоне Волны (по желанию)
+    let clips_group = PreferencesGroup::new();
+    let clips_row = libadwaita::SwitchRow::builder()
+        .title("Клипы на фоне")
+        .subtitle("Если у трека есть клип в Яндексе, его короткое превью (4–10 с) зациклено и полупрозрачно играет на фоне Волны. Скачивается несколько МБ на трек. Применится со следующего трека")
+        .active(load_clips())
+        .build();
+    {
+        let p = player.clone();
+        clips_row.connect_active_notify(move |row| {
+            let _ = save_clips(row.is_active());
+            if !row.is_active() {
+                p.emit(crate::player::PlayerUiEvent::ClipUpdated(None));
+            }
+        });
+    }
+    clips_group.add(&clips_row);
+    page.add(&clips_group);
+
     // Память
     let memory_group = PreferencesGroup::new();
-    let clear_row = nav_row("Очистить память", &format!("Кэш обложек: {}", size_text(covers_cache_size())));
+    let clear_row = nav_row("Очистить память", &format!("Обложки и клипы: {}", size_text(covers_cache_size() + clips_cache_size())));
     {
         let p = player.clone();
         clear_row.connect_activated(move |row| {
-            let freed = clear_covers_cache();
-            row.set_subtitle("Кэш обложек: 0.0 МБ");
+            let freed = clear_covers_cache() + clear_clips_cache();
+            row.set_subtitle("Обложки и клипы: 0.0 МБ");
             p.emit(crate::player::PlayerUiEvent::StatusMessage(format!("Освобождено {}", size_text(freed))));
         });
     }

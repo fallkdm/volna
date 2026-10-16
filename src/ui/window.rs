@@ -335,8 +335,9 @@ impl VolnaWindow {
             *close_karaoke.borrow_mut() = Some(Rc::new(move || set(false)));
         }
         {
-            let set = set_karaoke.clone();
-            island.karaoke_btn.connect_clicked(move |_| set(true));
+            // кнопка «Т» работает как переключатель: повторное нажатие закрывает текст
+            let (set, sheet) = (set_karaoke.clone(), karaoke_overlay.clone());
+            island.karaoke_btn.connect_clicked(move |_| set(!(sheet.is_visible() && sheet.opacity() > 0.5)));
         }
         {
             let set = set_karaoke.clone();
@@ -729,6 +730,8 @@ fn setup_event_listener(
             match event {
                 PlayerUiEvent::TrackStarted { track, .. } => {
                     awaiting_start.set(std::env::var_os("VOLNA_DEMO_POS_MS").is_none());
+                    // клип прошлого трека гаснет; клип нового придёт отдельным событием, если он есть и включён
+                    wave_view.clip.stop();
                     let artists = track.artists_string();
                     let album = track.albums.first().and_then(|a| a.title.as_ref()).map(|s| s.as_str()).unwrap_or("");
                     let subtitle = if album.is_empty() {
@@ -818,6 +821,10 @@ fn setup_event_listener(
                     island.cover_image.set_from_file(Some(&path));
                     wave_view.shader_state.borrow_mut().update_from_cover(&path);
                 }
+                PlayerUiEvent::ClipUpdated(path) => match path {
+                    Some(p) => wave_view.clip.play(&p),
+                    None => wave_view.clip.stop(),
+                },
                 PlayerUiEvent::LyricsUpdated(lrc_text) => {
                     while let Some(child) = lyrics_container.first_child() {
                         lyrics_container.remove(&child);
@@ -859,7 +866,8 @@ fn setup_event_listener(
                         let trimmed = lrc_text.trim();
                         if !trimmed.is_empty() {
                             for line in lrc_text.lines() {
-                                let line_trimmed = line.trim();
+                                let fixed_line = crate::api::models::fix_mojibake(line.trim());
+                                let line_trimmed = fixed_line.as_str();
                                 if line_trimmed.is_empty() {
                                     let spacer = GtkBox::new(Orientation::Vertical, 0);
                                     spacer.set_size_request(-1, 10);

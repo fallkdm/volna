@@ -27,6 +27,9 @@ uniform float u_bass;
 uniform vec3 u_core;
 uniform vec3 u_deep;
 uniform vec3 u_ridge;
+uniform sampler2D u_clip;
+uniform float u_clip_alpha; // 0 — клипа нет
+uniform vec2 u_clip_size;   // размер кадра клипа в пикселях
 out vec4 frag;
 
 float hash(vec2 p) {
@@ -95,6 +98,15 @@ void main() {
     float guard = smoothstep(0.06, 0.30, length(p - u_center) / maxd);
     col = mix(col, u_deep * 0.30, 0.68 * dark * guard);
 
+    // клип: кадр растягивается на весь экран с сохранением пропорций (cover), смешивается полупрозрачно
+    if (u_clip_alpha > 0.001) {
+        float sc = max(u_size.x / u_clip_size.x, u_size.y / u_clip_size.y);
+        vec2 uv = ((p - u_size * 0.5) / sc + u_clip_size * 0.5) / u_clip_size;
+        vec3 v = texture(u_clip, uv).rgb;
+        // клип тонируем цветом трека: слой остаётся частью фона, а не отдельной картинкой
+        col = mix(col, mix(v, v * (u_core * 1.6 + 0.2), 0.45), u_clip_alpha);
+    }
+
     // 2. текучие нити: замкнутые кривые r(θ) вокруг центра; расстояние до кривой — по радиусу,
     // поправленное на наклон кривой, чтобы толщина не менялась на изгибах
     vec3 light = u_ridge * 0.5 + 0.5;
@@ -129,6 +141,8 @@ struct Gl {
     gl: glow::Context,
     program: glow::Program,
     vao: glow::VertexArray,
+    clip_tex: Option<glow::Texture>,
+    clip_size: (i32, i32),
 }
 
 /// Достаёт функции OpenGL через EGL (GTK 4 работает через EGL и на Wayland, и на X11)
@@ -175,7 +189,7 @@ fn compile(gl: &glow::Context, es: bool) -> Result<(glow::Program, glow::VertexA
 
 /// Подключает рендер к GLArea. `center` — центр кнопки Play, обновляется вызывающим перед каждым кадром.
 /// `on_fail` вызывается, если OpenGL не поднялся (нет EGL, драйвер без GLSL 3.30/ES 3.0): вызывающий показывает запасной фон.
-pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cell<(f64, f64)>>, on_fail: impl Fn() + 'static) {
+pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cell<(f64, f64)>>, clip: std::sync::Arc<super::wave_clip::ClipShared>, on_fail: impl Fn() + 'static) {
     let gl_state: Rc<RefCell<Option<Gl>>> = Rc::default();
 
     let s = gl_state.clone();
@@ -193,7 +207,7 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
         };
         let es = area.context().is_some_and(|c| c.uses_es());
         match compile(&gl, es) {
-            Ok((program, vao)) => *s.borrow_mut() = Some(Gl { gl, program, vao }),
+            Ok((program, vao)) => *s.borrow_mut() = Some(Gl { gl, program, vao, clip_tex: None, clip_size: (0, 0) }),
             Err(e) => {
                 eprintln!("[wave] шейдер не собрался: {e}");
                 on_fail();
@@ -208,13 +222,49 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
             unsafe {
                 g.gl.delete_program(g.program);
                 g.gl.delete_vertex_array(g.vao);
+                if let Some(t) = g.clip_tex {
+                    g.gl.delete_texture(t);
+                }
             }
         }
     });
 
+    let clip_alpha = Cell::new(0.0_f32);
     area.connect_render(move |area, _| {
-        let guard = gl_state.borrow();
-        let Some(g) = guard.as_ref() else { return glib::Propagation::Proceed };
+        let mut guard = gl_state.borrow_mut();
+        let Some(g) = guard.as_mut() else { return glib::Propagation::Proceed };
+        // новый кадр клипа → текстура (создаётся при первом кадре)
+        if let Some(f) = clip.take_fresh() {
+            unsafe {
+                let tex = match g.clip_tex {
+                    Some(t) => t,
+                    None => {
+                        let t = g.gl.create_texture().ok();
+                        if let Some(t) = t {
+                            g.gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                            g.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                            g.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                            g.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                            g.gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                        }
+                        g.clip_tex = t;
+                        match t {
+                            Some(t) => t,
+                            None => return glib::Propagation::Stop,
+                        }
+                    }
+                };
+                g.gl.active_texture(glow::TEXTURE0);
+                g.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                g.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                g.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, f.width, f.height, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&f.data)));
+            }
+            g.clip_size = (f.width, f.height);
+        }
+        // слой клипа проявляется и гаснет плавно (около полусекунды)
+        let target = if clip.active() && g.clip_tex.is_some() { 0.30 } else { 0.0 };
+        let a = clip_alpha.get();
+        clip_alpha.set(a + (target - a).clamp(-0.02, 0.02));
         let st = state.borrow();
         let (cx, cy) = center.get();
         let scale = area.scale_factor() as f32;
@@ -232,6 +282,11 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
                 let (r, gg, b) = v3(c);
                 gl.uniform_3_f32(loc(name).as_ref(), r, gg, b);
             }
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, g.clip_tex);
+            gl.uniform_1_i32(loc("u_clip").as_ref(), 0);
+            gl.uniform_1_f32(loc("u_clip_alpha").as_ref(), if g.clip_tex.is_some() { clip_alpha.get() } else { 0.0 });
+            gl.uniform_2_f32(loc("u_clip_size").as_ref(), g.clip_size.0.max(1) as f32, g.clip_size.1.max(1) as f32);
             gl.bind_vertex_array(Some(g.vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
         }

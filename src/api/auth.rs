@@ -21,6 +21,9 @@ pub struct AppConfig {
     /// Клиентский токен Genius (справка об исполнителях, если нет в Википедии)
     #[serde(default)]
     pub genius_token: Option<String>,
+    /// Клипы на фоне Волны (превью-ролики из Яндекса, полупрозрачно); по умолчанию выключено
+    #[serde(default)]
+    pub clips: bool,
     /// Ключ API Last.fm (справка об исполнителях)
     #[serde(default)]
     pub lastfm_key: Option<String>,
@@ -118,6 +121,17 @@ pub fn load_quality() -> String {
 pub fn save_quality(quality: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     config.quality = Some(quality.to_string());
+    save_config(&config)
+}
+
+/// Включены ли клипы на фоне
+pub fn load_clips() -> bool {
+    load_config().map(|c| c.clips).unwrap_or(false)
+}
+
+pub fn save_clips(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.clips = on;
     save_config(&config)
 }
 

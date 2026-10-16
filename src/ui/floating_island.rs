@@ -307,8 +307,21 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     }
     {
         let p = player.clone();
+        // change-value приходит на каждое движение мыши при перетаскивании; серия перемоток подряд
+        // (каждая сбрасывает конвейер) останавливала воспроизведение, поэтому берём последнее значение раз в 150 мс
+        let pending: std::rc::Rc<std::cell::Cell<Option<u64>>> = Default::default();
+        let scheduled = std::rc::Rc::new(std::cell::Cell::new(false));
         seek_scale.connect_change_value(move |_, _, new_val| {
-            p.seek(new_val as u64);
+            pending.set(Some(new_val.max(0.0) as u64));
+            if !scheduled.replace(true) {
+                let (p, pending, scheduled) = (p.clone(), pending.clone(), scheduled.clone());
+                gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                    scheduled.set(false);
+                    if let Some(secs) = pending.take() {
+                        p.seek(secs);
+                    }
+                });
+            }
             gtk4::glib::Propagation::Proceed
         });
     }

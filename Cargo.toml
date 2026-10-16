@@ -23,3 +23,4 @@ async-channel = "2"
 mpris-server = { version = "0.10", features = ["tokio"] }
 glow = "0.16"
 libloading = "0.8"
+gstreamer-app = "0.25"
