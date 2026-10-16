@@ -41,15 +41,18 @@ impl ClipShared {
 pub struct ClipController {
     shared: Arc<ClipShared>,
     pipeline: std::cell::RefCell<Option<gstreamer::Pipeline>>,
+    /// Наблюдатель шины: пока он жив, на конец ролика приходит перемотка в начало (при удалении наблюдатель снимается)
+    watch: std::cell::RefCell<Option<gstreamer::bus::BusWatchGuard>>,
 }
 
 impl ClipController {
     pub fn new(shared: Arc<ClipShared>) -> Self {
-        Self { shared, pipeline: Default::default() }
+        Self { shared, pipeline: Default::default(), watch: Default::default() }
     }
 
     /// Останавливает клип; слой плавно гаснет в шейдере
     pub fn stop(&self) {
+        self.watch.borrow_mut().take();
         if let Some(p) = self.pipeline.borrow_mut().take() {
             let _ = p.set_state(gstreamer::State::Null);
         }
@@ -92,7 +95,7 @@ impl ClipController {
         // конец ролика: перемотка в начало (петля)
         if let Some(bus) = pipeline.bus() {
             let weak = pipeline.downgrade();
-            let _ = bus.add_watch_local(move |_, msg| {
+            let guard = bus.add_watch_local(move |_, msg| {
                 use gstreamer::MessageView;
                 match msg.view() {
                     MessageView::Eos(_) => {
@@ -108,6 +111,7 @@ impl ClipController {
                     _ => glib::ControlFlow::Continue,
                 }
             });
+            *self.watch.borrow_mut() = guard.ok();
         }
 
         if pipeline.set_state(gstreamer::State::Playing).is_ok() {

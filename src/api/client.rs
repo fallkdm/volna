@@ -188,6 +188,17 @@ impl YandexMusicClient {
 
     /// Получает прямую ссылку на MP3-поток трека через download-info и подпись качества вида «MP3 192»
     pub async fn get_track_direct_url(&self, track_id: &str) -> Result<(String, String), ApiError> {
+        // ссылка download-info одноразовая и живёт недолго; редкий сбой ответа лечится повтором с новой ссылкой
+        match self.get_track_direct_url_once(track_id).await {
+            Err(ApiError::XmlParse(_)) => {
+                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                self.get_track_direct_url_once(track_id).await
+            }
+            other => other,
+        }
+    }
+
+    async fn get_track_direct_url_once(&self, track_id: &str) -> Result<(String, String), ApiError> {
         let download_infos = self.get_track_download_info(track_id).await?;
         if download_infos.is_empty() {
             return Err(ApiError::MissingData(format!(
@@ -209,8 +220,11 @@ impl YandexMusicClient {
             .text()
             .await?;
 
-        let host = extract_xml_tag(&xml_resp, "host")
-            .ok_or_else(|| ApiError::XmlParse("Тег <host> не найден".into()))?;
+        let host = extract_xml_tag(&xml_resp, "host").ok_or_else(|| {
+            // начало ответа помогает понять причину (лимит, капча, просроченная ссылка); без токенов, ответ публичный
+            let head: String = xml_resp.chars().filter(|c| !c.is_control()).take(80).collect();
+            ApiError::XmlParse(format!("в ответе Яндекса нет адреса потока («{}»)", head))
+        })?;
         let path = extract_xml_tag(&xml_resp, "path")
             .ok_or_else(|| ApiError::XmlParse("Тег <path> не найден".into()))?;
         let ts = extract_xml_tag(&xml_resp, "ts")

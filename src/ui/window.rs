@@ -928,10 +928,13 @@ fn setup_event_listener(
                 }
                 PlayerUiEvent::StatusMessage(msg) => {
                     let toast = Toast::new(&msg);
+                    toast.set_use_markup(false);
                     toast_overlay.add_toast(toast);
                 }
                 PlayerUiEvent::Error(err) => {
+                    // текст ошибки может содержать «<host>» и подобное: разметку отключаем, иначе тост не показывается
                     let toast = Toast::new(&format!("Ошибка: {}", err));
+                    toast.set_use_markup(false);
                     toast_overlay.add_toast(toast);
                 }
                 _ => {}
