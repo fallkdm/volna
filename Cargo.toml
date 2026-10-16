@@ -27,6 +27,10 @@ gstreamer-app = "0.25"
 [target.'cfg(target_os = "linux")'.dependencies]
 mpris-server = { version = "0.10", features = ["tokio"] }
 
+[target.'cfg(windows)'.dependencies]
+souvlaki = { version = "0.8", default-features = false }
+gdk4-win32 = "0.9"
+
 [build-dependencies]
 glib-build-tools = "0.22"
 

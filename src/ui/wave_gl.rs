@@ -172,6 +172,7 @@ fn epoxy_library() -> Option<&'static libloading::Library> {
 /// Достаёт функции OpenGL через libepoxy (кроссплатформенно: EGL на Wayland, GLX/EGL на X11, WGL на Windows).
 /// В libepoxy символы `epoxy_<name>` являются элементами глобальной таблицы диспетчеризации
 /// и требуют однократного разыменования указателя для получения адреса вызова в текущем GL-контексте.
+#[allow(unused_unsafe)]
 fn load_gl() -> Option<glow::Context> {
     // VOLNA_NO_GL=1 имитирует отсутствие OpenGL: так проверяют запасной фон
     if std::env::var_os("VOLNA_NO_GL").is_some() {
@@ -183,11 +184,9 @@ fn load_gl() -> Option<glow::Context> {
             let symbol = format!("epoxy_{name}\0");
             library
                 .get::<*const std::ffi::c_void>(symbol.as_bytes())
-                .map(|sym| {
-                    let entry = sym.try_as_raw_ptr().unwrap() as *const *const std::ffi::c_void;
-                    *entry
-                })
-                .unwrap_or(std::ptr::null())
+                .ok()
+                .and_then(|sym| sym.try_as_raw_ptr())
+                .map_or(std::ptr::null(), |ptr| unsafe { *(ptr as *const *const std::ffi::c_void) })
         })
     };
     Some(ctx)

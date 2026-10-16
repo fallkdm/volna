@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod cache;
+pub mod media_controls;
 pub mod mpris;
 pub mod player;
 pub mod ui;
@@ -92,11 +93,9 @@ fn main() {
         // Инициализируем плеер со связкой каналов
         match PlayerManager::new(client, vec![ui_tx, mpris_tx]) {
             Ok(player) => {
-                // Запускаем системный MPRIS2 D-Bus сервер
-                mpris::spawn_mpris_server(player.clone(), mpris_rx);
-
-                // Создаем и отображаем главное окно приложения
-                let window = VolnaWindow::new(app, player, ui_rx);
+                // Создаем главное окно и подключаем системные медиаклавиши (MPRIS / SMTC)
+                let window = VolnaWindow::new(app, player.clone(), ui_rx);
+                media_controls::start(&window.window, player, mpris_rx);
                 window.present();
             }
             Err(e) => {
