@@ -578,3 +578,43 @@ toast {
   color: alpha(white, 0.45);
 }
 .explicit-badge.hero { font-size: 14px; border-radius: 8px; min-width: 22px; min-height: 22px; }
+
+.liked-heart {
+    color: #ff6b4a;
+}
+
+.new-playlist-cover {
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+}
+
+.new-playlist-plus {
+    font-size: 48px;
+    font-weight: 300;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.playlist-desc {
+    padding-left: 0;
+    padding-right: 0;
+}
+
+/* кнопка загрузки обложки видна, только когда курсор над обложкой */
+.cover-upload {
+    background: rgba(0, 0, 0, 0.72);
+    color: #ffffff;
+    border-radius: 9999px;
+    padding: 8px 16px;
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity 150ms ease;
+}
+
+.cover-overlay:hover .cover-upload,
+.cover-upload:focus {
+    opacity: 1;
+}
+
+.cover-upload:hover {
+    background: rgba(0, 0, 0, 0.88);
+}

@@ -2,13 +2,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
+use libadwaita::prelude::*;
 use gtk4::{
     glib, Align, Box as GtkBox, Button, Label, ListBox, Orientation, ScrolledWindow,
     SelectionMode, Stack,
 };
 
-use super::collection::{album_tile, clear_box, playlist_tile, section_title, tile_row, track_row, DetailPage};
-use crate::player::PlayerManager;
+use super::collection::{album_tile, ask_playlist_name, clear_box, ensure_liked, new_playlist_tile, open_playlist, playlist_tile, section_title, tile_row, track_actions, track_row, DetailPage};
+use crate::api::models::Playlist;
+use crate::player::{PlayerManager, PlayerUiEvent};
 
 pub struct LibraryViewWidgets {
     pub container: GtkBox,
@@ -33,6 +35,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
         DetailPage::new(player, move || stack.set_visible_child_name("main"))
     };
     stack.add_named(&page.widget, Some("detail"));
+    page.set_nav(&stack);
 
     let main = GtkBox::new(Orientation::Vertical, 26);
     let heading = Label::new(Some("Коллекция"));
@@ -80,6 +83,16 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
         });
     }
 
+    // Загруженные треки: играют без интернета
+    let offline_list = ListBox::new();
+    offline_list.add_css_class("boxed-list");
+    offline_list.set_selection_mode(SelectionMode::None);
+    let offline_box = GtkBox::new(Orientation::Vertical, 10);
+    offline_box.append(&section_title("Загруженные"));
+    offline_box.append(&offline_list);
+    offline_box.set_visible(false);
+    main.append(&offline_box);
+
     // Плейлисты и любимые альбомы
     let (playlists_scroll, playlists_row) = tile_row();
     let playlists_box = GtkBox::new(Orientation::Vertical, 10);
@@ -113,6 +126,18 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 (liked_box.clone(), liked_count.clone(), liked_list.clone(), liked_tracks.clone());
             let (playlists_box, playlists_row) = (playlists_box.clone(), playlists_row.clone());
             let (albums_box, albums_row) = (albums_box.clone(), albums_row.clone());
+            let (offline_box, offline_list) = (offline_box.clone(), offline_list.clone());
+
+            // офлайн-треки показываются сразу и без сети
+            offline_list.remove_all();
+            let saved = crate::cache::list_offline();
+            for (i, track) in saved.iter().enumerate() {
+                let (p, queue) = (p.clone(), saved.clone());
+                let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play(queue.clone(), i) });
+                row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
+                offline_list.append(&row);
+            }
+            offline_box.set_visible(!saved.is_empty());
 
             glib::spawn_future_local(async move {
                 let client = p.client.lock().unwrap().clone();
@@ -132,24 +157,29 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 status.set_text("");
                 status.set_visible(false);
 
+                ensure_liked(&p).await;
                 if let Ok(tracks) = client.get_liked_tracks(&uid).await {
                     liked_count.set_text(&format!("{} треков", tracks.len()));
                     liked_list.remove_all();
                     for (i, track) in tracks.iter().take(LIKED_PREVIEW).enumerate() {
                         let (p, queue) = (p.clone(), tracks.clone());
-                        liked_list.append(&track_row(track, move || p.set_queue_and_play(queue.clone(), i)));
+                        let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play(queue.clone(), i) });
+                        row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
+                        liked_list.append(&row);
                     }
                     liked_box.set_visible(!tracks.is_empty());
                     *liked_tracks.borrow_mut() = tracks;
                 }
 
-                if let Ok(playlists) = client.get_user_playlists(&uid).await {
-                    clear_box(&playlists_row);
-                    for pl in &playlists {
-                        playlists_row.append(&playlist_tile(&p, &stack, &page, pl, TILE_SIZE));
-                    }
-                    playlists_box.set_visible(!playlists.is_empty());
+                {
+                    let (p, stack2, page2, row, uid) = (p.clone(), stack.clone(), page.clone(), playlists_row.clone(), uid.clone());
+                    page.set_on_removed(move || {
+                        let (p, stack, page, row, uid) = (p.clone(), stack2.clone(), page2.clone(), row.clone(), uid.clone());
+                        glib::spawn_future_local(async move { fill_playlists(&p, &stack, &page, &row, &uid).await });
+                    });
                 }
+                fill_playlists(&p, &stack, &page, &playlists_row, &uid).await;
+                playlists_box.set_visible(true);
 
                 if let Ok(albums) = client.get_liked_albums(&uid).await {
                     clear_box(&albums_row);
@@ -163,4 +193,36 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     }
 
     LibraryViewWidgets { container }
+}
+
+/// Плитка создания и плейлисты пользователя; после создания список перерисовывается
+async fn fill_playlists(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, row: &GtkBox, uid: &str) {
+    let client = p.client.lock().unwrap().clone();
+    let playlists = client.get_user_playlists(uid).await.unwrap_or_default();
+    clear_box(row);
+    let (p2, stack2, page2, row2, uid2) = (p.clone(), stack.clone(), page.clone(), row.clone(), uid.to_string());
+    let new_tile = new_playlist_tile(TILE_SIZE, {
+        let anchor = row.clone();
+        move || {
+            let (p, stack, page, row, uid) = (p2.clone(), stack2.clone(), page2.clone(), row2.clone(), uid2.clone());
+            ask_playlist_name(&anchor, move |name| {
+                glib::spawn_future_local(async move {
+                    let client = p.client.lock().unwrap().clone();
+                    match client.create_playlist(&uid, &name).await {
+                        Ok(kind) => {
+                            // у нового плейлиста сразу открывается его страница
+                            let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), og_image: None };
+                            open_playlist(&p, &stack, &page, &pl);
+                            fill_playlists(&p, &stack, &page, &row, &uid).await
+                        }
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось создать плейлист: {}", e))),
+                    }
+                });
+            });
+        }
+    });
+    row.append(&new_tile);
+    for pl in &playlists {
+        row.append(&playlist_tile(p, stack, page, pl, TILE_SIZE));
+    }
 }

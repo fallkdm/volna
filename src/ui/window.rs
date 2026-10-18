@@ -740,16 +740,16 @@ fn setup_event_listener(
                         format!("{} • {}", artists, album)
                     };
 
-                    wave_view.title_label.set_text(&track.title);
+                    wave_view.title_label.set_markup(&track.title_markup());
                     wave_view.explicit_badge.set_visible(track.is_explicit());
                     wave_view.artist_label.set_text(&subtitle);
                     wave_view.update_track_colors(&track);
 
-                    island.title_label.set_text(&track.title);
+                    island.title_label.set_markup(&track.title_markup());
                     island.explicit_badge.set_visible(track.is_explicit());
                     island.artist_label.set_text(&artists);
 
-                    k_track_title.set_text(&track.title);
+                    k_track_title.set_markup(&track.title_markup());
                     k_explicit.set_visible(track.is_explicit());
                     k_track_artist.set_text(&artists);
 

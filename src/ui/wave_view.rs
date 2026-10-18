@@ -343,7 +343,7 @@ pub fn create_wave_view(
             options: vec![
                 RotorFilterOption {
                     label: "⚡ Энергичное",
-                    mood: Some("energetic"),
+                    mood: Some("active"),
                     lang: None,
                     charac: None,
                     color: [1.0, 0.42, 0.29],
@@ -410,14 +410,14 @@ pub fn create_wave_view(
                 RotorFilterOption {
                     label: "🌐 Иностранный",
                     mood: None,
-                    lang: Some("foreign"),
+                    lang: Some("not-russian"),
                     charac: None,
                     color: [0.12, 0.68, 0.82],
                 },
                 RotorFilterOption {
                     label: "🎵 Без слов",
                     mood: None,
-                    lang: Some("instrumental"),
+                    lang: Some("without-words"),
                     charac: None,
                     color: [0.55, 0.35, 0.75],
                 },
@@ -425,8 +425,12 @@ pub fn create_wave_view(
         },
     ];
 
+    // выбор по одному пункту в каждом разделе (настроение, характер, язык); разделы сочетаются
+    type Pick = Option<(&'static str, &'static str, [f64; 3])>;
+    let selection: Rc<RefCell<[Pick; 3]>> = Rc::new(RefCell::new([None; 3]));
+    let slot_buttons: Rc<RefCell<Vec<(Button, usize, &'static str)>>> = Rc::default();
+
     for (s_idx, section) in sections.into_iter().enumerate() {
-        let _ = s_idx;
         let section_flow = gtk4::FlowBox::new();
         section_flow.set_selection_mode(gtk4::SelectionMode::None);
         section_flow.set_max_children_per_line(4);
@@ -453,34 +457,46 @@ pub fn create_wave_view(
             let player_clone = player.clone();
             let accent_clone = accent_color.clone();
             let da_weak = drawing_area.downgrade();
-            let pop_weak = popover.downgrade();
             let (pill_label_clone, pill_clone) = (pill_label.clone(), filter_pill.clone());
-            let buttons_clone = option_buttons.clone();
             let shader_state_clone = shader_state.clone();
 
             let opt_label = opt.label;
-            let mood_val = opt.mood.map(|s| s.to_string());
-            let lang_val = opt.lang.map(|s| s.to_string());
-            let char_val = opt.charac.map(|s| s.to_string());
+            let opt_value = opt.mood.or(opt.lang).or(opt.charac).unwrap_or_default();
             let rgb = opt.color;
+            slot_buttons.borrow_mut().push((btn.clone(), s_idx, opt_value));
+            let selection_clone = selection.clone();
+            let slot_buttons_clone = slot_buttons.clone();
 
-            btn.connect_clicked(move |clicked| {
-                if let Some(pop) = pop_weak.upgrade() {
-                    pop.set_visible(false);
-                }
-                pill_label_clone.set_text(opt_label);
-                pill_clone.set_visible(true);
-                for b in buttons_clone.borrow().iter() {
-                    b.remove_css_class("selected");
-                }
-                clicked.add_css_class("selected");
-                *accent_clone.borrow_mut() = rgb;
+            btn.connect_clicked(move |_| {
+                // повторный клик по выбранному пункту снимает его
+                let (mood_val, char_val, lang_val, core) = {
+                    let mut sel = selection_clone.borrow_mut();
+                    let same = sel[s_idx].map(|p| p.0) == Some(opt_value);
+                    sel[s_idx] = if same { None } else { Some((opt_value, opt_label, rgb)) };
+                    for (b, slot, val) in slot_buttons_clone.borrow().iter() {
+                        if sel[*slot].map(|p| p.0) == Some(*val) {
+                            b.add_css_class("selected");
+                        } else {
+                            b.remove_css_class("selected");
+                        }
+                    }
+                    let labels: Vec<&str> = sel.iter().flatten().map(|p| p.1).collect();
+                    pill_label_clone.set_text(&labels.join(" · "));
+                    pill_clone.set_visible(!labels.is_empty());
+                    // цвет фона: последний выбранный пункт, иначе стандартный оранжевый
+                    let core = if same {
+                        sel.iter().flatten().last().map(|p| p.2).unwrap_or([0.95, 0.42, 0.02])
+                    } else {
+                        rgb
+                    };
+                    (sel[0].map(|p| p.0.to_string()), sel[1].map(|p| p.0.to_string()), sel[2].map(|p| p.0.to_string()), core)
+                };
+                *accent_clone.borrow_mut() = core;
                 if let Some(da) = da_weak.upgrade() {
                     da.queue_draw();
                 }
 
                 // Плавный перелив цветов шейдера под выбранный фильтр
-                let core = rgb;
                 let deep = [core[0] * 0.35, core[1] * 0.35, core[2] * 0.35];
                 let ridge = [
                     (core[0] * 0.6 + 0.4).min(1.0),
@@ -489,11 +505,7 @@ pub fn create_wave_view(
                 ];
                 shader_state_clone.borrow_mut().set_target_colors(core, deep, ridge);
 
-                player_clone.apply_rotor_filter(
-                    mood_val.clone(),
-                    lang_val.clone(),
-                    char_val.clone(),
-                );
+                player_clone.apply_rotor_filter(mood_val, lang_val, char_val);
             });
 
             section_flow.append(&btn);
@@ -517,6 +529,7 @@ pub fn create_wave_view(
         let pop_weak = popover.downgrade();
         let pill_clone = filter_pill.clone();
         let buttons_clone = option_buttons.clone();
+        let selection_clone = selection.clone();
         let shader_state_clone = shader_state.clone();
 
         let reset_filters: Rc<dyn Fn()> = Rc::new(move || {
@@ -524,6 +537,7 @@ pub fn create_wave_view(
                 pop.set_visible(false);
             }
             pill_clone.set_visible(false);
+            *selection_clone.borrow_mut() = [None; 3];
             for b in buttons_clone.borrow().iter() {
                 b.remove_css_class("selected");
             }

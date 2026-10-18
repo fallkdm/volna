@@ -101,6 +101,9 @@ pub struct Track {
     #[serde(deserialize_with = "deserialize_id")]
     pub id: String,
     pub title: String,
+    /// Пометка версии рядом с названием: «Slowed», «Remix», «Live»
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(default)]
     pub artists: Vec<Artist>,
     #[serde(default)]
@@ -174,6 +177,15 @@ impl DerivedColors {
 }
 
 impl Track {
+    /// Название для Pango-разметки: версия («Slowed») идёт следом приглушённым цветом
+    pub fn title_markup(&self) -> String {
+        let t = gtk4::glib::markup_escape_text(&self.title);
+        match self.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => format!("{} <span alpha=\"55%\">{}</span>", t, gtk4::glib::markup_escape_text(v)),
+            None => t.to_string(),
+        }
+    }
+
     /// Трек с пометкой «explicit» (нецензурная лексика)
     pub fn is_explicit(&self) -> bool {
         self.content_warning.as_deref() == Some("explicit")

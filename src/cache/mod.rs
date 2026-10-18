@@ -127,3 +127,86 @@ pub fn clear_clips_cache() -> u64 {
     }
     freed
 }
+
+// ================= Офлайн-треки =================
+// Лежат в данных приложения (~/.local/share/volna/offline), а не в кэше: «Очистить память» их не трогает.
+
+use crate::api::models::Track;
+
+fn offline_dir() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".local").join("share")
+    });
+    let dir = base.join("volna").join("offline");
+    let _ = create_dir_all(&dir);
+    dir
+}
+
+fn safe_id(id: &str) -> String {
+    id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
+}
+
+/// Путь к сохранённому mp3, если трек есть офлайн
+pub fn offline_audio_path(track_id: &str) -> Option<PathBuf> {
+    let p = offline_dir().join(format!("{}.mp3", safe_id(track_id)));
+    p.exists().then_some(p)
+}
+
+/// Сохраняет аудио и описание трека; описание пишется последним, по нему трек считается сохранённым
+pub fn save_offline(track: &Track, audio: &[u8]) -> std::io::Result<()> {
+    let base = offline_dir().join(safe_id(&track.id));
+    let part = base.with_extension("part");
+    std::fs::write(&part, audio)?;
+    std::fs::rename(&part, base.with_extension("mp3"))?;
+    std::fs::write(base.with_extension("json"), serde_json::to_vec(track).map_err(std::io::Error::other)?)
+}
+
+pub fn remove_offline(track_id: &str) {
+    let base = offline_dir().join(safe_id(track_id));
+    for ext in ["json", "mp3", "part"] {
+        let _ = std::fs::remove_file(base.with_extension(ext));
+    }
+}
+
+/// Все сохранённые треки (новые первыми)
+pub fn list_offline() -> Vec<Track> {
+    let mut items: Vec<(std::time::SystemTime, Track)> = std::fs::read_dir(offline_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let track: Track = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+            offline_audio_path(&track.id)?;
+            Some((e.metadata().ok()?.modified().ok()?, track))
+        })
+        .collect();
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Размер офлайн-треков в байтах
+pub fn offline_size() -> u64 {
+    std::fs::read_dir(offline_dir()).into_iter().flatten().flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
+}
+
+#[cfg(test)]
+mod offline_tests {
+    use super::*;
+
+    #[test]
+    fn offline_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("volna-offline-{}", std::process::id()));
+        // SAFETY: единственный тест, трогающий окружение, и он выполняется до первого обращения к каталогу
+        unsafe { std::env::set_var("XDG_DATA_HOME", &tmp) };
+        let track: Track = serde_json::from_value(serde_json::json!({"id": "7", "title": "T", "artists": []})).unwrap();
+        assert!(offline_audio_path("7").is_none());
+        save_offline(&track, b"abc").unwrap();
+        assert!(offline_audio_path("7").is_some());
+        assert_eq!(list_offline().len(), 1);
+        remove_offline("7");
+        assert!(list_offline().is_empty());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}

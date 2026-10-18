@@ -509,6 +509,11 @@ impl PlayerManager {
         self.start_station(station, Some(track), label);
     }
 
+    /// Запускает «Волну по плейлисту»
+    pub fn play_playlist_wave(&self, uid: &str, kind: &str, title: &str) {
+        self.start_station(format!("playlist:{}_{}", uid, kind), None, format!("По плейлисту: {}", title));
+    }
+
     /// Запускает «Волну по артисту»
     pub fn play_artist_wave(&self, artist_id: &str, artist_name: &str) {
         self.start_station(format!("artist:{}", artist_id), None, format!("По артисту: {}", artist_name));
@@ -715,6 +720,15 @@ impl PlayerManager {
         crate::api::history::save_last_track(track);
         self.state.lock().unwrap().restored = false;
 
+        // сохранённый офлайн трек играет с диска: без сети и без токена
+        if let Some(path) = crate::cache::offline_audio_path(&track_id) {
+            audio_clone.play_url(&gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(path)));
+            emit_all(&senders, PlayerUiEvent::LoadingState(false));
+            emit_all(&senders, PlayerUiEvent::StreamQuality("Офлайн".to_string()));
+            emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
+            return;
+        }
+
         tokio::spawn(async move {
             if client.has_token() {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
@@ -747,7 +761,7 @@ impl PlayerManager {
     /// Запрашивает новую порцию треков Волны с заданным тегом/фильтром
     pub fn fetch_wave_tracks(&self, station_tag: &str) {
         let (mood, lang, charac) = match station_tag {
-            "energetic" => (Some("energetic"), None, None),
+            "energetic" => (Some("active"), None, None),
             "calm" => (Some("calm"), None, None),
             "russian" => (None, Some("russian"), None),
             "discover" => (None, None, Some("discover")),
@@ -936,7 +950,7 @@ fn next_repeat(mode: RepeatMode, wave: bool) -> RepeatMode {
 /// узнаём его по названию и исполнителям
 fn track_key(t: &Track) -> String {
     let artists: Vec<String> = t.artists.iter().map(|a| a.name.trim().to_lowercase()).collect();
-    format!("{}|{}", t.title.trim().to_lowercase(), artists.join(","))
+    format!("{}|{}|{}", t.title.trim().to_lowercase(), t.version.as_deref().unwrap_or("").trim().to_lowercase(), artists.join(","))
 }
 
 /// Оставляет в `new` только треки, которых ещё нет в `existing` и среди самих `new`

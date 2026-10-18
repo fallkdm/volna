@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
+use libadwaita::prelude::*;
 use libadwaita::ActionRow;
 use gtk4::{
     glib, Align, Box as GtkBox, Button, FlowBox, Label, ListBox, Orientation, ScrolledWindow, SearchEntry,
@@ -9,7 +10,7 @@ use gtk4::{
 };
 
 use super::collection::{
-    album_tile, artist_tile, clear_box, item_row, open_album, open_artist, open_playlist, open_track, playlist_tile, section_title, track_row, DetailPage,
+    album_tile, artist_tile, clear_box, ensure_liked, track_actions, item_row, open_album, open_artist, open_playlist, open_track, playlist_tile, section_title, track_row, DetailPage,
 };
 use crate::api::history::{clear_history, load_history, push_history, HistoryItem};
 use crate::api::models::{Album, SearchResult, Track};
@@ -50,12 +51,17 @@ impl Section {
 fn history_row(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, item: &HistoryItem) -> ActionRow {
     let (p, stack, page, it) = (p.clone(), stack.clone(), page.clone(), item.clone());
     match item {
-        HistoryItem::Track(t) => track_row(t, move || {
-            push_history(it.clone());
-            if let HistoryItem::Track(t) = &it {
-                p.play_single_track(t.clone());
-            }
-        }),
+        HistoryItem::Track(t) => {
+            let actions = track_actions(&p, Some((&stack, &page)), t);
+            let row = track_row(t, move || {
+                push_history(it.clone());
+                if let HistoryItem::Track(t) = &it {
+                    p.play_single_track(t.clone());
+                }
+            });
+            row.add_suffix(&actions);
+            row
+        }
         HistoryItem::Artist(a) => item_row(&a.name, "Исполнитель", a.cover_url(100), true, move || {
             push_history(it.clone());
             if let HistoryItem::Artist(a) = &it {
@@ -108,6 +114,7 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         DetailPage::new(player, move || stack.set_visible_child_name("main"))
     };
     stack.add_named(&page.widget, Some("detail"));
+    page.set_nav(&stack);
 
     let search_entry = SearchEntry::new();
     search_entry.set_placeholder_text(Some("Поиск треков, альбомов, плейлистов..."));
@@ -309,12 +316,18 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
                 let playlists = result.playlists.map(|s| s.results).unwrap_or_default();
 
                 // Клик по треку: он играет, дальше «Волна по треку»
+                ensure_liked(&p).await;
+                if seq.get() != my_seq {
+                    return;
+                }
                 for track in &tracks {
-                    let (p, t) = (p.clone(), track.clone());
-                    tracks_list.append(&track_row(track, move || {
+                    let (p2, t) = (p.clone(), track.clone());
+                    let row = track_row(track, move || {
                         push_history(HistoryItem::Track(t.clone()));
-                        p.play_single_track(t.clone());
-                    }));
+                        p2.play_single_track(t.clone());
+                    });
+                    row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
+                    tracks_list.append(&row);
                 }
                 for artist in &artists {
                     let tile = artist_tile(&p, &stack, &page, artist, TILE_SIZE);

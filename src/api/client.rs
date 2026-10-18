@@ -65,6 +65,14 @@ enum LrclibFetch {
 }
 
 /// Клиент для работы с API Яндекс Музыки
+/// Сведения о плейлисте для страницы своего плейлиста
+pub struct PlaylistMeta {
+    pub private: bool,
+    pub description: String,
+    pub owner: String,
+    pub modified: String,
+}
+
 #[derive(Clone)]
 pub struct YandexMusicClient {
     client: reqwest::Client,
@@ -127,21 +135,20 @@ impl YandexMusicClient {
         language: Option<&str>,
         character: Option<&str>,
     ) -> Result<RotorStationTracks, ApiError> {
-        let mut url = format!("{}/rotor/station/{}/tracks", self.base_url, station_id);
-        let mut query_params = Vec::new();
-        if let Some(m) = mood {
-            query_params.push(format!("mood={}", m));
+        // фильтры Ротор принимает отдельным запросом настроек, а не параметрами /tracks
+        if station_id == "user:onyourwave" {
+            let body = serde_json::json!({
+                "moodEnergy": mood.unwrap_or("all"),
+                "diversity": character.unwrap_or("default"),
+                "language": language.unwrap_or("any"),
+            });
+            let settings_url = format!("{}/rotor/station/{}/settings2", self.base_url, station_id);
+            let r = self.client.post(&settings_url).headers(self.headers()).json(&body).send().await?;
+            if !r.status().is_success() {
+                eprintln!("rotor settings2: HTTP {}", r.status());
+            }
         }
-        if let Some(l) = language {
-            query_params.push(format!("language={}", l));
-        }
-        if let Some(c) = character {
-            query_params.push(format!("diversity={}", c));
-        }
-        if !query_params.is_empty() {
-            url.push('?');
-            url.push_str(&query_params.join("&"));
-        }
+        let url = format!("{}/rotor/station/{}/tracks", self.base_url, station_id);
 
         let resp = self
             .client
@@ -270,6 +277,208 @@ impl YandexMusicClient {
             .and_then(serde_json::from_value)
             .map_err(|e| ApiError::InvalidResponse(format!("{} ({})", e, path)))?;
         Ok(api_response.result)
+    }
+
+    /// POST формой (`application/x-www-form-urlencoded`) с разбором `result` как JSON
+    async fn post_form(&self, path: &str, form: &[(&str, String)]) -> Result<serde_json::Value, ApiError> {
+        let body = form
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut headers = self.headers();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+        }
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        Ok(v.get("result").cloned().unwrap_or_default())
+    }
+
+    /// Идентификаторы треков из «Мне нравится»
+    pub async fn get_liked_track_ids(&self, uid: &str) -> Result<Vec<String>, ApiError> {
+        let v: serde_json::Value = self.get_result(&format!("/users/{}/likes/tracks", uid)).await?;
+        Ok(v["library"]["tracks"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|t| t["id"].as_str().map(String::from).or_else(|| t["id"].as_u64().map(|n| n.to_string()))).collect())
+            .unwrap_or_default())
+    }
+
+    /// Поставить или снять «Мне нравится»
+    pub async fn set_track_like(&self, uid: &str, track_id: &str, like: bool) -> Result<(), ApiError> {
+        let action = if like { "add-multiple" } else { "remove" };
+        self.post_form(&format!("/users/{}/likes/tracks/{}", uid, action), &[("track-ids", track_id.to_string())]).await?;
+        Ok(())
+    }
+
+    /// «Не нравится» на трек
+    pub async fn dislike_track(&self, uid: &str, track_id: &str) -> Result<(), ApiError> {
+        self.post_form(&format!("/users/{}/dislikes/tracks/add-multiple", uid), &[("track-ids", track_id.to_string())]).await?;
+        Ok(())
+    }
+
+    /// Создаёт приватный плейлист и возвращает его `kind`
+    pub async fn create_playlist(&self, uid: &str, title: &str) -> Result<String, ApiError> {
+        let r = self
+            .post_form(
+                &format!("/users/{}/playlists/create", uid),
+                &[("title", title.to_string()), ("visibility", "private".to_string())],
+            )
+            .await?;
+        match &r["kind"] {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Number(n) => Ok(n.to_string()),
+            _ => Err(ApiError::InvalidResponse("в ответе нет номера нового плейлиста".into())),
+        }
+    }
+
+    /// Приватность, описание, владелец и дата изменения плейлиста
+    pub async fn get_playlist_meta(&self, uid: &str, kind: &str) -> Result<PlaylistMeta, ApiError> {
+        let v: serde_json::Value = self.get_result(&format!("/users/{}/playlists/{}", uid, kind)).await?;
+        let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
+        Ok(PlaylistMeta {
+            private: v["visibility"].as_str() == Some("private"),
+            description: text("description"),
+            owner: v["owner"]["name"].as_str().or(v["owner"]["login"].as_str()).unwrap_or("").to_string(),
+            modified: text("modified"),
+        })
+    }
+
+    /// Раздел «О треке»: пары (заголовок, значение) — исполнитель, авторы, лейбл, источник
+    pub async fn get_track_credits(&self, track_id: &str) -> Result<Vec<(String, String)>, ApiError> {
+        let v: serde_json::Value = self.get_result(&format!("/tracks/{}/credits", track_id)).await?;
+        Ok(v["credits"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|c| Some((c["title"].as_str()?.to_string(), c["value"].as_str()?.to_string()))).collect())
+            .unwrap_or_default())
+    }
+
+    /// Загружает обложку плейлиста (multipart, поле `image`); возвращает адрес новой обложки
+    pub async fn upload_playlist_cover(&self, uid: &str, kind: &str, file_name: &str, mime: &str, data: Vec<u8>) -> Result<Option<String>, ApiError> {
+        let boundary = "----volna7e1f0c2a";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{file_name}\"\r\nContent-Type: {mime}\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let mut headers = self.headers();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).map_err(|e| ApiError::InvalidResponse(e.to_string()))?,
+        );
+        let resp = self
+            .client
+            .post(format!("{}/users/{}/playlists/{}/cover/upload", self.base_url, uid, kind))
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() || v.get("error").is_some() {
+            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, v["error"]["name"].as_str().unwrap_or(""))));
+        }
+        Ok(v["result"]["ogImage"].as_str().or(v["result"]["cover"]["uri"].as_str()).map(String::from))
+    }
+
+    /// Переименовывает плейлист
+    pub async fn rename_playlist(&self, uid: &str, kind: &str, title: &str) -> Result<(), ApiError> {
+        self.post_form(&format!("/users/{}/playlists/{}/name", uid, kind), &[("value", title.to_string())]).await?;
+        Ok(())
+    }
+
+    /// Скачивает mp3 трека целиком
+    pub async fn download_track_bytes(&self, track_id: &str) -> Result<Vec<u8>, ApiError> {
+        let (url, _) = self.get_track_direct_url(track_id).await?;
+        Ok(self.client.get(&url).send().await?.error_for_status()?.bytes().await?.to_vec())
+    }
+
+    /// Сохраняет трек для прослушивания без интернета (внутри приложения)
+    pub async fn save_track_offline(&self, track: &Track) -> Result<(), ApiError> {
+        let bytes = self.download_track_bytes(&track.id).await?;
+        crate::cache::save_offline(track, &bytes).map_err(|e| ApiError::InvalidResponse(e.to_string()))
+    }
+
+    /// Скачивает трек в `~/Music/Волна` и возвращает путь к файлу
+    pub async fn download_track(&self, track: &Track) -> Result<std::path::PathBuf, ApiError> {
+        let bytes = self.download_track_bytes(&track.id).await?;
+        let home = std::env::var("HOME").map_err(|e| ApiError::InvalidResponse(e.to_string()))?;
+        let dir = std::path::Path::new(&home).join("Music").join("Волна");
+        std::fs::create_dir_all(&dir).map_err(|e| ApiError::InvalidResponse(e.to_string()))?;
+        let name: String = format!("{} - {}", track.artists_string(), track.title)
+            .chars()
+            .map(|c| if "/\\:*?\"<>|".contains(c) { '_' } else { c })
+            .collect();
+        let path = dir.join(format!("{}.mp3", name));
+        std::fs::write(&path, &bytes).map_err(|e| ApiError::InvalidResponse(e.to_string()))?;
+        Ok(path)
+    }
+
+    /// Ключи `uid:kind` понравившихся плейлистов
+    pub async fn get_liked_playlist_keys(&self, uid: &str) -> Result<Vec<String>, ApiError> {
+        let v: serde_json::Value = self.get_result(&format!("/users/{}/likes/playlists", uid)).await?;
+        let id = |x: &serde_json::Value| x.as_str().map(String::from).or_else(|| x.as_u64().map(|n| n.to_string())).unwrap_or_default();
+        Ok(v.as_array()
+            .map(|a| a.iter().map(|i| format!("{}:{}", id(&i["playlist"]["uid"]), id(&i["playlist"]["kind"]))).collect())
+            .unwrap_or_default())
+    }
+
+    /// Поставить или снять «Нравится» плейлисту (`key` вида `uid:kind`)
+    pub async fn set_playlist_like(&self, uid: &str, key: &str, like: bool) -> Result<(), ApiError> {
+        let action = if like { "add-multiple" } else { "remove" };
+        self.post_form(&format!("/users/{}/likes/playlists/{}", uid, action), &[("playlist-ids", key.to_string())]).await?;
+        Ok(())
+    }
+
+    pub async fn set_playlist_description(&self, uid: &str, kind: &str, text: &str) -> Result<(), ApiError> {
+        self.post_form(&format!("/users/{}/playlists/{}/description", uid, kind), &[("value", text.to_string())]).await?;
+        Ok(())
+    }
+
+    pub async fn set_playlist_private(&self, uid: &str, kind: &str, private: bool) -> Result<(), ApiError> {
+        let value = if private { "private" } else { "public" };
+        self.post_form(&format!("/users/{}/playlists/{}/visibility", uid, kind), &[("value", value.to_string())]).await?;
+        Ok(())
+    }
+
+    pub async fn delete_playlist(&self, uid: &str, kind: &str) -> Result<(), ApiError> {
+        self.post_form(&format!("/users/{}/playlists/{}/delete", uid, kind), &[]).await?;
+        Ok(())
+    }
+
+    /// Добавляет трек в начало плейлиста
+    pub async fn add_track_to_playlist(&self, uid: &str, kind: &str, track: &Track) -> Result<(), ApiError> {
+        self.add_tracks_to_playlist(uid, kind, std::slice::from_ref(track)).await
+    }
+
+    /// Добавляет треки в начало плейлиста одним изменением
+    pub async fn add_tracks_to_playlist(&self, uid: &str, kind: &str, tracks: &[Track]) -> Result<(), ApiError> {
+        let pl: serde_json::Value = self.get_result(&format!("/users/{}/playlists/{}", uid, kind)).await?;
+        let revision = pl["revision"].as_u64().unwrap_or(1);
+        let items: Vec<_> = tracks
+            .iter()
+            .map(|t| serde_json::json!({"id": t.id, "albumId": t.albums.first().map(|a| a.id.clone()).unwrap_or_default()}))
+            .collect();
+        let diff = serde_json::json!([{"op": "insert", "at": 0, "tracks": items}]);
+        self.post_form(
+            &format!("/users/{}/playlists/{}/change", uid, kind),
+            &[("diff", diff.to_string()), ("revision", revision.to_string())],
+        )
+        .await?;
+        Ok(())
     }
 
     /// Поиск по запросу: треки, альбомы и плейлисты
