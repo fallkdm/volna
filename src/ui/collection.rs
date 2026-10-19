@@ -1382,12 +1382,12 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
         }));
     }
     {
-        let (p, id) = (player.clone(), track.id.clone());
+        let (p, t) = (player.clone(), track.clone());
         add("video-x-generic-symbolic", "Трейлер", Box::new(move || {
-            let (p, id) = (p.clone(), id.clone());
+            let (p, t) = (p.clone(), t.clone());
             glib::spawn_future_local(async move {
                 let client = p.client.lock().unwrap().clone();
-                match client.get_track_clip_url(&id).await {
+                match client.get_clip_url_for_track(&t).await {
                     // клип открывается в системном проигрывателе
                     Some(url) => {
                         let _ = std::process::Command::new("xdg-open").arg(url).spawn();

@@ -23,6 +23,11 @@ pub struct FloatingIslandWidgets {
     pub total_time_label: Label,
     pub volume_scale: Scale,
     pub karaoke_btn: Button,
+    /// Значок громкости и всплывающий ползунок; окно ползунка добавляется оверлеем окна (`wire_volume_popup`)
+    pub volume_btn: Button,
+    pub volume_popup: GtkBox,
+    /// Выбор Яндекс Станции; класс `cast-active`, когда станция привязана
+    pub cast_btn: gtk4::MenuButton,
     pub quality_badge: Label,
     pub repeat_btn: Button,
     /// Цифра «1» поверх значка повтора: видна в режиме «один трек»
@@ -232,29 +237,65 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     }
     right_box.append(&repeat_btn);
 
+    let cast_btn = build_cast_button(player);
+    right_box.append(&cast_btn);
+
     let quality_badge = Label::new(Some("MP3"));
     quality_badge.add_css_class("lossless-badge");
     quality_badge.set_valign(Align::Center);
     right_box.append(&quality_badge);
 
-    // Громкость
-    let volume_box = GtkBox::new(Orientation::Horizontal, 8);
-    volume_box.set_valign(Align::Center);
-    let vol_icon = Image::from_icon_name("audio-volume-high-symbolic");
-    vol_icon.add_css_class("island-volume-icon");
-    volume_box.append(&vol_icon);
-
+    // Громкость: только значок, ползунок всплывает над ним при наведении (как в Яндекс Музыке).
+    // Всплывающее окно рисуется внутри окна приложения (оверлеем), а не отдельным окном: оно не выходит за края.
     let vol_adj = Adjustment::new(85.0, 0.0, 100.0, 1.0, 10.0, 0.0);
-    let volume_scale = Scale::new(Orientation::Horizontal, Some(&vol_adj));
+    let volume_scale = Scale::new(Orientation::Vertical, Some(&vol_adj));
     volume_scale.add_css_class("adw-scale");
-    volume_scale.set_width_request(32);
-    volume_scale.set_hexpand(true);
+    volume_scale.add_css_class("volume-vertical");
+    volume_scale.set_inverted(true); // вверх — громче
+    volume_scale.set_height_request(118);
     volume_scale.set_draw_value(false);
-    volume_scale.set_tooltip_text(Some("Громкость"));
-    volume_box.set_hexpand(true);
-    volume_box.append(&volume_scale);
 
-    right_box.append(&volume_box);
+    let vol_icon = Image::from_icon_name("audio-volume-high-symbolic");
+    let volume_btn = Button::new();
+    volume_btn.set_child(Some(&vol_icon));
+    volume_btn.add_css_class("flat");
+    volume_btn.add_css_class("circular");
+    volume_btn.add_css_class("island-volume-btn");
+    volume_btn.set_valign(Align::Center);
+    volume_btn.set_halign(Align::End);
+    volume_btn.set_hexpand(true);
+
+    let volume_popup = GtkBox::new(Orientation::Vertical, 0);
+    volume_popup.add_css_class("volume-popup");
+    volume_popup.set_halign(Align::Start);
+    volume_popup.set_valign(Align::Start);
+    volume_popup.set_visible(false);
+    volume_popup.append(&volume_scale);
+
+    // колесо мыши над значком меняет громкость
+    {
+        let adj = vol_adj.clone();
+        let scroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        scroll.connect_scroll(move |_, _, dy| {
+            adj.set_value(adj.value() - dy * 5.0);
+            gtk4::glib::Propagation::Stop
+        });
+        volume_btn.add_controller(scroll);
+    }
+    // значок отражает уровень
+    {
+        let icon = vol_icon.clone();
+        vol_adj.connect_value_changed(move |a| {
+            icon.set_icon_name(Some(match a.value() {
+                v if v <= 0.5 => "audio-volume-muted-symbolic",
+                v if v < 34.0 => "audio-volume-low-symbolic",
+                v if v < 67.0 => "audio-volume-medium-symbolic",
+                _ => "audio-volume-high-symbolic",
+            }));
+        });
+    }
+
+    right_box.append(&volume_btn);
     top_row.set_end_widget(Some(&right_box));
     container.append(&top_row);
 
@@ -349,9 +390,162 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
         curr_time_label,
         total_time_label,
         volume_scale,
+        volume_btn,
+        volume_popup,
         karaoke_btn,
+        cast_btn,
         quality_badge,
         repeat_btn,
         repeat_one,
+    }
+}
+
+/// Кнопка выбора Яндекс Станции: список найденных в сети, подключение и отключение
+fn build_cast_button(player: &PlayerManager) -> gtk4::MenuButton {
+    let btn = gtk4::MenuButton::new();
+    // иконка «устройство с колонкой» лежит в исходниках, как и иконка текста песни
+    let icon_path = [concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons/cast-device-symbolic.svg"), "data/icons/cast-device-symbolic.svg"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+    match icon_path {
+        Some(path) => {
+            let img = Image::from_file(path);
+            img.set_pixel_size(18);
+            btn.set_child(Some(&img));
+        }
+        None => btn.set_icon_name("audio-speakers-symbolic"),
+    }
+    btn.add_css_class("flat");
+    btn.add_css_class("circular");
+    btn.set_valign(Align::Center);
+    btn.set_tooltip_text(Some("Яндекс Станция"));
+
+    let pop = gtk4::Popover::new();
+    let body = GtkBox::new(Orientation::Vertical, 6);
+    body.set_margin_top(10);
+    body.set_margin_bottom(10);
+    body.set_margin_start(10);
+    body.set_margin_end(10);
+    let heading = Label::new(Some("Яндекс Станция"));
+    heading.add_css_class("section-title");
+    heading.set_halign(Align::Start);
+    let status = Label::new(None);
+    status.add_css_class("dim-label");
+    status.set_halign(Align::Start);
+    let list = GtkBox::new(Orientation::Vertical, 2);
+    let off = Button::with_label("Отключить");
+    off.add_css_class("pill");
+    off.set_visible(false);
+    body.append(&heading);
+    body.append(&status);
+    body.append(&list);
+    body.append(&off);
+    pop.set_child(Some(&body));
+    btn.set_popover(Some(&pop));
+
+    {
+        let (p, pop) = (player.clone(), pop.clone());
+        off.connect_clicked(move |_| {
+            pop.popdown();
+            p.cast_disconnect();
+        });
+    }
+    // при каждом открытии ищем станции заново
+    {
+        let (p, status, list, off) = (player.clone(), status.clone(), list.clone(), off.clone());
+        let pop2 = pop.clone();
+        pop.connect_show(move |_| {
+            while let Some(c) = list.first_child() {
+                list.remove(&c);
+            }
+            let connected = p.cast_name();
+            off.set_visible(connected.is_some());
+            status.set_text(&match &connected {
+                Some(n) => format!("Играет на «{}»", n),
+                None => "Поиск в сети…".to_string(),
+            });
+            let (p, status, list, pop) = (p.clone(), status.clone(), list.clone(), pop2.clone());
+            gtk4::glib::spawn_future_local(async move {
+                let client = p.client.lock().unwrap().clone();
+                match crate::station::find_stations(&client, std::time::Duration::from_secs(3)).await {
+                    Ok(found) if found.is_empty() => {
+                        if p.cast_name().is_none() {
+                            status.set_text("Станции в сети не найдены");
+                        }
+                    }
+                    Ok(found) => {
+                        if p.cast_name().is_none() {
+                            status.set_text("Выберите станцию");
+                        }
+                        for dev in found {
+                            let b = Button::with_label(&dev.name);
+                            b.add_css_class("flat");
+                            let (p, pop) = (p.clone(), pop.clone());
+                            b.connect_clicked(move |_| {
+                                pop.popdown();
+                                p.cast_connect(dev.clone());
+                            });
+                            list.append(&b);
+                        }
+                    }
+                    Err(e) => status.set_text(&format!("Не удалось найти станции: {}", e)),
+                }
+            });
+        });
+    }
+    btn
+}
+
+/// Размер всплывающего ползунка громкости (ширина × высота), px
+const VOLUME_POPUP_SIZE: (i32, i32) = (30, 132);
+
+/// Подключает всплывающий ползунок громкости: показ над значком при наведении, внутри `overlay`.
+/// Положение задаёт сам оверлей по сигналу `get-child-position`: по центру над значком, не выходя за края.
+pub fn wire_volume_popup(island: &FloatingIslandWidgets, overlay: &gtk4::Overlay) {
+    let popup = &island.volume_popup;
+    popup.set_size_request(VOLUME_POPUP_SIZE.0, VOLUME_POPUP_SIZE.1);
+    overlay.add_overlay(popup);
+    {
+        let (btn, popup) = (island.volume_btn.clone(), popup.clone());
+        overlay.connect_get_child_position(move |ov, child| {
+            if child != popup.upcast_ref::<gtk4::Widget>() {
+                return None;
+            }
+            let b = btn.compute_bounds(ov)?;
+            let (w, h) = VOLUME_POPUP_SIZE;
+            let x = (b.x() + b.width() / 2.0 - w as f32 / 2.0).clamp(0.0, (ov.width() - w).max(0) as f32);
+            let y = (b.y() - h as f32 - 6.0).max(0.0);
+            Some(gtk4::gdk::Rectangle::new(x as i32, y as i32, w, h))
+        });
+    }
+
+    // курсор над значком / над ползунком; ползунок закрывается, когда его нет ни там, ни там
+    let over = std::rc::Rc::new([std::cell::Cell::new(false), std::cell::Cell::new(false)]);
+    for (i, widget) in [island.volume_btn.clone().upcast::<gtk4::Widget>(), popup.clone().upcast::<gtk4::Widget>()].into_iter().enumerate() {
+        let motion = gtk4::EventControllerMotion::new();
+        {
+            let (over, popup, overlay) = (over.clone(), popup.clone(), overlay.clone());
+            motion.connect_enter(move |_, _, _| {
+                over[i].set(true);
+                if !popup.is_visible() {
+                    popup.set_visible(true);
+                    overlay.queue_resize();
+                }
+            });
+        }
+        {
+            let (over, popup) = (over.clone(), popup.clone());
+            motion.connect_leave(move |_| {
+                over[i].set(false);
+                let (over, popup) = (over.clone(), popup.clone());
+                // небольшая задержка: курсор переходит со значка на ползунок
+                gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(300), move || {
+                    if !over[0].get() && !over[1].get() {
+                        popup.set_visible(false);
+                    }
+                });
+            });
+        }
+        widget.add_controller(motion);
     }
 }

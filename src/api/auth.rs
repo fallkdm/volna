@@ -30,6 +30,15 @@ pub struct AppConfig {
     /// Последний проигранный трек: при запуске показывается вместо заглушки
     #[serde(default)]
     pub last_track: Option<serde_json::Value>,
+    /// Статус в Discord (Rich Presence): что играет сейчас; по умолчанию выключено
+    #[serde(default)]
+    pub discord_rpc: bool,
+    /// Application ID приложения из discord.com/developers (имя приложения Discord показывает в статусе)
+    #[serde(default)]
+    pub discord_client_id: Option<String>,
+    /// Выбранная Яндекс Станция (`deviceId`): при запуске приложение подключается к ней само
+    #[serde(default)]
+    pub station_id: Option<String>,
     /// История поиска: открытые результаты (см. `history.rs`); элементы разбираются по одному
     #[serde(default)]
     pub history_items: Vec<serde_json::Value>,
@@ -127,6 +136,24 @@ pub fn save_quality(quality: &str) -> Result<(), Box<dyn std::error::Error + Sen
 /// Включены ли клипы на фоне
 pub fn load_clips() -> bool {
     load_config().map(|c| c.clips).unwrap_or(false)
+}
+
+/// Настройки Discord: (включено, Application ID)
+pub fn load_discord() -> (bool, Option<String>) {
+    let c = load_config().unwrap_or_default();
+    (c.discord_rpc, c.discord_client_id.filter(|i| !i.trim().is_empty()))
+}
+
+pub fn save_discord_rpc(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.discord_rpc = on;
+    save_config(&config)
+}
+
+pub fn save_discord_client_id(id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.discord_client_id = Some(id.trim().to_string()).filter(|i| !i.is_empty());
+    save_config(&config)
 }
 
 pub fn save_clips(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

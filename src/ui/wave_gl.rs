@@ -30,6 +30,7 @@ uniform vec3 u_ridge;
 uniform sampler2D u_clip;
 uniform float u_clip_alpha; // 0 — клипа нет
 uniform vec2 u_clip_size;   // размер кадра клипа в пикселях
+uniform vec4 u_clip_rect;   // картинка внутри кадра без чёрных полос: x0, y0, x1, y1 в пикселях
 out vec4 frag;
 
 float hash(vec2 p) {
@@ -100,8 +101,9 @@ void main() {
 
     // клип: кадр растягивается на весь экран с сохранением пропорций (cover), смешивается полупрозрачно
     if (u_clip_alpha > 0.001) {
-        float sc = max(u_size.x / u_clip_size.x, u_size.y / u_clip_size.y);
-        vec2 uv = ((p - u_size * 0.5) / sc + u_clip_size * 0.5) / u_clip_size;
+        vec2 cs = u_clip_rect.zw - u_clip_rect.xy;
+        float sc = max(u_size.x / cs.x, u_size.y / cs.y);
+        vec2 uv = ((p - u_size * 0.5) / sc + u_clip_rect.xy + cs * 0.5) / u_clip_size;
         vec3 v = texture(u_clip, uv).rgb;
         // клип тонируем цветом трека: слой остаётся частью фона, а не отдельной картинкой
         col = mix(col, mix(v, v * (u_core * 1.6 + 0.2), 0.45), u_clip_alpha);
@@ -143,6 +145,8 @@ struct Gl {
     vao: glow::VertexArray,
     clip_tex: Option<glow::Texture>,
     clip_size: (i32, i32),
+    /// Объединение границ картинки по кадрам: чёрные полосы не входят, тёмные сцены не сужают её
+    clip_rect: Option<(i32, i32, i32, i32)>,
 }
 
 /// Достаёт функции OpenGL через EGL (GTK 4 работает через EGL и на Wayland, и на X11)
@@ -207,7 +211,7 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
         };
         let es = area.context().is_some_and(|c| c.uses_es());
         match compile(&gl, es) {
-            Ok((program, vao)) => *s.borrow_mut() = Some(Gl { gl, program, vao, clip_tex: None, clip_size: (0, 0) }),
+            Ok((program, vao)) => *s.borrow_mut() = Some(Gl { gl, program, vao, clip_tex: None, clip_size: (0, 0), clip_rect: None }),
             Err(e) => {
                 eprintln!("[wave] шейдер не собрался: {e}");
                 on_fail();
@@ -259,7 +263,19 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
                 g.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
                 g.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, f.width, f.height, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&f.data)));
             }
+            if g.clip_size != (f.width, f.height) {
+                g.clip_rect = None;
+            }
             g.clip_size = (f.width, f.height);
+            if let Some(b) = super::wave_clip::content_bounds(&f) {
+                g.clip_rect = Some(match g.clip_rect {
+                    Some(r) => (r.0.min(b.0), r.1.min(b.1), r.2.max(b.2), r.3.max(b.3)),
+                    None => b,
+                });
+            }
+        }
+        if !clip.active() {
+            g.clip_rect = None; // следующий клип измеряется заново
         }
         // слой клипа проявляется и гаснет плавно (около полусекунды)
         let target = if clip.active() && g.clip_tex.is_some() { 0.30 } else { 0.0 };
@@ -286,6 +302,8 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
             gl.bind_texture(glow::TEXTURE_2D, g.clip_tex);
             gl.uniform_1_i32(loc("u_clip").as_ref(), 0);
             gl.uniform_1_f32(loc("u_clip_alpha").as_ref(), if g.clip_tex.is_some() { clip_alpha.get() } else { 0.0 });
+            let r = g.clip_rect.unwrap_or((0, 0, g.clip_size.0.max(1), g.clip_size.1.max(1)));
+            gl.uniform_4_f32(loc("u_clip_rect").as_ref(), r.0 as f32, r.1 as f32, r.2 as f32, r.3 as f32);
             gl.uniform_2_f32(loc("u_clip_size").as_ref(), g.clip_size.0.max(1) as f32, g.clip_size.1.max(1) as f32);
             gl.bind_vertex_array(Some(g.vao));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);

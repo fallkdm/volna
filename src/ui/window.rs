@@ -267,6 +267,7 @@ impl VolnaWindow {
         root_overlay.add_overlay(&karaoke_overlay);
         // плеер добавляем после караоке, чтобы он оставался поверх текста песни (оверлеи рисуются в порядке добавления)
         root_overlay.add_overlay(&island.container);
+        super::floating_island::wire_volume_popup(&island, &root_overlay);
 
         let lyrics_data: Rc<RefCell<Vec<LrcLine>>> = Rc::new(RefCell::new(Vec::new()));
         let lyrics_labels: Rc<RefCell<Vec<Label>>> = Rc::new(RefCell::new(Vec::new()));
@@ -522,7 +523,7 @@ impl VolnaWindow {
             // 50 мс: подсветка строки привязана к позиции с точностью до миллисекунд
             gtk4::glib::timeout_add_local(Duration::from_millis(50), move || {
                 if *is_playing_ref.borrow() {
-                    if let Some(pos_ms) = player_clone.audio.position_ms() {
+                    if let Some(pos_ms) = player_clone.position_ms() {
                         if awaiting.get() {
                             if pos_ms > 1500 {
                                 return gtk4::glib::ControlFlow::Continue;
@@ -533,7 +534,7 @@ impl VolnaWindow {
                         // полоса прогресса и время обновляются раз в секунду
                         if last_sec.get() != pos {
                             last_sec.set(pos);
-                            let dur = player_clone.audio.duration_seconds().unwrap_or(240);
+                            let dur = player_clone.duration_seconds().unwrap_or(240);
                             island_seek.set_range(0.0, dur as f64);
                             island_seek.set_value(pos as f64);
                             // полоска прогрузки, как в видеоплеерах: докуда поток уже скачан
@@ -814,6 +815,18 @@ fn setup_event_listener(
                         island.repeat_btn.add_css_class("active");
                     }
                 }
+                PlayerUiEvent::CastChanged(name) => {
+                    match &name {
+                        Some(n) => {
+                            island.cast_btn.add_css_class("cast-active");
+                            island.cast_btn.set_tooltip_text(Some(&format!("Играет на «{}»", n)));
+                        }
+                        None => {
+                            island.cast_btn.remove_css_class("cast-active");
+                            island.cast_btn.set_tooltip_text(Some("Яндекс Станция"));
+                        }
+                    }
+                }
                 PlayerUiEvent::StreamQuality(label) => {
                     island.quality_badge.set_text(&label);
                 }
@@ -849,7 +862,7 @@ fn setup_event_listener(
                             lbl.set_cursor_from_name(Some("pointer"));
                             let click = gtk4::GestureClick::new();
                             let (p, at) = (player.clone(), line.time_ms);
-                            click.connect_released(move |_, _, _, _| p.audio.seek_ms(at));
+                            click.connect_released(move |_, _, _, _| p.seek_ms(at));
                             lbl.add_controller(click);
                             lyrics_container.append(&lbl);
                             new_labels.push(lbl);

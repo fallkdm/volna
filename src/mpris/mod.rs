@@ -79,7 +79,7 @@ impl PlayerInterface for MprisHandler {
     }
 
     async fn pause(&self) -> fdo::Result<()> {
-        self.player.audio.pause();
+        self.player.pause();
         self.player.emit(PlayerUiEvent::PlaybackToggled(false));
         Ok(())
     }
@@ -90,20 +90,20 @@ impl PlayerInterface for MprisHandler {
     }
 
     async fn stop(&self) -> fdo::Result<()> {
-        self.player.audio.pause();
+        self.player.pause();
         self.player.seek(0);
         self.player.emit(PlayerUiEvent::PlaybackToggled(false));
         Ok(())
     }
 
     async fn play(&self) -> fdo::Result<()> {
-        self.player.audio.play();
+        self.player.resume();
         self.player.emit(PlayerUiEvent::PlaybackToggled(true));
         Ok(())
     }
 
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
-        let current = self.player.audio.position_seconds().unwrap_or(0) as i64;
+        let current = (self.player.position_ms().unwrap_or(0) / 1000) as i64;
         let new_pos = (current + offset.as_secs()).max(0) as u64;
         self.player.seek(new_pos);
         Ok(())
@@ -191,7 +191,7 @@ impl PlayerInterface for MprisHandler {
     }
 
     async fn position(&self) -> fdo::Result<Time> {
-        let secs = self.player.audio.position_seconds().unwrap_or(0);
+        let secs = self.player.position_ms().unwrap_or(0) / 1000;
         Ok(Time::from_secs(secs as i64))
     }
 

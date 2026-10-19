@@ -1,7 +1,9 @@
 pub mod api;
 pub mod cache;
+pub mod discord;
 pub mod mpris;
 pub mod player;
+pub mod station;
 pub mod ui;
 
 use libadwaita::prelude::*;
@@ -38,12 +40,18 @@ fn main() {
         // Создаем каналы событий для UI и для MPRIS D-Bus сервера
         let (ui_tx, ui_rx) = async_channel::unbounded();
         let (mpris_tx, mpris_rx) = async_channel::unbounded();
+        let (discord_tx, discord_rx) = async_channel::unbounded();
 
         // Инициализируем плеер со связкой каналов
-        match PlayerManager::new(client, vec![ui_tx, mpris_tx]) {
+        match PlayerManager::new(client, vec![ui_tx, mpris_tx, discord_tx]) {
             Ok(player) => {
                 // Запускаем системный MPRIS2 D-Bus сервер
                 mpris::spawn_mpris_server(player.clone(), mpris_rx);
+                discord::spawn_bridge(player.clone(), discord_rx);
+
+                // закрытие приложения останавливает музыку, которую оно включило на Станции
+                let exit_player = player.clone();
+                app.connect_shutdown(move |_| exit_player.cast_stop_on_exit());
 
                 // Создаем и отображаем главное окно приложения
                 let window = VolnaWindow::new(app, player, ui_rx);

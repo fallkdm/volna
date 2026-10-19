@@ -24,3 +24,10 @@ mpris-server = { version = "0.10", features = ["tokio"] }
 glow = "0.16"
 libloading = "0.8"
 gstreamer-app = "0.25"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+mdns-sd = "0.21.5"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+uuid = { version = "1.28.0", features = ["v4"] }
+discord-rich-presence = "1.1.0"

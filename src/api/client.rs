@@ -65,6 +65,14 @@ enum LrclibFetch {
 }
 
 /// Клиент для работы с API Яндекс Музыки
+/// Устройство аккаунта из `quasar.yandex.net/glagol/device_list`
+pub struct GlagolDevice {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub cert_pem: String,
+}
+
 /// Сведения о плейлисте для страницы своего плейлиста
 pub struct PlaylistMeta {
     pub private: bool,
@@ -354,6 +362,80 @@ impl YandexMusicClient {
             owner: v["owner"]["name"].as_str().or(v["owner"]["login"].as_str()).unwrap_or("").to_string(),
             modified: text("modified"),
         })
+    }
+
+    /// Клип трека; если у этой версии клипа нет, берётся клип той же песни того же исполнителя
+    /// (у «Extended Mix» клипа может не быть, а у «Kazantip 2005 Mix» есть)
+    pub async fn get_clip_url_for_track(&self, track: &Track) -> Option<String> {
+        if let Some(url) = self.get_track_clip_url(&track.id).await {
+            return Some(url);
+        }
+        let same_title = |t: &Track| t.title.trim().to_lowercase() == track.title.trim().to_lowercase();
+        // сначала версии той же песни на том же альбоме: у «Extended Mix» клипа нет, а у «Kazantip 2005 Mix» рядом есть
+        let mut candidates: Vec<Track> = Vec::new();
+        if let Some(album) = track.albums.first() {
+            candidates = self.get_album_tracks(&album.id).await.unwrap_or_default();
+        }
+        // затем поиск: тот же заголовок и общий исполнитель
+        let artist_ids: Vec<&str> = track.artists.iter().map(|a| a.id.as_str()).collect();
+        let query = format!("{} {}", track.artists_string(), track.title);
+        if let Some(found) = self.search(&query).await.ok().and_then(|r| r.tracks) {
+            candidates.extend(found.results.into_iter().filter(|t| t.artists.iter().any(|a| artist_ids.contains(&a.id.as_str()))));
+        }
+        for t in candidates.into_iter().filter(|t| t.id != track.id && same_title(t)).take(5) {
+            if let Some(url) = self.get_track_clip_url(&t.id).await {
+                return Some(url);
+            }
+        }
+        None
+    }
+
+    /// Устройства аккаунта (колонки, приложения) с сертификатами для локального соединения
+    pub async fn glagol_devices(&self) -> Result<Vec<GlagolDevice>, ApiError> {
+        let mut headers = self.headers();
+        if let Some(t) = &self.token {
+            if let Ok(v) = HeaderValue::from_str(&format!("oauth {}", t.trim())) {
+                headers.insert(AUTHORIZATION, v);
+            }
+        }
+        let resp = self.client.get("https://quasar.yandex.net/glagol/device_list").headers(headers).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ApiError::InvalidResponse(format!("HTTP {}", status)));
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v["devices"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|d| GlagolDevice {
+                        id: d["id"].as_str().unwrap_or("").to_string(),
+                        name: d["name"].as_str().unwrap_or("").to_string(),
+                        platform: d["platform"].as_str().unwrap_or("").to_string(),
+                        cert_pem: d["glagol"]["security"]["server_certificate"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Токен разговора со станцией
+    pub async fn glagol_token(&self, device_id: &str, platform: &str) -> Result<String, ApiError> {
+        let mut headers = self.headers();
+        if let Some(t) = &self.token {
+            if let Ok(v) = HeaderValue::from_str(&format!("oauth {}", t.trim())) {
+                headers.insert(AUTHORIZATION, v);
+            }
+        }
+        let resp = self
+            .client
+            .get(format!("https://quasar.yandex.net/glagol/token?device_id={}&platform={}", urlencoding_encode(device_id), urlencoding_encode(platform)))
+            .headers(headers)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await.unwrap_or_default();
+        v["token"].as_str().map(String::from).ok_or_else(|| ApiError::InvalidResponse(format!("HTTP {}: токен станции не выдан", status)))
     }
 
     /// Раздел «О треке»: пары (заголовок, значение) — исполнитель, авторы, лейбл, источник

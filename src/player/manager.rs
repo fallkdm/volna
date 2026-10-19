@@ -46,6 +46,10 @@ pub enum PlayerUiEvent {
     UserLoggedOut,
     StatusMessage(String),
     Error(String),
+    /// Станция привязана (имя) или отвязана
+    CastChanged(Option<String>),
+    /// Изменились настройки Discord (включение, Application ID)
+    DiscordSettingsChanged,
 }
 
 /// Состояние очереди и воспроизведения
@@ -101,6 +105,8 @@ pub struct PlayerManager {
     pub client: Arc<Mutex<YandexMusicClient>>,
     pub state: Arc<Mutex<PlayerState>>,
     pub event_senders: Vec<Sender<PlayerUiEvent>>,
+    /// Привязанная Яндекс Станция (см. `cast.rs`)
+    pub(super) cast: Arc<Mutex<Option<super::cast::CastLink>>>,
     /// Номер последнего запроса воспроизведения: устаревшие асинхронные задачи (быстрые клики) отбрасываются
     generation: Arc<AtomicU64>,
 }
@@ -120,6 +126,7 @@ impl PlayerManager {
             client,
             state,
             event_senders,
+            cast: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
         };
 
@@ -140,6 +147,7 @@ impl PlayerManager {
 
         // Проверяем статус авторизации при старте
         manager.check_auth_on_startup();
+        manager.cast_autoconnect();
 
         Ok(manager)
     }
@@ -262,6 +270,15 @@ impl PlayerManager {
         });
     }
 
+    /// Позиция воспроизведения в мс: на станции, если она привязана, иначе в приложении
+    pub fn position_ms(&self) -> Option<u64> {
+        self.cast_position_ms().or_else(|| self.audio.position_ms())
+    }
+
+    pub fn duration_seconds(&self) -> Option<u64> {
+        self.cast_duration_secs().or_else(|| self.audio.duration_seconds())
+    }
+
     /// Запускает или переключает воспроизведение (Play/Pause)
     pub fn toggle_play(&self) {
         if self.resume_restored() {
@@ -288,7 +305,10 @@ impl PlayerManager {
             return;
         }
 
-        let is_playing = self.audio.toggle_play();
+        let is_playing = match self.cast_toggle() {
+            Some(playing) => playing,
+            None => self.audio.toggle_play(),
+        };
         self.emit(PlayerUiEvent::PlaybackToggled(is_playing));
     }
 
@@ -618,13 +638,40 @@ impl PlayerManager {
         self.play_track_stream(&track);
     }
 
+    /// Пауза (на станции, если она привязана)
+    pub fn pause(&self) {
+        if !self.cast_set_playing(false) {
+            self.audio.pause();
+        }
+    }
+
+    /// Продолжение (на станции, если она привязана)
+    pub fn resume(&self) {
+        if !self.cast_set_playing(true) {
+            self.audio.play();
+        }
+    }
+
+    /// Перемотка к заданной миллисекунде (клик по строке текста)
+    pub fn seek_ms(&self, ms: u64) {
+        if !self.cast_seek(ms / 1000) {
+            self.audio.seek_ms(ms);
+        }
+    }
+
     /// Перемотка к заданной секунде
     pub fn seek(&self, seconds: u64) {
+        if self.cast_seek(seconds) {
+            return;
+        }
         self.audio.seek_seconds(seconds);
     }
 
     /// Установка громкости
     pub fn set_volume(&self, volume: f64) {
+        if self.cast_set_volume(volume) {
+            return;
+        }
         self.audio.set_volume(volume);
     }
 
@@ -705,7 +752,7 @@ impl PlayerManager {
     }
 
     /// Загружает прямую ссылку на трек, кэширует обложку и начинает воспроизведение через GStreamer
-    fn play_track_stream(&self, track: &Track) {
+    pub(super) fn play_track_stream(&self, track: &Track) {
         let audio_clone = self.audio.clone();
         let track_id = track.id.clone();
         let station_id = self.state.lock().unwrap().station_id.clone();
@@ -719,6 +766,11 @@ impl PlayerManager {
         spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
         crate::api::history::save_last_track(track);
         self.state.lock().unwrap().restored = false;
+
+        // привязана Станция: трек играет на ней, звук приложения молчит
+        if self.cast_play(track) {
+            return;
+        }
 
         // сохранённый офлайн трек играет с диска: без сети и без токена
         if let Some(path) = crate::cache::offline_audio_path(&track_id) {
@@ -904,10 +956,26 @@ fn spawn_cover_and_lyrics(
     }
 
     if crate::api::auth::load_clips() {
-        let (senders, generation, client, track_id) = (senders.to_vec(), generation.clone(), client.clone(), track.id.clone());
+        let (senders, generation, client, clip_track) = (senders.to_vec(), generation.clone(), client.clone(), track.clone());
         tokio::spawn(async move {
-            let path = match client.get_track_clip_url(&track_id).await {
+            // свои клипы альбома важнее клипов Яндекса
+            if let Some(path) = crate::cache::custom_clip_for(&clip_track) {
+                if generation.load(Ordering::SeqCst) == epoch {
+                    emit_all(&senders, PlayerUiEvent::ClipUpdated(Some(path.to_string_lossy().to_string())));
+                }
+                return;
+            }
+            let path = match client.get_clip_url_for_track(&clip_track).await {
                 Some(url) => crate::cache::fetch_clip_cached(&url).await,
+                None => None,
+            };
+            // заставки-обложки без движения клипом не показываем
+            let path = match path {
+                Some(p) => {
+                    let s = p.to_string_lossy().to_string();
+                    let still = tokio::task::spawn_blocking(move || crate::ui::wave_clip::is_static(&s)).await.unwrap_or(false);
+                    (!still).then_some(p)
+                }
                 None => None,
             };
             if generation.load(Ordering::SeqCst) == epoch {

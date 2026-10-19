@@ -278,8 +278,38 @@ popover.rotor-popover > contents {
     border: 1px solid rgba(255, 107, 74, 0.34);
 }
 
-.island-volume-icon {
+.island-volume-btn {
     color: rgba(255, 255, 255, 0.7);
+}
+
+.island-volume-btn:hover {
+    color: #ffffff;
+}
+
+/* вертикальный ползунок громкости над значком */
+.volume-popup {
+    padding: 6px 2px;
+    border-radius: 16px;
+    background-color: rgba(30, 30, 33, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+scale.volume-vertical {
+    padding: 0 6px;
+}
+
+scale.volume-vertical trough {
+    min-width: 6px;
+    min-height: 0;
+}
+
+scale.volume-vertical highlight {
+    background-image: linear-gradient(0deg, #ff6b4a, #ff8a5c);
+}
+
+scale.volume-vertical slider {
+    opacity: 1;
 }
 
 /* Полноэкранный караоке / текст песни */
@@ -617,4 +647,9 @@ toast {
 
 .cover-upload:hover {
     background: rgba(0, 0, 0, 0.88);
+}
+
+/* привязана Яндекс Станция */
+.cast-active {
+    color: #ff6b4a;
 }

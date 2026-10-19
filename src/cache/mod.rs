@@ -128,17 +128,45 @@ pub fn clear_clips_cache() -> u64 {
     freed
 }
 
+// ================= Свои клипы для фона =================
+// ~/.local/share/volna/custom_clips/<id альбома>/*.mp4: для треков этого альбома фон берёт их вместо клипов Яндекса.
+// Файлы кладёт пользователь, в репозиторий они не входят.
+
+/// Каталог данных приложения без glib: `$XDG_DATA_HOME/volna` или `~/.local/share/volna`
+fn data_dir() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".local").join("share")
+    });
+    base.join("volna")
+}
+
+/// Случайный свой клип для любого из альбомов трека
+pub fn custom_clip_for(track: &Track) -> Option<PathBuf> {
+    let pick = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos() as usize).unwrap_or(0);
+    custom_clip_in(&data_dir(), track, pick)
+}
+
+fn custom_clip_in(data: &std::path::Path, track: &Track, pick: usize) -> Option<PathBuf> {
+    let mut clips: Vec<PathBuf> = Vec::new();
+    for album in &track.albums {
+        let dir = data.join("custom_clips").join(safe_id(&album.id));
+        clips.extend(std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "mp4")));
+    }
+    if clips.is_empty() {
+        return None;
+    }
+    clips.sort();
+    Some(clips.swap_remove(pick % clips.len()))
+}
+
 // ================= Офлайн-треки =================
 // Лежат в данных приложения (~/.local/share/volna/offline), а не в кэше: «Очистить память» их не трогает.
 
 use crate::api::models::Track;
 
 fn offline_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".local").join("share")
-    });
-    let dir = base.join("volna").join("offline");
+    let dir = data_dir().join("offline");
     let _ = create_dir_all(&dir);
     dir
 }
@@ -207,6 +235,25 @@ mod offline_tests {
         assert_eq!(list_offline().len(), 1);
         remove_offline("7");
         assert!(list_offline().is_empty());
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+#[cfg(test)]
+mod custom_clip_tests {
+    use super::*;
+
+    #[test]
+    fn custom_clip_is_taken_from_track_album_folder() {
+        let tmp = std::env::temp_dir().join(format!("volna-clips-{}", std::process::id()));
+        let dir = tmp.join("custom_clips").join("22045");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let white_pony: Track = serde_json::from_value(serde_json::json!({"id": "1", "title": "T", "albums": [{"id": "22045"}]})).unwrap();
+        let other: Track = serde_json::from_value(serde_json::json!({"id": "2", "title": "T", "albums": [{"id": "1"}]})).unwrap();
+        assert_eq!(custom_clip_in(&tmp, &white_pony, 7), Some(dir.join("a.mp4")));
+        assert_eq!(custom_clip_in(&tmp, &other, 0), None);
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

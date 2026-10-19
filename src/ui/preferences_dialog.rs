@@ -4,7 +4,7 @@ use libadwaita::prelude::*;
 use libadwaita::{ActionRow, ComboRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup, PreferencesPage};
 
 use crate::api::auth::{
-    load_clips, save_clips, load_genius_token, load_lastfm_key, load_quality, load_token, save_genius_token, save_lastfm_key, save_quality, save_token,
+    load_clips, load_discord, save_clips, save_discord_client_id, save_discord_rpc, load_genius_token, load_lastfm_key, load_quality, load_token, save_genius_token, save_lastfm_key, save_quality, save_token,
 };
 use crate::cache::{clear_clips_cache, clear_covers_cache, clips_cache_size, covers_cache_size};
 use crate::player::PlayerManager;
@@ -86,6 +86,42 @@ pub fn show_preferences_dialog(
     }
     clips_group.add(&clips_row);
     page.add(&clips_group);
+
+    // Discord: что играет сейчас — в статусе профиля
+    let discord_group = PreferencesGroup::new();
+    discord_group.set_title("Discord");
+    discord_group.set_description(Some(
+        "Показывает в профиле Discord название трека, исполнителя, обложку и время. Discord должен быть запущен.",
+    ));
+    let (discord_on, discord_id) = load_discord();
+    let has_builtin = crate::discord::DEFAULT_APP_ID.is_some();
+    let discord_row = libadwaita::SwitchRow::builder().title("Статус в Discord").active(discord_on).build();
+    if !has_builtin && discord_id.is_none() {
+        discord_row.set_subtitle("Нужен Application ID: впишите свой ниже");
+    }
+    let discord_id_row = libadwaita::EntryRow::builder()
+        .title(if has_builtin { "Свой Application ID (необязательно)" } else { "Application ID (discord.com/developers)" })
+        .show_apply_button(true)
+        .build();
+    if let Some(id) = discord_id {
+        discord_id_row.set_text(&id);
+    }
+    {
+        let p = player.clone();
+        discord_row.connect_active_notify(move |row| {
+            let _ = save_discord_rpc(row.is_active());
+            p.emit(crate::player::PlayerUiEvent::DiscordSettingsChanged);
+        });
+        let p = player.clone();
+        discord_id_row.connect_apply(move |row| {
+            let _ = save_discord_client_id(&row.text());
+            p.emit(crate::player::PlayerUiEvent::DiscordSettingsChanged);
+        });
+    }
+    discord_group.add(&discord_row);
+    // свой ID нужен только пока у приложения нет встроенного; потом это скрытая «расширенная» настройка
+    discord_group.add(&discord_id_row);
+    page.add(&discord_group);
 
     // Память
     let memory_group = PreferencesGroup::new();
