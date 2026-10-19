@@ -1,0 +1,63 @@
+# Maintainer: fallkdm
+pkgname=volna-git
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc='Неофициальный лёгкий клиент Яндекс Музыки на Rust, GTK4 / Libadwaita и GStreamer'
+arch=('x86_64')
+url='https://github.com/fallkdm/volna'
+license=('GPL-3.0-only')
+depends=(
+  'gtk4'
+  'libadwaita'
+  'gstreamer'
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'gst-plugins-bad'
+  'gst-plugins-bad-libs'
+  'gst-libav'
+  'libglvnd'
+)
+makedepends=('git' 'cargo')
+optdepends=('mprisence: статус в Discord через MPRIS (встроенный статус в настройках работает и без него)')
+provides=('volna')
+conflicts=('volna')
+options=('!lto')
+source=("$pkgname::git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/volna "$pkgdir/usr/bin/volna"
+  install -Dm644 data/applications/io.github.fallkdm.Volna.desktop \
+    "$pkgdir/usr/share/applications/io.github.fallkdm.Volna.desktop"
+  install -Dm644 data/icons/io.github.fallkdm.Volna.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.fallkdm.Volna.svg"
+  # иконки интерфейса приложение ищет в /usr/share/volna/icons
+  install -Dm644 data/icons/lyrics-symbolic.svg "$pkgdir/usr/share/volna/icons/lyrics-symbolic.svg"
+  install -Dm644 data/icons/cast-device-symbolic.svg "$pkgdir/usr/share/volna/icons/cast-device-symbolic.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

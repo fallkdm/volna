@@ -188,20 +188,18 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     right_box.set_hexpand(true);
     right_box.set_valign(Align::Center);
 
-    // иконка лежит в исходниках: ищем по пути сборки, затем относительно текущей папки
-    let built_icon = concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons/lyrics-symbolic.svg");
-    let karaoke_icon = if std::path::Path::new(built_icon).exists() {
-        let img = Image::from_file(built_icon);
-        img.set_pixel_size(18);
-        img
-    } else if std::path::Path::new("data/icons/lyrics-symbolic.svg").exists() {
-        let img = Image::from_file("data/icons/lyrics-symbolic.svg");
-        img.set_pixel_size(18);
-        img
-    } else {
-        let img = Image::from_icon_name("text-x-generic-symbolic");
-        img.set_pixel_size(18);
-        img
+    // иконка лежит в данных приложения (исходники или /usr/share/volna/icons)
+    let karaoke_icon = match super::bundled_icon("lyrics-symbolic.svg") {
+        Some(path) => {
+            let img = Image::from_file(path);
+            img.set_pixel_size(18);
+            img
+        }
+        None => {
+            let img = Image::from_icon_name("text-x-generic-symbolic");
+            img.set_pixel_size(18);
+            img
+        }
     };
     karaoke_icon.add_css_class("lyrics-btn-icon");
 
@@ -403,11 +401,8 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
 /// Кнопка выбора Яндекс Станции: список найденных в сети, подключение и отключение
 fn build_cast_button(player: &PlayerManager) -> gtk4::MenuButton {
     let btn = gtk4::MenuButton::new();
-    // иконка «устройство с колонкой» лежит в исходниках, как и иконка текста песни
-    let icon_path = [concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons/cast-device-symbolic.svg"), "data/icons/cast-device-symbolic.svg"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists());
-    match icon_path {
+    // иконка «устройство с колонкой» лежит в данных приложения, как и иконка текста песни
+    match super::bundled_icon("cast-device-symbolic.svg") {
         Some(path) => {
             let img = Image::from_file(path);
             img.set_pixel_size(18);
