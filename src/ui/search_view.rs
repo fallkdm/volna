@@ -22,6 +22,7 @@ pub struct SearchViewWidgets {
     pub show_artist: Rc<dyn Fn(String)>,
     pub show_track: Rc<dyn Fn(Track)>,
     pub show_album: Rc<dyn Fn(Album)>,
+    pub show_playlist: Rc<dyn Fn(crate::api::models::Playlist)>,
 }
 
 // Порядок совпадает с секциями: Треки, Исполнители, Альбомы, Плейлисты
@@ -150,10 +151,18 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     let history_box = GtkBox::new(Orientation::Vertical, 12);
     main.append(&history_box);
     let rebuild_history: Rc<dyn Fn()> = {
-        let (hb, p, stack, page) = (history_box.clone(), player.clone(), stack.clone(), page.clone());
+        let (hb, p, stack, page, filter) = (history_box.clone(), player.clone(), stack.clone(), page.clone(), filter.clone());
         Rc::new(move || {
             clear_box(&hb);
-            let items = load_history();
+            // чипы фильтруют и историю, пока поле пустое: Все, Треки, Исполнители, Альбомы, Плейлисты
+            let items: Vec<HistoryItem> = load_history()
+                .into_iter()
+                .filter(|it| match (filter.get(), it) {
+                    (0, _) => true,
+                    (1, HistoryItem::Track(_)) | (2, HistoryItem::Artist(_)) | (3, HistoryItem::Album(_)) | (4, HistoryItem::Playlist(_)) => true,
+                    _ => false,
+                })
+                .collect();
             hb.set_visible(!items.is_empty());
             if items.is_empty() {
                 return;
@@ -240,11 +249,15 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         })
     };
     for (i, b) in buttons.iter().enumerate() {
-        let (filter, apply) = (filter.clone(), apply_filter.clone());
+        let (filter, apply, rebuild, entry) = (filter.clone(), apply_filter.clone(), rebuild_history.clone(), search_entry.clone());
         b.connect_toggled(move |b| {
             if b.is_active() {
                 filter.set(i);
                 apply();
+                // поле пусто: чип отбирает записи истории
+                if entry.text().trim().is_empty() {
+                    rebuild();
+                }
             }
         });
     }
@@ -375,21 +388,6 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         search_entry.connect_activate(move |e| do_search(e.text().trim().to_string()));
     }
 
-    {
-        let (p, stack, weak) = (player.clone(), stack.clone(), Rc::downgrade(&page));
-        *page.link_handler.borrow_mut() = Some(Rc::new(move |uri: &str| {
-            let Some(page) = weak.upgrade() else { return };
-            if let Some(id) = uri.strip_prefix("artist:") {
-                open_artist(&p, &stack, &page, id.to_string());
-            } else if let Some(id) = uri.strip_prefix("album:") {
-                let album = page.link_albums.borrow().iter().find(|a| a.id == id).cloned();
-                if let Some(album) = album {
-                    open_album(&p, &stack, &page, &album);
-                }
-            }
-        }));
-    }
-
     let show_artist: Rc<dyn Fn(String)> = {
         let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
         Rc::new(move |id| open_artist(&p, &stack, &page, id))
@@ -404,5 +402,10 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         Rc::new(move |a| open_album(&p, &stack, &page, &a))
     };
 
-    SearchViewWidgets { container, show_artist, show_track, show_album }
+    let show_playlist: Rc<dyn Fn(crate::api::models::Playlist)> = {
+        let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
+        Rc::new(move |pl| open_playlist(&p, &stack, &page, &pl))
+    };
+
+    SearchViewWidgets { container, show_artist, show_track, show_album, show_playlist }
 }

@@ -128,6 +128,57 @@ pub fn clear_clips_cache() -> u64 {
     freed
 }
 
+// ================= Последняя очередь (альбом, плейлист…) =================
+// Нужна, чтобы после перезапуска «Play» продолжал альбом или плейлист, а не включал Волну по треку.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Session {
+    source: Option<crate::player::PlaySource>,
+    queue: Vec<Track>,
+}
+
+fn session_dir() -> PathBuf {
+    let dir = data_dir().join("session");
+    let _ = create_dir_all(&dir);
+    dir
+}
+
+/// Запоминает очередь и её источник (запись в фоне: очередь может быть в сотни треков)
+pub fn save_session_queue(queue: &[Track], source: Option<crate::player::PlaySource>) {
+    let session = Session { source, queue: queue.iter().take(500).cloned().collect() };
+    let path = session_dir().join("queue.json");
+    std::thread::spawn(move || {
+        if let Ok(json) = serde_json::to_vec(&session) {
+            let _ = std::fs::write(path, json);
+        }
+    });
+}
+
+/// Позиция в очереди: меняется на каждом треке, поэтому лежит отдельно от самой очереди
+pub fn save_session_index(index: usize) {
+    let _ = std::fs::write(session_dir().join("index"), index.to_string());
+}
+
+fn load_session_in(dir: &std::path::Path) -> Option<(Vec<Track>, usize, Option<crate::player::PlaySource>)> {
+    let session: Session = serde_json::from_slice(&std::fs::read(dir.join("queue.json")).ok()?).ok()?;
+    if session.queue.is_empty() {
+        return None;
+    }
+    let index = std::fs::read_to_string(dir.join("index")).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    let index = index.min(session.queue.len() - 1);
+    Some((session.queue, index, session.source))
+}
+
+/// Забывает очередь (включена Волна: после перезапуска она продолжается по треку)
+pub fn clear_session() {
+    let _ = std::fs::remove_file(session_dir().join("queue.json"));
+}
+
+/// Сохранённая очередь: (треки, индекс, источник); индекс приводится к границам очереди
+pub fn load_session() -> Option<(Vec<Track>, usize, Option<crate::player::PlaySource>)> {
+    load_session_in(&session_dir())
+}
+
 // ================= Свои клипы для фона =================
 // ~/.local/share/volna/custom_clips/<id альбома>/*.mp4: для треков этого альбома фон берёт их вместо клипов Яндекса.
 // Файлы кладёт пользователь, в репозиторий они не входят.
@@ -255,5 +306,24 @@ mod custom_clip_tests {
         assert_eq!(custom_clip_in(&tmp, &white_pony, 7), Some(dir.join("a.mp4")));
         assert_eq!(custom_clip_in(&tmp, &other, 0), None);
         let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn session_is_loaded_and_index_is_clamped() {
+        let dir = std::env::temp_dir().join(format!("volna-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = |id: &str| -> Track { serde_json::from_value(serde_json::json!({"id": id, "title": id})).unwrap() };
+        assert!(load_session_in(&dir).is_none());
+        let json = serde_json::to_vec(&Session { source: Some(crate::player::PlaySource::new("Альбом: X", None)), queue: vec![t("1"), t("2")] }).unwrap();
+        std::fs::write(dir.join("queue.json"), json).unwrap();
+        std::fs::write(dir.join("index"), "9").unwrap();
+        let (queue, index, source) = load_session_in(&dir).unwrap();
+        assert_eq!((queue.len(), index, source.map(|s| s.label).as_deref()), (2, 1, Some("Альбом: X")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

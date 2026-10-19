@@ -10,7 +10,7 @@ use gtk4::{
 
 use super::collection::{album_tile, ask_playlist_name, clear_box, ensure_liked, new_playlist_tile, open_playlist, playlist_tile, section_title, tile_row, track_actions, track_row, DetailPage};
 use crate::api::models::Playlist;
-use crate::player::{PlayerManager, PlayerUiEvent};
+use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 
 pub struct LibraryViewWidgets {
     pub container: GtkBox,
@@ -133,7 +133,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
             let saved = crate::cache::list_offline();
             for (i, track) in saved.iter().enumerate() {
                 let (p, queue) = (p.clone(), saved.clone());
-                let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play(queue.clone(), i) });
+                let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play_from(queue.clone(), i, Some(PlaySource::new("Загруженные", Some(SourceTarget::Library)))) });
                 row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                 offline_list.append(&row);
             }
@@ -163,7 +163,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     liked_list.remove_all();
                     for (i, track) in tracks.iter().take(LIKED_PREVIEW).enumerate() {
                         let (p, queue) = (p.clone(), tracks.clone());
-                        let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play(queue.clone(), i) });
+                        let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play_from(queue.clone(), i, Some(PlaySource::new("Мне нравится", Some(SourceTarget::Library)))) });
                         row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                         liked_list.append(&row);
                     }

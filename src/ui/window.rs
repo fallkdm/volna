@@ -153,6 +153,48 @@ impl VolnaWindow {
         open_from_player(&wave_view.title_label, false);
         open_from_player(&wave_view.artist_label, true);
 
+        // Клик по плашке источника («Альбом: …», «Плейлист: …», «По треку: …») открывает этот источник
+        {
+            let click = gtk4::GestureClick::new();
+            let (vs, target) = (view_stack.clone(), wave_view.source_target.clone());
+            let (show_artist, show_track, show_album, show_playlist) = (
+                search_view.show_artist.clone(),
+                search_view.show_track.clone(),
+                search_view.show_album.clone(),
+                search_view.show_playlist.clone(),
+            );
+            let close = close_karaoke.clone();
+            click.connect_released(move |_, _, _, _| {
+                let Some(target) = target.borrow().clone() else { return };
+                let f = close.borrow().clone();
+                if let Some(f) = f {
+                    f();
+                }
+                use crate::player::SourceTarget::*;
+                match target {
+                    Library => vs.set_visible_child_name("library"),
+                    Album(a) => {
+                        vs.set_visible_child_name("search");
+                        show_album(a);
+                    }
+                    Playlist(pl) => {
+                        vs.set_visible_child_name("search");
+                        show_playlist(pl);
+                    }
+                    Artist(id) => {
+                        vs.set_visible_child_name("search");
+                        show_artist(id);
+                    }
+                    Track(t) => {
+                        vs.set_visible_child_name("search");
+                        show_track(t);
+                    }
+                }
+            });
+            wave_view.pill_label.add_controller(click);
+            wave_view.pill_label.set_cursor_from_name(Some("pointer"));
+        }
+
         // Клик по обложке в плеере открывает альбом текущего трека
         {
             let click = gtk4::GestureClick::new();
@@ -800,7 +842,15 @@ fn setup_event_listener(
                         island.dislike_btn.remove_css_class("disliked");
                     }
                 }
-                PlayerUiEvent::WaveContext(label) => wave_view.set_context(label.as_deref()),
+                PlayerUiEvent::WaveContext(label) => {
+                    wave_view.set_context(label.as_deref());
+                    *wave_view.source_target.borrow_mut() = None; // цель для станции придёт следом (StationTarget)
+                }
+                PlayerUiEvent::SourceContext(source) => {
+                    wave_view.set_source(source.as_ref().map(|s| s.label.as_str()));
+                    *wave_view.source_target.borrow_mut() = source.and_then(|s| s.target);
+                }
+                PlayerUiEvent::StationTarget(target) => *wave_view.source_target.borrow_mut() = target,
                 PlayerUiEvent::RepeatChanged(mode) => {
                     let tip = match mode {
                         RepeatMode::Off => "Повтор: выключен",

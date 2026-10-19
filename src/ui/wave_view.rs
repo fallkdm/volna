@@ -112,7 +112,10 @@ pub struct WaveViewWidgets {
     pub filter_pill: GtkBox,
     /// Клип на фоне (превью-ролик трека)
     pub clip: Rc<super::wave_clip::ClipController>,
-    pill_label: Label,
+    pub pill_label: Label,
+    pill_close: Button,
+    /// Куда ведёт клик по плашке (источник очереди или станция)
+    pub source_target: Rc<RefCell<Option<crate::player::SourceTarget>>>,
     option_buttons: Rc<RefCell<Vec<Button>>>,
 }
 
@@ -122,10 +125,25 @@ impl WaveViewWidgets {
         match label {
             Some(text) => {
                 self.pill_label.set_text(text);
+                self.pill_close.set_tooltip_text(Some("Сбросить фильтр"));
+                self.pill_close.set_visible(true);
                 self.filter_pill.set_visible(true);
                 for b in self.option_buttons.borrow().iter() {
                     b.remove_css_class("selected");
                 }
+            }
+            None => self.filter_pill.set_visible(false),
+        }
+    }
+
+    /// Подпись источника очереди (плейлист, альбом, топ артиста); крестик включает обычную Волну
+    pub fn set_source(&self, label: Option<&str>) {
+        match label {
+            Some(text) => {
+                self.pill_label.set_text(text);
+                self.pill_close.set_tooltip_text(Some("Сбросить: включить обычную Волну"));
+                self.pill_close.set_visible(true);
+                self.filter_pill.set_visible(true);
             }
             None => self.filter_pill.set_visible(false),
         }
@@ -305,6 +323,8 @@ pub fn create_wave_view(
 
     // выбранный пункт подсвечивается; общий список нужен, чтобы снять подсветку с прежнего
     let option_buttons: Rc<RefCell<Vec<Button>>> = Rc::default();
+    // куда ведёт клик по плашке; выбор фильтра сбрасывает цель (плашка тогда показывает фильтры)
+    let source_target: Rc<RefCell<Option<crate::player::SourceTarget>>> = Rc::default();
 
     let popover_box = GtkBox::new(Orientation::Vertical, 14);
     popover_box.add_css_class("wave-settings-card");
@@ -457,7 +477,8 @@ pub fn create_wave_view(
             let player_clone = player.clone();
             let accent_clone = accent_color.clone();
             let da_weak = drawing_area.downgrade();
-            let (pill_label_clone, pill_clone) = (pill_label.clone(), filter_pill.clone());
+            let (pill_label_clone, pill_clone, pill_close_clone) = (pill_label.clone(), filter_pill.clone(), pill_close.clone());
+            let source_target_clone = source_target.clone();
             let shader_state_clone = shader_state.clone();
 
             let opt_label = opt.label;
@@ -482,6 +503,8 @@ pub fn create_wave_view(
                     }
                     let labels: Vec<&str> = sel.iter().flatten().map(|p| p.1).collect();
                     pill_label_clone.set_text(&labels.join(" · "));
+                    pill_close_clone.set_tooltip_text(Some("Сбросить фильтр"));
+                    *source_target_clone.borrow_mut() = None;
                     pill_clone.set_visible(!labels.is_empty());
                     // цвет фона: последний выбранный пункт, иначе стандартный оранжевый
                     let core = if same {
@@ -607,6 +630,8 @@ pub fn create_wave_view(
         clip,
         filter_pill,
         pill_label,
+        pill_close: pill_close.clone(),
+        source_target: source_target.clone(),
         option_buttons,
     }
 }

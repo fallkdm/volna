@@ -126,7 +126,7 @@ impl ClipController {
         self.stop();
         let desc = format!(
             "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale ! \
-             video/x-raw,format=RGBA,width=640 ! appsink name=sink sync=true max-buffers=2 drop=true",
+             video/x-raw,format=RGBA,width=640,pixel-aspect-ratio=1/1 ! appsink name=sink sync=true max-buffers=2 drop=true",
             path.replace('\\', "\\\\").replace('"', "\\\"")
         );
         let Ok(element) = gstreamer::parse::launch(&desc) else { return };

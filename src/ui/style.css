@@ -653,3 +653,17 @@ toast {
 .cast-active {
     color: #ff6b4a;
 }
+
+/* плашка «N слушателей в месяц» на странице артиста */
+.listeners-pill {
+    padding: 6px 12px;
+    border-radius: 9999px;
+    background-color: rgba(255, 255, 255, 0.12);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+/* видео артиста: фон за шапкой на всю ширину, слегка размыт */
+.artist-ambient {
+    filter: blur(9px) saturate(1.15);
+}

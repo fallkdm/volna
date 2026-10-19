@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_channel::Sender;
 
 use crate::api::client::YandexMusicClient;
-use crate::api::models::Track;
+use crate::api::models::{Album, Playlist, Track};
 use super::audio::AudioBackend;
 
 /// Режим повтора: нет, один трек, вся очередь (для Волны «вся очередь» недоступна)
@@ -13,6 +13,30 @@ pub enum RepeatMode {
     Off,
     One,
     All,
+}
+
+/// Куда ведёт клик по плашке источника
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum SourceTarget {
+    Album(Album),
+    Playlist(Playlist),
+    Artist(String),
+    Track(Track),
+    /// Вкладка «Медиатека» («Мне нравится», «Загруженные»)
+    Library,
+}
+
+/// Откуда играет очередь: подпись на плашке и страница, куда ведёт клик по ней
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlaySource {
+    pub label: String,
+    pub target: Option<SourceTarget>,
+}
+
+impl PlaySource {
+    pub fn new(label: impl Into<String>, target: Option<SourceTarget>) -> Self {
+        Self { label: label.into(), target }
+    }
 }
 
 /// События плеера для обновления интерфейса
@@ -48,6 +72,10 @@ pub enum PlayerUiEvent {
     Error(String),
     /// Станция привязана (имя) или отвязана
     CastChanged(Option<String>),
+    /// Откуда играет очередь: «Плейлист: …», «Альбом: …», «Популярное: …»; `None` — подписи нет
+    SourceContext(Option<PlaySource>),
+    /// Страница, куда ведёт плашка Волны («По треку», «По артисту»)
+    StationTarget(Option<SourceTarget>),
     /// Изменились настройки Discord (включение, Application ID)
     DiscordSettingsChanged,
 }
@@ -71,6 +99,8 @@ pub struct PlayerState {
     pub wave: bool,
     /// Подпись Волны по артисту/треку (у простой Волны её нет)
     pub wave_label: Option<String>,
+    /// Откуда играет очередь («Плейлист: …»); для сохранения между запусками
+    pub play_source: Option<PlaySource>,
     /// Показан сохранённый последний трек, воспроизведение ещё не запускалось
     pub restored: bool,
 }
@@ -93,6 +123,7 @@ impl Default for PlayerState {
             repeat: RepeatMode::Off,
             wave: false,
             wave_label: None,
+            play_source: None,
             restored: false,
         }
     }
@@ -200,6 +231,25 @@ impl PlayerManager {
     /// Показывает последний проигранный трек: заголовок, цвета, обложку и текст. Воспроизведение не стартует
     fn restore_last_track(&self) {
         let Some(track) = crate::api::history::load_last_track() else { return };
+        // последняя очередь (альбом, плейлист): после перезапуска Play продолжает её, а не включает Волну по треку
+        if let Some((queue, index, source)) = crate::cache::load_session() {
+            if queue.get(index).is_some_and(|t| t.id == track.id) {
+                let total = queue.len();
+                {
+                    let mut state = self.state.lock().unwrap();
+                    state.queue = queue;
+                    state.current_index = index;
+                    state.current_track = Some(track.clone());
+                    state.play_source = source.clone();
+                    state.restored = true;
+                }
+                self.emit(PlayerUiEvent::SourceContext(source));
+                self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index, total_queue: total });
+                let client = self.client.lock().unwrap().clone();
+                spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
+                return;
+            }
+        }
         {
             let mut state = self.state.lock().unwrap();
             state.queue = vec![track.clone()];
@@ -214,16 +264,20 @@ impl PlayerManager {
 
     /// Если на экране сохранённый трек, первое нажатие Play/вперёд/назад запускает его (с продолжением Волной по треку)
     fn resume_restored(&self) -> bool {
-        let track = {
+        let (track, session) = {
             let mut state = self.state.lock().unwrap();
             if !state.restored {
                 return false;
             }
             state.restored = false;
-            state.current_track.clone()
+            let session = (state.queue.len() > 1).then(|| (state.queue.clone(), state.current_index, state.play_source.clone()));
+            (state.current_track.clone(), session)
         };
-        if let Some(track) = track {
-            self.play_single_track(track);
+        match (session, track) {
+            // восстановлена очередь: продолжаем её с того же места
+            (Some((queue, index, source)), _) => self.set_queue_and_play_from(queue, index, source),
+            (None, Some(track)) => self.play_single_track(track),
+            _ => {}
         }
         true
     }
@@ -374,6 +428,9 @@ impl PlayerManager {
 
     /// Запоминает, что играет: станция Ротора или обычная очередь; для Волны повтор очереди сбрасывается
     fn set_wave(&self, wave: bool) {
+        if wave {
+            crate::cache::clear_session(); // после перезапуска Волна продолжается по треку
+        }
         let reset = {
             let mut state = self.state.lock().unwrap();
             state.wave = wave;
@@ -559,6 +616,12 @@ impl PlayerManager {
         }
         self.set_wave(true);
         self.set_wave_label(Some(label.clone()));
+        let target = match (&first, station_id.split_once(':')) {
+            (Some(t), Some(("track", _))) => Some(SourceTarget::Track(t.clone())),
+            (_, Some(("artist", id))) => Some(SourceTarget::Artist(id.to_string())),
+            _ => None,
+        };
+        self.emit(PlayerUiEvent::StationTarget(target));
 
         match &first {
             Some(t) => {
@@ -613,6 +676,11 @@ impl PlayerManager {
 
     /// Задает новую очередь треков и запускает воспроизведение
     pub fn set_queue_and_play(&self, tracks: Vec<Track>, start_index: usize) {
+        self.set_queue_and_play_from(tracks, start_index, None);
+    }
+
+    /// Запускает очередь и подписывает, откуда она (плейлист, альбом, топ артиста…)
+    pub fn set_queue_and_play_from(&self, tracks: Vec<Track>, start_index: usize, source: Option<PlaySource>) {
         if tracks.is_empty() {
             return;
         }
@@ -624,11 +692,14 @@ impl PlayerManager {
             state.queue = tracks.clone();
             state.current_index = index;
             state.current_track = Some(track.clone());
+            state.play_source = source.clone();
             state.is_liked = false;
             state.is_disliked = false;
         }
 
         self.set_wave(false);
+        crate::cache::save_session_queue(&tracks, source.clone());
+        self.emit(PlayerUiEvent::SourceContext(source));
         self.emit(PlayerUiEvent::QueueUpdated(tracks.clone()));
         self.emit(PlayerUiEvent::TrackStarted {
             track: track.clone(),
@@ -765,7 +836,13 @@ impl PlayerManager {
         let client = self.client.lock().unwrap().clone();
         spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
         crate::api::history::save_last_track(track);
-        self.state.lock().unwrap().restored = false;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.restored = false;
+            if !state.wave {
+                crate::cache::save_session_index(state.current_index);
+            }
+        }
 
         // привязана Станция: трек играет на ней, звук приложения молчит
         if self.cast_play(track) {

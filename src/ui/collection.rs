@@ -13,7 +13,7 @@ use libadwaita::prelude::*;
 use libadwaita::ActionRow;
 
 use crate::api::models::{Album, Artist, Playlist, Track};
-use crate::player::{PlayerManager, PlayerUiEvent};
+use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 
 thread_local! {
     /// Идентификаторы треков из «Мне нравится»; None, пока не загружены
@@ -161,6 +161,20 @@ pub struct DetailPage {
     subtitle: Label,
     list: ListBox,
     tracks: Rc<RefCell<Vec<Track>>>,
+    /// Подпись источника очереди для плашки на экране Волны (по типу страницы)
+    source: Rc<RefCell<Option<PlaySource>>>,
+    /// Видео в шапке страницы артиста: кадры из GStreamer рисуются в `Picture`
+    /// Фото артиста (адреса 1000×1000) для просмотра по клику на аватарку
+    photos: Rc<RefCell<Vec<String>>>,
+    /// Размытое свечение того же видео на всю ширину шапки
+    ambient_pic: gtk4::Picture,
+    video: super::wave_clip::ClipController,
+    video_shared: std::sync::Arc<super::wave_clip::ClipShared>,
+    /// Номер показа видео: таймер кадров и запоздавшие загрузки устаревшего видео отбрасываются
+    video_gen: std::cell::Cell<u32>,
+    /// Плашка «N слушателей в месяц» у артиста
+    listeners: GtkBox,
+    listeners_label: Label,
     player: PlayerManager,
     wave_btn: Button,
     wave: Rc<RefCell<Option<Wave>>>,
@@ -265,6 +279,14 @@ impl DetailPage {
         info.set_hexpand(true);
         info.append(&kind);
         info.append(&title_row);
+        let listeners = GtkBox::new(Orientation::Horizontal, 6);
+        listeners.add_css_class("listeners-pill");
+        listeners.set_halign(Align::Start);
+        listeners.set_visible(false);
+        listeners.append(&Image::from_icon_name("avatar-default-symbolic"));
+        let listeners_label = Label::new(None);
+        listeners.append(&listeners_label);
+        info.append(&listeners);
         info.append(&subtitle);
         let desc_btn = Button::new();
         desc_btn.add_css_class("flat");
@@ -300,8 +322,31 @@ impl DetailPage {
         cover_overlay.add_overlay(&cover_btn);
         let hero = GtkBox::new(Orientation::Horizontal, 24);
         hero.append(&cover_overlay);
+        // клик по аватарке артиста открывает все его фото
+        let photos: Rc<RefCell<Vec<String>>> = Rc::default();
+        {
+            let (photos, title, anchor) = (photos.clone(), title.clone(), cover.clone());
+            let click = gtk4::GestureClick::new();
+            click.connect_released(move |_, _, _, _| {
+                let urls = photos.borrow().clone();
+                if !urls.is_empty() {
+                    show_photo_gallery(&anchor, &title.text(), &urls);
+                }
+            });
+            cover.add_controller(click);
+        }
         hero.append(&info);
+        // видео артиста лежит под всей страницей (оверлей вокруг прокрутки), края у него растворяются в фоне
+        // видео артиста играет размытым фоном позади шапки на всю ширину страницы
+        let ambient_pic = gtk4::Picture::new();
+        ambient_pic.set_content_fit(gtk4::ContentFit::Fill); // кадр уже обрезан под пропорции в `ambient_frame`
+        ambient_pic.set_can_shrink(true);
+        ambient_pic.set_can_target(false);
+        ambient_pic.add_css_class("artist-ambient");
+        ambient_pic.set_visible(false);
         content.append(&hero);
+        let video_shared = std::sync::Arc::new(super::wave_clip::ClipShared::default());
+        let video = super::wave_clip::ClipController::new(video_shared.clone());
         let about = GtkBox::new(Orientation::Vertical, 6);
         about.add_css_class("about-card");
         about.set_visible(false);
@@ -312,6 +357,7 @@ impl DetailPage {
         list.set_selection_mode(gtk4::SelectionMode::None);
 
         let tracks: Rc<RefCell<Vec<Track>>> = Rc::default();
+        let source: Rc<RefCell<Option<PlaySource>>> = Rc::default();
         let owner_target: Rc<RefCell<Option<(String, String)>>> = Rc::default();
         let nav: NavCell = Rc::default();
         let owner_box = GtkBox::new(Orientation::Vertical, 12);
@@ -405,11 +451,28 @@ impl DetailPage {
         content.set_margin_bottom(130);
         content.set_margin_end(14);
         scrolled.set_child(Some(&content));
-        widget.append(&scrolled);
+        let page_overlay = gtk4::Overlay::new();
+        page_overlay.set_vexpand(true);
+        page_overlay.set_child(Some(&gtk4::Box::new(Orientation::Vertical, 0)));
+        page_overlay.add_overlay(&ambient_pic);
+        page_overlay.add_overlay(&scrolled);
+        // видео занимает верх страницы на всю ширину и уезжает вверх вместе с прокруткой
+        {
+            let (bg, adj) = (ambient_pic.clone(), scrolled.vadjustment());
+            page_overlay.connect_get_child_position(move |ov, child| {
+                if child != bg.upcast_ref::<gtk4::Widget>() {
+                    return None;
+                }
+                Some(gdk::Rectangle::new(0, -(adj.value() as i32) - AMBIENT_LIFT, ov.width(), AMBIENT_HEIGHT))
+            });
+            let ov = page_overlay.clone();
+            scrolled.vadjustment().connect_value_changed(move |_| ov.queue_allocate());
+        }
+        widget.append(&page_overlay);
 
         {
-            let (p, t) = (player.clone(), tracks.clone());
-            play.connect_clicked(move |_| p.set_queue_and_play(t.borrow().clone(), 0));
+            let (p, t, src) = (player.clone(), tracks.clone(), source.clone());
+            play.connect_clicked(move |_| p.set_queue_and_play_from(t.borrow().clone(), 0, src.borrow().clone()));
         }
 
         {
@@ -455,7 +518,7 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, video, video_shared, video_gen: Default::default(), listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
     }
 
     /// Кнопка-описание у своего плейлиста: клик открывает редактирование
@@ -563,6 +626,19 @@ impl DetailPage {
     /// Стек, в котором лежит страница; нужен меню треков для переходов к альбому и исполнителю
     pub fn set_nav(self: &Rc<Self>, stack: &Stack) {
         *self.nav.borrow_mut() = Some((stack.clone(), Rc::downgrade(self)));
+        // клики по исполнителю и альбому в подписи страницы (`artist:ID`, `album:ID`); нужны на любом экране со страницами
+        let (p, stack, weak) = (self.player.clone(), stack.clone(), Rc::downgrade(self));
+        *self.link_handler.borrow_mut() = Some(Rc::new(move |uri: &str| {
+            let Some(page) = weak.upgrade() else { return };
+            if let Some(id) = uri.strip_prefix("artist:") {
+                open_artist(&p, &stack, &page, id.to_string());
+            } else if let Some(id) = uri.strip_prefix("album:") {
+                let album = page.link_albums.borrow().iter().find(|a| a.id == id).cloned();
+                if let Some(album) = album {
+                    open_album(&p, &stack, &page, &album);
+                }
+            }
+        }));
     }
 
     pub fn set_on_removed(&self, f: impl Fn() + 'static) {
@@ -738,6 +814,64 @@ impl DetailPage {
         });
     }
 
+    /// Включает зацикленное видео в шапке (беззвучно); кадры забирает таймер, пока страница на этом видео
+    pub fn play_background_video(self: &Rc<Self>, path: &str) {
+        let token = self.video_gen.get() + 1;
+        self.video_gen.set(token);
+        self.ambient_pic.set_visible(true);
+        self.video.play(path);
+        let weak = Rc::downgrade(self);
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+            let Some(page) = weak.upgrade() else { return glib::ControlFlow::Break };
+            if page.video_gen.get() != token {
+                return glib::ControlFlow::Break;
+            }
+            if let Some(f) = page.video_shared.take_fresh() {
+                let ratio = page.ambient_pic.width().max(1) as f32 / AMBIENT_HEIGHT as f32;
+                let (aw, ah, glow) = ambient_frame(&f, ratio);
+                let glow = gdk::MemoryTexture::new(aw, ah, gdk::MemoryFormat::R8g8b8a8Premultiplied, &glib::Bytes::from_owned(glow), (aw * 4) as usize);
+                page.ambient_pic.set_paintable(Some(&glow));
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Останавливает видео шапки и возвращает обычную обложку
+    pub fn stop_background_video(&self) {
+        self.video_gen.set(self.video_gen.get() + 1);
+        self.video.stop();
+        self.ambient_pic.set_paintable(None::<&gdk::Paintable>);
+        self.ambient_pic.set_visible(false);
+    }
+
+    /// Номер показа видео: по нему загрузка проверяет, что страница ещё та же
+    pub fn video_token(&self) -> u32 {
+        self.video_gen.get()
+    }
+
+    /// Фото артиста для просмотра по клику на аватарку (если их больше одного)
+    pub fn set_photos(&self, uris: &[String]) {
+        let urls: Vec<String> = uris.iter().map(|u| crate::api::models::cover_url(u, 1000)).collect();
+        if urls.len() > 1 {
+            self.cover.set_cursor_from_name(Some("pointer"));
+            self.cover.set_tooltip_text(Some("Все фото"));
+        }
+        *self.photos.borrow_mut() = if urls.len() > 1 { urls } else { Vec::new() };
+    }
+
+    /// Страница, куда ведёт клик по плашке источника (ставится после `show`)
+    pub fn set_source_target(&self, target: SourceTarget) {
+        if let Some(src) = self.source.borrow_mut().as_mut() {
+            src.target = Some(target);
+        }
+    }
+
+    /// Плашка «N слушателей в месяц» на странице артиста
+    pub fn set_listeners(&self, count: u64) {
+        self.listeners_label.set_text(&format!("{} слушателей в месяц", group_digits(count)));
+        self.listeners.set_visible(true);
+    }
+
     /// Показывает кнопку «Волна по …»
     pub fn set_wave(&self, wave: Wave) {
         self.wave_btn.set_label(match wave {
@@ -911,6 +1045,14 @@ impl DetailPage {
     pub fn show(&self, kind: &str, title: &str, subtitle: &str, cover_url: Option<String>, tracks: Vec<Track>) {
         self.kind.set_text(kind);
         self.title.set_text(title);
+        self.stop_background_video();
+        self.photos.borrow_mut().clear();
+        self.cover.set_cursor(None::<&gdk::Cursor>);
+        *self.source.borrow_mut() = source_label(kind, title).map(|label| {
+            // у «Мне нравится» и «Загруженных» страницы нет, клик ведёт на вкладку Медиатека
+            PlaySource::new(label, (kind == "Коллекция").then_some(SourceTarget::Library))
+        });
+        self.listeners.set_visible(false);
         self.title_badge.set_visible(false);
         self.subtitle.set_markup(&glib::markup_escape_text(subtitle));
         self.link_albums.borrow_mut().clear();
@@ -934,11 +1076,11 @@ impl DetailPage {
             self.list.remove(&child);
         }
         for track in tracks.iter() {
-            let (p, t, id) = (self.player.clone(), self.tracks.clone(), track.id.clone());
+            let (p, t, id, src) = (self.player.clone(), self.tracks.clone(), track.id.clone(), self.source.clone());
             // позицию ищем по id: добавление в плейлист сдвигает индексы
             let row = track_row(track, move || {
                 let i = t.borrow().iter().position(|x| x.id == id).unwrap_or(0);
-                p.set_queue_and_play(t.borrow().clone(), i)
+                p.set_queue_and_play_from(t.borrow().clone(), i, src.borrow().clone())
             });
             row.add_suffix(&row_actions(&self.player, &self.nav, track));
             self.list.append(&row);
@@ -957,9 +1099,10 @@ fn insert_track_row(p: &PlayerManager, nav: &NavCell, tracks: &Rc<RefCell<Vec<Tr
     let (p2, t) = (p.clone(), tracks.clone());
     // индексы строк сдвинулись, поэтому позицию ищем по id
     let id = track.id.clone();
+    let source = nav.borrow().as_ref().and_then(|(_, w)| w.upgrade()).map(|pg| pg.source.clone()).unwrap_or_default();
     let row = track_row(track, move || {
         let i = t.borrow().iter().position(|x| x.id == id).unwrap_or(0);
-        p2.set_queue_and_play(t.borrow().clone(), i)
+        p2.set_queue_and_play_from(t.borrow().clone(), i, source.borrow().clone())
     });
     row.add_suffix(&row_actions(p, nav, track));
     list.insert(&row, 0);
@@ -1002,6 +1145,16 @@ pub fn open(
         match result {
             Ok(tracks) => {
                 page.show(kind, &title, &subtitle, cover_url, tracks);
+                match (&source, &album) {
+                    (Source::Album(_), Some(al)) => page.set_source_target(SourceTarget::Album(al.clone())),
+                    (Source::Playlist(uid, k), _) => page.set_source_target(SourceTarget::Playlist(Playlist {
+                        uid: uid.clone(),
+                        kind: k.clone(),
+                        title: title.clone(),
+                        ..Default::default()
+                    })),
+                    _ => {}
+                }
                 if let Source::Playlist(uid, k) = &source {
                     if let Ok(me) = client.get_uid().await {
                         let liked = client.get_liked_playlist_keys(&me).await.unwrap_or_default().contains(&format!("{}:{}", uid, k));
@@ -1103,6 +1256,24 @@ pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                 let a = &brief.artist;
                 page.show("Исполнитель", &a.name, "", a.cover_url(400), brief.popular_tracks);
                 page.set_round_cover(true);
+                page.set_source_target(SourceTarget::Artist(artist_id.clone()));
+                let photos: Vec<String> = brief.all_covers.iter().filter_map(|c| c.uri.clone()).collect();
+                page.set_photos(&photos);
+                if let Some(n) = brief.stats.as_ref().and_then(|s| s.last_month_listeners) {
+                    page.set_listeners(n);
+                }
+                // видео шапки: только https и хосты Яндекса, ссылка приходит из ответа сервера
+                if let Some(url) = brief.background_video_url.clone().filter(|u| trusted_video_url(u)) {
+                    let (page, token) = (page.clone(), page.video_token());
+                    glib::spawn_future_local(async move {
+                        if let Some(path) = crate::cache::fetch_clip_cached(&url).await {
+                            // пока качалось, страницу могли сменить
+                            if page.video_token() == token {
+                                page.play_background_video(&path.to_string_lossy());
+                            }
+                        }
+                    });
+                }
                 page.load_about(a.name.clone());
                 page.set_wave(Wave::Artist(artist_id, a.name.clone()));
                 if !brief.albums.is_empty() {
@@ -1137,6 +1308,7 @@ pub fn open_track(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, 
         };
         page.show("Трек", &track.title, &sub, track.cover_url(400), tracks);
         page.title_badge.set_visible(track.is_explicit());
+        page.set_source_target(SourceTarget::Track(track.clone()));
         page.set_subtitle_links(&track.artists, track.albums.first(), None);
         if let Some(a) = track.artists.first() {
             page.load_about(a.name.clone());
@@ -1492,7 +1664,10 @@ fn show_track_credits(player: &PlayerManager, anchor: &impl IsA<gtk4::Widget>, t
     dialog.set_title(&track.title);
     dialog.set_content_width(480);
     dialog.set_content_height(460);
-    dialog.set_child(Some(&scrolled));
+    let toolbar = libadwaita::ToolbarView::new();
+    toolbar.add_top_bar(&libadwaita::HeaderBar::new());
+    toolbar.set_content(Some(&scrolled));
+    dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));
 
     let (p, id) = (player.clone(), track.id.clone());
@@ -1537,4 +1712,234 @@ fn offline_label(tracks: &[Track]) -> &'static str {
     } else {
         "Загрузить"
     }
+}
+
+/// Подпись источника очереди для плашки на экране Волны по типу страницы
+fn source_label(kind: &str, title: &str) -> Option<String> {
+    match kind {
+        "Плейлист" => Some(format!("Плейлист: {title}")),
+        "Альбом" => Some(format!("Альбом: {title}")),
+        "Исполнитель" => Some(format!("Популярное: {title}")),
+        "Трек" => Some(format!("Похожие на «{title}»")),
+        "Коллекция" => Some(title.to_string()),
+        _ => None,
+    }
+}
+
+/// 5510287 → «5 510 287» (неразрывные пробелы)
+fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push('\u{a0}');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    #[test]
+    fn labels_and_digits() {
+        assert_eq!(source_label("Плейлист", "Попа").as_deref(), Some("Плейлист: Попа"));
+        assert_eq!(source_label("Исполнитель", "Три дня дождя").as_deref(), Some("Популярное: Три дня дождя"));
+        assert_eq!(source_label("Что-то", "x"), None);
+        assert_eq!(group_digits(5_510_287), "5\u{a0}510\u{a0}287");
+        assert_eq!(group_digits(999), "999");
+    }
+}
+
+/// Видео шапки принимается только по https с хоста Яндекса
+fn trusted_video_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let host = rest.split('/').next().unwrap_or("");
+    host.ends_with(".yandex.net") || host.ends_with(".yandex.ru")
+}
+
+#[cfg(test)]
+mod video_url_tests {
+    use super::*;
+
+    #[test]
+    fn only_yandex_https_hosts_are_trusted() {
+        assert!(trusted_video_url("https://runtime.strm.yandex.ru/videos/a/b.mp4"));
+        assert!(trusted_video_url("https://video-preview.s3.yandex.net/x.mp4"));
+        assert!(!trusted_video_url("http://runtime.strm.yandex.ru/x.mp4"));
+        assert!(!trusted_video_url("https://evil.example.com/yandex.ru/x.mp4"));
+        assert!(!trusted_video_url("https://yandex.ru.evil.com/x.mp4"));
+    }
+}
+
+/// Высота видео за шапкой артиста, px
+const AMBIENT_HEIGHT: i32 = 580;
+/// На сколько видео поднято выше верха страницы: верх кадра обычно тёмный пустой, его уводим за край
+const AMBIENT_LIFT: i32 = 40;
+
+/// Кадр для свечения за шапкой: вырезка под пропорции области, уменьшенная до 64 px по ширине.
+/// Растягивание маленькой картинки и CSS-размытие дают мягкое цветное пятно; к низу и бокам оно
+/// становится прозрачным (премультиплицированный RGBA) и затемняется, чтобы текст шапки читался.
+fn ambient_frame(f: &super::wave_clip::ClipFrame, ratio: f32) -> (i32, i32, Vec<u8>) {
+    const W: usize = 112;
+    let (sw, sh) = (f.width.max(1) as usize, f.height.max(1) as usize);
+    let (cw, ch) = if sw as f32 / sh as f32 > ratio { ((sh as f32 * ratio) as usize, sh) } else { (sw, (sw as f32 / ratio) as usize) };
+    let (cw, ch) = (cw.clamp(1, sw), ch.clamp(1, sh));
+    let (x0, y0) = ((sw - cw) / 2, ((sh - ch) as f32 * 0.3) as usize);
+    let h = ((W as f32 / ratio.max(0.1)) as usize).clamp(4, 112);
+    let smooth = |t: f32| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    let mut out = Vec::with_capacity(W * h * 4);
+    for oy in 0..h {
+        // прозрачность: сверху плотно, нижние 55% растворяются; по бокам короткое растворение
+        let fy = smooth((h - 1 - oy) as f32 / (h - 1).max(1) as f32 / 0.62);
+        for ox in 0..W {
+            let fx = smooth(ox as f32 / W as f32 / 0.12) * smooth((W - 1 - ox) as f32 / W as f32 / 0.12);
+            // среднее по блоку исходного кадра
+            let (bx0, bx1) = (x0 + ox * cw / W, (x0 + (ox + 1) * cw / W).max(x0 + ox * cw / W + 1));
+            let (by0, by1) = (y0 + oy * ch / h, (y0 + (oy + 1) * ch / h).max(y0 + oy * ch / h + 1));
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in (by0..by1.min(sh)).step_by(2) {
+                for x in (bx0..bx1.min(sw)).step_by(2) {
+                    let i = (y * sw + x) * 4;
+                    r += f.data[i] as u32;
+                    g += f.data[i + 1] as u32;
+                    b += f.data[i + 2] as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1) as f32;
+            let a = fx * fy;
+            let m = a * 0.88; // лёгкое затемнение: текст шапки читается, видео остаётся заметным
+            out.extend_from_slice(&[(r as f32 / n * m) as u8, (g as f32 / n * m) as u8, (b as f32 / n * m) as u8, (a * 255.0) as u8]);
+        }
+    }
+    (W as i32, h as i32, out)
+}
+
+#[cfg(test)]
+mod ambient_tests {
+    use super::*;
+    use crate::ui::wave_clip::ClipFrame;
+
+    #[test]
+    fn background_is_small_and_fades_to_bottom_and_sides() {
+        let f = ClipFrame { width: 640, height: 860, data: vec![200; 640 * 860 * 4] };
+        let (w, h, d) = ambient_frame(&f, 4.0);
+        assert_eq!((w, h), (112, 28));
+        let alpha = |x: usize, y: usize| d[(y * w as usize + x) * 4 + 3];
+        assert!(alpha(56, 0) > 240, "верх в центре плотный");
+        assert!(alpha(56, 27) < 5, "низ прозрачен");
+        assert!(alpha(0, 0) < 5 && alpha(111, 0) < 5, "края по бокам прозрачны");
+        assert!(d[56 * 4] < 200, "кадр слегка затемнён");
+    }
+}
+
+/// Загружает картинку в `Picture` (тот же кэш в памяти, что у обложек)
+fn load_picture(pic: &gtk4::Picture, url: String) {
+    if let Some(tex) = COVERS.with(|c| c.borrow().get(&url).cloned()) {
+        pic.set_paintable(Some(&tex));
+        return;
+    }
+    let weak = pic.downgrade();
+    glib::spawn_future_local(async move {
+        let Ok(resp) = reqwest::get(&url).await else { return };
+        let Ok(bytes) = resp.bytes().await else { return };
+        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
+        COVERS.with(|c| c.borrow_mut().insert(url, tex.clone()));
+        if let Some(p) = weak.upgrade() {
+            p.set_paintable(Some(&tex));
+        }
+    });
+}
+
+/// Просмотр фото артиста: листается стрелками на экране, клавишами и жестом, внизу точки
+fn show_photo_gallery(anchor: &impl IsA<gtk4::Widget>, title: &str, urls: &[String]) {
+    let carousel = libadwaita::Carousel::new();
+    carousel.set_hexpand(true);
+    carousel.set_vexpand(true);
+    let mut pages = Vec::new();
+    for url in urls {
+        let pic = gtk4::Picture::new();
+        pic.set_content_fit(gtk4::ContentFit::Contain);
+        pic.set_can_shrink(true);
+        pic.set_margin_top(8);
+        pic.set_margin_bottom(8);
+        load_picture(&pic, url.clone());
+        carousel.append(&pic);
+        pages.push(pic);
+    }
+    let dots = libadwaita::CarouselIndicatorDots::new();
+    dots.set_carousel(Some(&carousel));
+    dots.set_margin_bottom(12);
+
+    // стрелки поверх картинки по бокам
+    let arrow = |icon: &str, align: Align| {
+        let b = Button::from_icon_name(icon);
+        b.add_css_class("circular");
+        b.add_css_class("osd");
+        b.set_halign(align);
+        b.set_valign(Align::Center);
+        b.set_margin_start(12);
+        b.set_margin_end(12);
+        b
+    };
+    let (prev, next) = (arrow("go-previous-symbolic", Align::Start), arrow("go-next-symbolic", Align::End));
+    let overlay = gtk4::Overlay::new();
+    overlay.set_child(Some(&carousel));
+    overlay.add_overlay(&prev);
+    overlay.add_overlay(&next);
+
+    let go = {
+        let (carousel, pages) = (carousel.clone(), pages.clone());
+        move |step: i32| {
+            let n = pages.len() as i32;
+            let cur = carousel.position().round() as i32;
+            let target = (cur + step).rem_euclid(n) as usize;
+            carousel.scroll_to(&pages[target], true);
+        }
+    };
+    let go = Rc::new(go);
+    {
+        let go = go.clone();
+        prev.connect_clicked(move |_| go(-1));
+    }
+    {
+        let go = go.clone();
+        next.connect_clicked(move |_| go(1));
+    }
+    let keys = gtk4::EventControllerKey::new();
+    {
+        let go = go.clone();
+        keys.connect_key_pressed(move |_, key, _, _| match key {
+            gdk::Key::Left => {
+                go(-1);
+                glib::Propagation::Stop
+            }
+            gdk::Key::Right => {
+                go(1);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+    }
+
+    let content = GtkBox::new(Orientation::Vertical, 0);
+    content.append(&overlay);
+    content.append(&dots);
+    let dialog = libadwaita::Dialog::new();
+    dialog.set_title(title);
+    dialog.set_content_width(720);
+    dialog.set_content_height(760);
+    dialog.add_controller(keys);
+    // заголовок с крестиком: без него закрыть можно только Esc
+    let toolbar = libadwaita::ToolbarView::new();
+    toolbar.add_top_bar(&libadwaita::HeaderBar::new());
+    toolbar.set_content(Some(&content));
+    dialog.set_child(Some(&toolbar));
+    dialog.present(Some(anchor));
 }

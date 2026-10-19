@@ -395,6 +395,21 @@ pub struct ArtistBrief {
     pub albums: Vec<Album>,
     #[serde(default, rename = "popularTracks")]
     pub popular_tracks: Vec<Track>,
+    #[serde(default)]
+    pub stats: Option<ArtistStats>,
+    /// Все фото артиста (список аватарок)
+    #[serde(default, rename = "allCovers")]
+    pub all_covers: Vec<ArtistCover>,
+    /// Зацикленное видео в шапке страницы артиста (у части артистов есть)
+    #[serde(default, rename = "backgroundVideoUrl")]
+    pub background_video_url: Option<String>,
+}
+
+/// Статистика артиста из `brief-info`
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArtistStats {
+    #[serde(default, rename = "lastMonthListeners")]
+    pub last_month_listeners: Option<u64>,
 }
 
 /// Похожие треки (`/tracks/{id}/similar`)
