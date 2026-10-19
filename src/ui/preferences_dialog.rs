@@ -1,10 +1,15 @@
 use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Entry, Image, Orientation};
 use libadwaita::prelude::*;
-use libadwaita::{ActionRow, ComboRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup, PreferencesPage};
+use libadwaita::{
+    ActionRow, ComboRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup, PreferencesPage,
+    SpinRow, SwitchRow,
+};
 
 use crate::api::auth::{
-    load_clips, load_discord, save_clips, save_discord_client_id, save_discord_rpc, load_genius_token, load_lastfm_key, load_quality, load_token, save_genius_token, save_lastfm_key, save_quality, save_token,
+    load_clips, load_crossfade, load_discord, load_genius_token, load_lastfm_key, load_quality,
+    load_token, save_clips, save_crossfade, save_discord_client_id, save_discord_rpc,
+    save_genius_token, save_lastfm_key, save_quality, save_token,
 };
 use crate::cache::{clear_clips_cache, clear_covers_cache, clips_cache_size, covers_cache_size};
 use crate::player::PlayerManager;
@@ -46,8 +51,10 @@ pub fn show_preferences_dialog(
     wave_group.add(&wave_row);
     page.add(&wave_group);
 
-    // Качество звука: действует со следующего трека
-    let quality_group = PreferencesGroup::new();
+    // Воспроизведение: качество звука и плавный переход
+    let playback_group = PreferencesGroup::new();
+    playback_group.set_title("Воспроизведение");
+
     let quality_row = ComboRow::builder()
         .title("Качество звука")
         .subtitle("Яндекс отдаёт сторонним клиентам только MP3 (сейчас до 192 кбит/с); lossless недоступен. Применится со следующего трека")
@@ -65,8 +72,61 @@ pub fn show_preferences_dialog(
             _ => "best",
         });
     });
-    quality_group.add(&quality_row);
-    page.add(&quality_group);
+    playback_group.add(&quality_row);
+
+    let (crossfade_enabled, crossfade_dur) = load_crossfade();
+
+    let crossfade_switch = SwitchRow::builder()
+        .title("Плавный переход между треками")
+        .subtitle("Мягкая смена композиций без резких пауз")
+        .active(crossfade_enabled)
+        .build();
+
+    let duration_adj = gtk4::Adjustment::new(
+        crossfade_dur as f64,
+        1.0,
+        10.0,
+        1.0,
+        1.0,
+        0.0,
+    );
+
+    let duration_spin = SpinRow::builder()
+        .title("Длительность перехода")
+        .subtitle("Время затухания и нарастания звука в секундах")
+        .adjustment(&duration_adj)
+        .numeric(true)
+        .sensitive(crossfade_enabled)
+        .build();
+
+    {
+        let p = player.clone();
+        let spin_clone = duration_spin.clone();
+        crossfade_switch.connect_active_notify(move |row| {
+            let active = row.is_active();
+            spin_clone.set_sensitive(active);
+            let dur = spin_clone.value().round().clamp(1.0, 10.0) as u32;
+            let _ = save_crossfade(active, dur);
+            p.set_crossfade(active, dur);
+            p.emit(crate::player::PlayerUiEvent::CrossfadeChanged { enabled: active, duration: dur });
+        });
+    }
+
+    {
+        let p = player.clone();
+        let sw_clone = crossfade_switch.clone();
+        duration_spin.connect_value_notify(move |spin| {
+            let active = sw_clone.is_active();
+            let dur = spin.value().round().clamp(1.0, 10.0) as u32;
+            let _ = save_crossfade(active, dur);
+            p.set_crossfade(active, dur);
+            p.emit(crate::player::PlayerUiEvent::CrossfadeChanged { enabled: active, duration: dur });
+        });
+    }
+
+    playback_group.add(&crossfade_switch);
+    playback_group.add(&duration_spin);
+    page.add(&playback_group);
 
     // Клипы на фоне Волны (по желанию)
     let clips_group = PreferencesGroup::new();

@@ -207,58 +207,147 @@
       max-width: 500px;
     }
 
-    /* Quick Fluid Mood Carousel (Scrollable & Responsive) */
-    .fluid-pill-scroll-wrapper {
-      width: 100%;
-      max-width: 680px;
-      display: flex;
-      justify-content: center;
+    /* Wave Configuration Trigger Button & Popover */
+    .wave-trigger-container {
       position: relative;
-      flex-shrink: 0;
-    }
-    .fluid-pill-bar {
-      display: flex;
-      gap: 8px;
-      padding: 6px 12px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: var(--adw-radius-pill);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      overflow-x: auto;
-      scrollbar-width: none; /* Firefox */
-      -ms-overflow-style: none; /* IE */
-      max-width: 100%;
-    }
-    .fluid-pill-bar::-webkit-scrollbar {
-      display: none; /* Chrome/Safari */
+      display: inline-flex;
+      justify-content: center;
+      margin-top: 6px;
     }
 
-    .fluid-pill {
-      background: transparent;
-      border: none;
-      color: var(--adw-text-secondary);
-      padding: 7px 16px;
+    .wave-config-btn {
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      color: #ffffff;
+      padding: 8px 22px;
       border-radius: var(--adw-radius-pill);
       font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+    }
+    .wave-config-btn:hover {
+      background: rgba(255, 255, 255, 0.16);
+      border-color: rgba(255, 255, 255, 0.3);
+      transform: translateY(-1px);
+    }
+    .wave-config-btn.active-filter {
+      background: rgba(255, 107, 74, 0.22);
+      border-color: rgba(255, 107, 74, 0.5);
+      color: #ff9d85;
+      box-shadow: 0 4px 20px rgba(255, 107, 74, 0.25);
+    }
+    .config-arrow {
+      font-size: 11px;
+      opacity: 0.7;
+      transition: transform 0.2s;
+    }
+    .wave-config-btn.popover-open .config-arrow {
+      transform: rotate(180deg);
+    }
+
+    /* Libadwaita Authentic Popover */
+    .adw-popover {
+      position: absolute;
+      bottom: calc(100% + 12px);
+      left: 50%;
+      transform: translateX(-50%);
+      width: 370px;
+      max-width: calc(100vw - 32px);
+      background: #242424;
+      border: 1px solid var(--adw-border-strong);
+      border-radius: 16px;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.75), 0 2px 8px rgba(0, 0, 0, 0.4);
+      padding: 16px;
+      z-index: 120;
+      display: none;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .adw-popover.open {
+      display: flex;
+      animation: popoverFadeIn 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    @keyframes popoverFadeIn {
+      0% { opacity: 0; transform: translateX(-50%) translateY(8px); }
+      100% { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+
+    .popover-arrow {
+      position: absolute;
+      bottom: -7px;
+      left: 50%;
+      transform: translateX(-50%) rotate(45deg);
+      width: 12px;
+      height: 12px;
+      background: #242424;
+      border-right: 1px solid var(--adw-border-strong);
+      border-bottom: 1px solid var(--adw-border-strong);
+    }
+
+    .popover-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 8px;
+    }
+
+    .popover-section {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .popover-section-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--adw-text-dim);
+    }
+    .popover-chips-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .popover-chip {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--adw-border);
+      color: var(--adw-text-secondary);
+      padding: 6px 12px;
+      border-radius: var(--adw-radius-pill);
+      font-size: 12px;
       font-weight: 500;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      white-space: nowrap;
-      flex-shrink: 0;
-      transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+      gap: 5px;
+      transition: all 0.15s ease;
     }
-    .fluid-pill:hover {
+    .popover-chip:hover {
+      background: rgba(255, 255, 255, 0.12);
       color: #fff;
-      background: rgba(255, 255, 255, 0.1);
     }
-    .fluid-pill.active {
-      background: #ffffff;
-      color: #111111;
+    .popover-chip.active {
+      background: var(--adw-accent);
+      border-color: var(--adw-accent);
+      color: #ffffff;
       font-weight: 600;
-      box-shadow: 0 4px 14px rgba(255, 255, 255, 0.28);
+      box-shadow: 0 2px 8px rgba(53, 132, 228, 0.35);
+    }
+
+    .popover-footer {
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      padding-top: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
 
     /* Floating Island Player (Completely Adaptive) */
@@ -765,15 +854,60 @@
       <div class="hero-track-artist" id="heroArtist">M83 • Hurry Up, We're Dreaming</div>
     </div>
 
-    <!-- Quick Mood Carousel (Horizontally Scrollable) -->
-    <div class="fluid-pill-scroll-wrapper">
-      <div class="fluid-pill-bar" id="fluidPills">
-        <button class="fluid-pill active" data-color="#ff6b4a" data-mood="Энергичное">⚡ Энергичное</button>
-        <button class="fluid-pill" data-color="#3584e4" data-mood="Спокойное">☕ Спокойное</button>
-        <button class="fluid-pill" data-color="#26a269" data-mood="На русском">🇷🇺 На русском</button>
-        <button class="fluid-pill" data-color="#9c27b0" data-mood="Новое">✨ Новое</button>
-        <button class="fluid-pill" data-color="#e5a50a" data-mood="Вечеринка">🎉 Вечеринка</button>
-        <button class="fluid-pill" id="btn-custom-wave" title="Тонкая настройка всех параметров">⚙ Фильтры</button>
+    <!-- Compact Trigger Button for Wave Customization -->
+    <div class="wave-trigger-container" style="position: relative; z-index: 40; margin-top: 4px;">
+      <button class="adw-btn pill wave-config-btn" id="btnWaveConfig" title="Настроить фильтры потока">
+        <span class="config-icon">⚙</span>
+        <span class="config-label" id="waveConfigLabel">Настроить волну</span>
+        <span class="config-arrow">▾</span>
+      </button>
+
+      <!-- Libadwaita Popover for Stream Personalization -->
+      <div class="adw-popover" id="wavePopover">
+        <div class="popover-arrow"></div>
+        <div class="popover-header">
+          <span style="font-weight: 700; font-size: 13px;">Персонализация потока</span>
+          <span class="adw-badge accent" style="font-size: 9px;">Моя волна</span>
+        </div>
+
+        <!-- Section 1: Mood -->
+        <div class="popover-section">
+          <div class="popover-section-title">Настроение</div>
+          <div class="popover-chips-grid" id="popoverMoods">
+            <button class="popover-chip active" data-group="mood" data-val="Бодрое" data-color="#ff6b4a">⚡ Бодрое</button>
+            <button class="popover-chip" data-group="mood" data-val="Спокойное" data-color="#3584e4">☕ Спокойное</button>
+            <button class="popover-chip" data-group="mood" data-val="Весёлое" data-color="#e5a50a">🎉 Весёлое</button>
+            <button class="popover-chip" data-group="mood" data-val="Грустное" data-color="#9c27b0">🌧 Грустное</button>
+          </div>
+        </div>
+
+        <!-- Section 2: Character -->
+        <div class="popover-section">
+          <div class="popover-section-title">Характер</div>
+          <div class="popover-chips-grid" id="popoverChars">
+            <button class="popover-chip active" data-group="char" data-val="Любимое">❤️ Любимое</button>
+            <button class="popover-chip" data-group="char" data-val="Незнакомое">✨ Незнакомое</button>
+            <button class="popover-chip" data-group="char" data-val="Популярное">🔥 Популярное</button>
+          </div>
+        </div>
+
+        <!-- Section 3: Language -->
+        <div class="popover-section">
+          <div class="popover-section-title">Язык</div>
+          <div class="popover-chips-grid" id="popoverLangs">
+            <button class="popover-chip active" data-group="lang" data-val="На русском">🇷🇺 На русском</button>
+            <button class="popover-chip" data-group="lang" data-val="Иностранный">🌐 Иностранный</button>
+            <button class="popover-chip" data-group="lang" data-val="Без слов">🎵 Без слов</button>
+          </div>
+        </div>
+
+        <!-- Popover Footer -->
+        <div class="popover-footer">
+          <span style="font-size: 11px; color: var(--adw-text-dim);" id="popoverSummary">⚡ Бодрое • ❤️ Любимое</span>
+          <button class="adw-btn flat" id="btnResetPopover" style="font-size: 11px; padding: 4px 8px; color: #f66151;">
+            ↺ Сбросить фильтры
+          </button>
+        </div>
       </div>
     </div>
   </main>
@@ -1006,20 +1140,81 @@
     fluidWaveWrap.addEventListener('click', togglePlay);
     islandPlay.addEventListener('click', togglePlay);
 
-    // Pill color extraction
+    // Wave Config Trigger Button & Popover Logic
     const ambientBg = document.getElementById('ambientBg');
-    const pills = document.querySelectorAll('.fluid-pill[data-color]');
+    const btnWaveConfig = document.getElementById('btnWaveConfig');
+    const wavePopover = document.getElementById('wavePopover');
+    const waveConfigLabel = document.getElementById('waveConfigLabel');
+    const popoverSummary = document.getElementById('popoverSummary');
+    const btnResetPopover = document.getElementById('btnResetPopover');
 
-    pills.forEach(pill => {
-      pill.addEventListener('click', () => {
-        pills.forEach(p => p.classList.remove('active'));
-        pill.classList.add('active');
-        const color = pill.getAttribute('data-color');
-        const mood = pill.getAttribute('data-mood');
-        primaryAccent = color;
-        ambientBg.style.background = `radial-gradient(circle at 50% 32%, ${color}33 0%, rgba(20,20,20,0.6) 70%, #141414 100%)`;
-        showToast(`Поток: ${mood}`);
+    let currentFilters = {
+      mood: 'Бодрое',
+      char: 'Любимое',
+      lang: 'На русском'
+    };
+
+    function updateFilterDisplay() {
+      waveConfigLabel.innerText = `${currentFilters.mood} • ${currentFilters.char}`;
+      popoverSummary.innerText = `${currentFilters.mood} • ${currentFilters.char} • ${currentFilters.lang}`;
+      btnWaveConfig.classList.add('active-filter');
+    }
+
+    btnWaveConfig.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isOpen = wavePopover.classList.toggle('open');
+      btnWaveConfig.classList.toggle('popover-open', isOpen);
+    });
+
+    // Close popover when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!wavePopover.contains(e.target) && e.target !== btnWaveConfig && !btnWaveConfig.contains(e.target)) {
+        wavePopover.classList.remove('open');
+        btnWaveConfig.classList.remove('popover-open');
+      }
+    });
+
+    // Popover chips selection
+    document.querySelectorAll('.popover-chip').forEach(chip => {
+      chip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const group = chip.getAttribute('data-group');
+        const val = chip.getAttribute('data-val');
+
+        // Toggle within same group
+        document.querySelectorAll(`.popover-chip[data-group="${group}"]`).forEach(c => c.classList.remove('active'));
+        chip.classList.add('active');
+
+        currentFilters[group] = val;
+
+        // If mood changed, change ambient color
+        if (group === 'mood') {
+          const color = chip.getAttribute('data-color') || '#ff6b4a';
+          primaryAccent = color;
+          ambientBg.style.background = `radial-gradient(circle at 50% 32%, ${color}33 0%, rgba(20,20,20,0.6) 70%, #141414 100%)`;
+        }
+
+        updateFilterDisplay();
+        showToast(`Фильтр волны: ${val}`);
       });
+    });
+
+    // Reset Popover
+    btnResetPopover.addEventListener('click', (e) => {
+      e.stopPropagation();
+      currentFilters = { mood: 'Бодрое', char: 'Любимое', lang: 'На русском' };
+      document.querySelectorAll('.popover-chip').forEach(c => c.classList.remove('active'));
+      document.querySelector('.popover-chip[data-val="Бодрое"]')?.classList.add('active');
+      document.querySelector('.popover-chip[data-val="Любимое"]')?.classList.add('active');
+      document.querySelector('.popover-chip[data-val="На русском"]')?.classList.add('active');
+
+      primaryAccent = '#ff6b4a';
+      ambientBg.style.background = `radial-gradient(circle at 50% 32%, rgba(255, 107, 74, 0.18) 0%, rgba(156, 39, 176, 0.08) 50%, #161616 100%)`;
+
+      waveConfigLabel.innerText = 'Настроить волну';
+      btnWaveConfig.classList.remove('active-filter');
+      popoverSummary.innerText = 'Фильтры сброшены';
+      showToast('Фильтры волны сброшены');
     });
 
     // Time ticker

@@ -10,8 +10,12 @@ pub const CLIENT_ID: &str = "23cabbbdc6cd418abb4b39c32c41195d";
 /// Официальный OAuth URL для быстрого получения токена
 pub const OAUTH_AUTHORIZE_URL: &str = "https://oauth.yandex.ru/authorize?response_type=token&client_id=23cabbbdc6cd418abb4b39c32c41195d";
 
+fn default_crossfade_duration() -> u32 {
+    3
+}
+
 /// Конфигурация приложения Волна
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// OAuth токен Яндекс Музыки
     pub token: Option<String>,
@@ -42,6 +46,31 @@ pub struct AppConfig {
     /// История поиска: открытые результаты (см. `history.rs`); элементы разбираются по одному
     #[serde(default)]
     pub history_items: Vec<serde_json::Value>,
+    /// Плавный переход между треками (fade-out / fade-in)
+    #[serde(default)]
+    pub crossfade: bool,
+    /// Длительность перехода в секундах (по умолчанию 3)
+    #[serde(default = "default_crossfade_duration")]
+    pub crossfade_duration: u32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            quality: None,
+            genius_token: None,
+            clips: false,
+            lastfm_key: None,
+            last_track: None,
+            discord_rpc: false,
+            discord_client_id: None,
+            station_id: None,
+            history_items: Vec::new(),
+            crossfade: false,
+            crossfade_duration: 3,
+        }
+    }
 }
 
 /// Возвращает путь к файлу конфигурации (~/.config/volna/config.json)
@@ -162,6 +191,21 @@ pub fn save_clips(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Syn
     save_config(&config)
 }
 
+/// Настройки плавного перехода между треками: (включен, длительность в секундах)
+pub fn load_crossfade() -> (bool, u32) {
+    let c = load_config().unwrap_or_default();
+    let duration = if c.crossfade_duration == 0 { 3 } else { c.crossfade_duration };
+    (c.crossfade, duration)
+}
+
+/// Сохраняет настройки плавного перехода между треками
+pub fn save_crossfade(enabled: bool, duration: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.crossfade = enabled;
+    config.crossfade_duration = duration;
+    save_config(&config)
+}
+
 /// Сохраняет токен в файл конфигурации
 pub fn save_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let clean = extract_token_from_input(token);
@@ -244,5 +288,22 @@ mod tests {
             extract_token_from_input("OAuth y0_MyToken"),
             "y0_MyToken"
         );
+    }
+
+    #[test]
+    fn test_crossfade_config() {
+        let default_cfg = AppConfig::default();
+        assert!(!default_cfg.crossfade);
+        assert_eq!(default_cfg.crossfade_duration, 3);
+
+        let json = "{}";
+        let parsed: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.crossfade);
+        assert_eq!(parsed.crossfade_duration, 3);
+
+        let json_custom = r#"{"crossfade": true, "crossfade_duration": 5}"#;
+        let parsed_custom: AppConfig = serde_json::from_str(json_custom).unwrap();
+        assert!(parsed_custom.crossfade);
+        assert_eq!(parsed_custom.crossfade_duration, 5);
     }
 }

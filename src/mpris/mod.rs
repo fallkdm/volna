@@ -119,7 +119,7 @@ impl PlayerInterface for MprisHandler {
     }
 
     async fn playback_status(&self) -> fdo::Result<PlaybackStatus> {
-        if self.player.audio.is_playing() {
+        if self.player.is_playing() {
             Ok(PlaybackStatus::Playing)
         } else {
             Ok(PlaybackStatus::Paused)

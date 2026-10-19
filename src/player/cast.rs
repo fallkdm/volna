@@ -24,6 +24,11 @@ impl PlayerManager {
         self.cast.lock().unwrap().as_ref().map(|c| c.session.device.name.clone())
     }
 
+    /// Играет ли станция; None, если она не привязана
+    pub fn cast_playing(&self) -> Option<bool> {
+        self.cast.lock().unwrap().as_ref().map(|c| c.state.playing)
+    }
+
     pub fn cast_active(&self) -> bool {
         self.cast.lock().unwrap().is_some()
     }

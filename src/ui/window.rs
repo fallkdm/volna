@@ -1000,6 +1000,7 @@ fn setup_event_listener(
                     toast.set_use_markup(false);
                     toast_overlay.add_toast(toast);
                 }
+                PlayerUiEvent::CrossfadeChanged { .. } => {}
                 _ => {}
             }
         }

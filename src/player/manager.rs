@@ -78,6 +78,11 @@ pub enum PlayerUiEvent {
     StationTarget(Option<SourceTarget>),
     /// Изменились настройки Discord (включение, Application ID)
     DiscordSettingsChanged,
+    /// Изменились настройки плавного перехода между треками
+    CrossfadeChanged {
+        enabled: bool,
+        duration: u32,
+    },
 }
 
 /// Состояние очереди и воспроизведения
@@ -103,6 +108,8 @@ pub struct PlayerState {
     pub play_source: Option<PlaySource>,
     /// Показан сохранённый последний трек, воспроизведение ещё не запускалось
     pub restored: bool,
+    /// Сработал ли автоматический кроссфейд перед окончанием трека
+    pub crossfade_triggered: bool,
 }
 
 impl Default for PlayerState {
@@ -125,9 +132,21 @@ impl Default for PlayerState {
             wave_label: None,
             play_source: None,
             restored: false,
+            crossfade_triggered: false,
         }
     }
 }
+
+/// Ссылка на поток следующего трека, полученная заранее
+struct Prefetched {
+    track_id: String,
+    url: String,
+    label: String,
+    at: std::time::Instant,
+}
+
+/// Ссылки на поток живут недолго (через несколько минут отвечают 410): заранее полученной верим 90 секунд
+const PREFETCH_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Менеджер плеера
 #[derive(Clone)]
@@ -136,10 +155,14 @@ pub struct PlayerManager {
     pub client: Arc<Mutex<YandexMusicClient>>,
     pub state: Arc<Mutex<PlayerState>>,
     pub event_senders: Vec<Sender<PlayerUiEvent>>,
+    /// Ссылка на следующий трек очереди, полученная заранее (один слот)
+    prefetch: Arc<Mutex<Option<Prefetched>>>,
     /// Привязанная Яндекс Станция (см. `cast.rs`)
     pub(super) cast: Arc<Mutex<Option<super::cast::CastLink>>>,
     /// Номер последнего запроса воспроизведения: устаревшие асинхронные задачи (быстрые клики) отбрасываются
     generation: Arc<AtomicU64>,
+    /// Настройки плавного перехода: (включен, длительность в секундах)
+    crossfade: Arc<Mutex<(bool, u32)>>,
 }
 
 impl PlayerManager {
@@ -151,6 +174,8 @@ impl PlayerManager {
         let audio = Arc::new(AudioBackend::new()?);
         let client = Arc::new(Mutex::new(client));
         let state = Arc::new(Mutex::new(PlayerState::default()));
+        let (cf_enabled, cf_dur) = crate::api::auth::load_crossfade();
+        let crossfade = Arc::new(Mutex::new((cf_enabled, cf_dur)));
 
         let manager = Self {
             audio,
@@ -158,13 +183,27 @@ impl PlayerManager {
             state,
             event_senders,
             cast: Arc::default(),
+            prefetch: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
+            crossfade,
         };
 
         // Подключаем автоматический переход к следующему треку по окончании воспроизведения
         let mgr_eos = manager.clone();
         manager.audio.set_on_eos(move || {
             mgr_eos.on_track_finished();
+        });
+
+        // Фоновый мониторинг прогресса трека для автоматической сводки (кроссфейда) в конце песни
+        let mgr_crossfade = manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                if let Some(pos_ms) = mgr_crossfade.audio.position_ms() {
+                    mgr_crossfade.check_auto_crossfade(pos_ms);
+                }
+            }
         });
 
         // Демо для скриншотов: вымышленный трек, без сети и без пользовательских данных
@@ -284,6 +323,9 @@ impl PlayerManager {
 
     /// Отправляет событие во все зарегистрированные каналы (UI, MPRIS)
     pub fn emit(&self, event: PlayerUiEvent) {
+        if let PlayerUiEvent::Error(e) = &event {
+            eprintln!("[error] {}", e);
+        }
         for s in &self.event_senders {
             let _ = s.send_blocking(event.clone());
         }
@@ -326,7 +368,76 @@ impl PlayerManager {
 
     /// Позиция воспроизведения в мс: на станции, если она привязана, иначе в приложении
     pub fn position_ms(&self) -> Option<u64> {
-        self.cast_position_ms().or_else(|| self.audio.position_ms())
+        let pos = self.cast_position_ms().or_else(|| self.audio.position_ms());
+        if let Some(ms) = pos {
+            self.check_auto_crossfade(ms);
+        }
+        pos
+    }
+
+    /// Проверяет, не подошел ли текущий трек к моменту автоматической сводки со следующим (кроссфейда)
+    pub fn check_auto_crossfade(&self, pos_ms: u64) {
+        let (crossfade, crossfade_dur) = self.crossfade_settings();
+        if !crossfade || crossfade_dur == 0 {
+            return;
+        }
+        let fade_ms = (crossfade_dur as u64) * 1000;
+
+        let was_playing = self.audio.is_playing();
+        if !was_playing {
+            return;
+        }
+
+        let dur_ms = {
+            let state = match self.state.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if state.crossfade_triggered {
+                return;
+            }
+            state.current_track.as_ref().and_then(|t| t.duration_ms).map(|ms| ms as u64)
+        }.or_else(|| self.duration_seconds().map(|s| s * 1000));
+
+        let dur_ms = match dur_ms {
+            Some(d) if d > fade_ms + 1000 => d,
+            _ => return,
+        };
+
+        if pos_ms < dur_ms.saturating_sub(fade_ms) {
+            return;
+        }
+
+        let trigger = {
+            let mut state = match self.state.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if state.crossfade_triggered {
+                false
+            } else {
+                let at_end = state.current_index + 1 >= state.queue.len();
+                if state.repeat == RepeatMode::Off && !state.wave && at_end {
+                    false
+                } else {
+                    state.crossfade_triggered = true;
+                    true
+                }
+            }
+        };
+
+        if trigger {
+            eprintln!(
+                "[crossfade] автосводка в конце трека (pos: {} ms, dur: {} ms, fade: {} ms)",
+                pos_ms, dur_ms, fade_ms
+            );
+            self.next_track();
+        }
+    }
+
+    /// Играет ли музыка: на станции, если она привязана, иначе в приложении
+    pub fn is_playing(&self) -> bool {
+        self.cast_playing().unwrap_or_else(|| self.audio.is_playing())
     }
 
     pub fn duration_seconds(&self) -> Option<u64> {
@@ -395,6 +506,14 @@ impl PlayerManager {
                         .await;
                 }
             });
+        }
+
+        {
+            let state = self.state.lock().unwrap();
+            if state.crossfade_triggered {
+                eprintln!("[on_track_finished] автокроссфейд уже запущен, пропускаем повторный next_track");
+                return;
+            }
         }
 
         let (mode, wave, at_end, current) = {
@@ -709,17 +828,17 @@ impl PlayerManager {
         self.play_track_stream(&track);
     }
 
-    /// Пауза (на станции, если она привязана)
+    /// Пауза (на станции, если она привязана) с мягким затуханием
     pub fn pause(&self) {
         if !self.cast_set_playing(false) {
-            self.audio.pause();
+            self.audio.pause_soft(250);
         }
     }
 
-    /// Продолжение (на станции, если она привязана)
+    /// Продолжение (на станции, если она привязана) с мягким нарастанием
     pub fn resume(&self) {
         if !self.cast_set_playing(true) {
-            self.audio.play();
+            self.audio.play_soft(250);
         }
     }
 
@@ -738,12 +857,24 @@ impl PlayerManager {
         self.audio.seek_seconds(seconds);
     }
 
-    /// Установка громкости
+    /// Установка громкости (обновляет целевую громкость user_volume)
     pub fn set_volume(&self, volume: f64) {
         if self.cast_set_volume(volume) {
             return;
         }
         self.audio.set_volume(volume);
+    }
+
+    /// Текущие настройки плавного перехода: (включен, длительность в секундах)
+    pub fn crossfade_settings(&self) -> (bool, u32) {
+        self.crossfade.lock().map(|c| *c).unwrap_or((false, 3))
+    }
+
+    /// Обновление настроек плавного перехода
+    pub fn set_crossfade(&self, enabled: bool, duration: u32) {
+        if let Ok(mut cf) = self.crossfade.lock() {
+            *cf = (enabled, duration);
+        }
     }
 
     /// Отметка лайка
@@ -830,8 +961,9 @@ impl PlayerManager {
         let batch_id = self.state.lock().unwrap().batch_id.clone();
         let senders = self.event_senders.clone();
         let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let current_gen = self.generation.clone();
-        let is_stale = move || current_gen.load(Ordering::SeqCst) != epoch;
+        let stale_gen = self.generation.clone();
+        let is_stale = move || stale_gen.load(Ordering::SeqCst) != epoch;
+        eprintln!("[play] #{} {} — {} ({})", epoch, track.title, track.artists_string(), track.id);
 
         let client = self.client.lock().unwrap().clone();
         spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
@@ -849,28 +981,95 @@ impl PlayerManager {
             return;
         }
 
+        let (crossfade, crossfade_dur) = self.crossfade_settings();
+        let fade_ms = (crossfade_dur as u64) * 1000;
+        let was_playing = self.audio.is_playing();
+
         // сохранённый офлайн трек играет с диска: без сети и без токена
         if let Some(path) = crate::cache::offline_audio_path(&track_id) {
-            audio_clone.play_url(&gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(path)));
+            let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(path));
             emit_all(&senders, PlayerUiEvent::LoadingState(false));
             emit_all(&senders, PlayerUiEvent::StreamQuality("Офлайн".to_string()));
+
+            if crossfade {
+                if was_playing {
+                    audio_clone.crossfade_to_url(&uri, fade_ms);
+                } else {
+                    audio_clone.stop();
+                    audio_clone.play_url_fade_in(&uri, fade_ms);
+                }
+            } else {
+                audio_clone.stop();
+                audio_clone.play_url(&uri);
+            }
+
+            if let Ok(mut state) = self.state.lock() {
+                state.crossfade_triggered = false;
+            }
+
             emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
             return;
         }
 
+        // следующий трек очереди: после старта этого его ссылку получим заранее
+        let next_track = {
+            let state = self.state.lock().unwrap();
+            state.queue.get(state.current_index + 1).cloned().filter(|t| t.id != track.id)
+        };
+        let prefetch = self.prefetch.clone();
+        let prefetch_client = client.clone();
+        let state_arc = self.state.clone();
+
+        self.emit(PlayerUiEvent::Progress { current_sec: 0, total_sec: track.duration_ms.unwrap_or(0) / 1000 });
+
         tokio::spawn(async move {
             if client.has_token() {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
-                let result = client.get_track_direct_url(&track_id).await;
+                let started = std::time::Instant::now();
+                // ссылка могла быть получена заранее, пока играл прежний трек
+                let ready = prefetch.lock().unwrap().take().filter(|p| p.track_id == track_id && p.at.elapsed() < PREFETCH_TTL);
+                let hit = ready.is_some();
+                let result = match ready {
+                    Some(p) => Ok((p.url, p.label)),
+                    None => client.get_track_direct_url(&track_id).await,
+                };
+                eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "ошибка" });
                 if is_stale() {
+                    eprintln!("[play] #{} устарел, поток не запускаем", epoch);
                     return;
                 }
                 match result {
                     Ok((url, label)) => {
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
                         emit_all(&senders, PlayerUiEvent::StreamQuality(label));
-                        audio_clone.play_url(&url);
+
+                        if crossfade {
+                            if was_playing {
+                                audio_clone.crossfade_to_url(&url, fade_ms);
+                            } else {
+                                audio_clone.stop();
+                                audio_clone.play_url_fade_in(&url, fade_ms);
+                            }
+                        } else {
+                            audio_clone.stop();
+                            audio_clone.play_url(&url);
+                        }
+
+                        if let Ok(mut state) = state_arc.lock() {
+                            state.crossfade_triggered = false;
+                        }
+
                         emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
+                        // следующий трек готовим заранее (офлайн-треки в этом не нуждаются)
+                        if let Some(next) = next_track.filter(|t| crate::cache::offline_audio_path(&t.id).is_none()) {
+                            tokio::spawn(async move {
+                                let started = std::time::Instant::now();
+                                if let Some((url, label)) = prefetch_client.prefetch_track(&next.id).await {
+                                    eprintln!("[prefetch] «{}» готов за {} мс", next.title, started.elapsed().as_millis());
+                                    *prefetch.lock().unwrap() = Some(Prefetched { track_id: next.id, url, label, at: std::time::Instant::now() });
+                                }
+                            });
+                        }
                         let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
                     }
                     Err(e) => {
@@ -990,6 +1189,12 @@ impl PlayerManager {
                             Ok((url, label)) => {
                                 emit_all(&senders, PlayerUiEvent::StreamQuality(label));
                                 audio_clone.play_url(&url);
+                                let (crossfade, crossfade_dur) = crate::api::auth::load_crossfade();
+                                if crossfade {
+                                    audio_clone.fade_in((crossfade_dur as u64) * 1000);
+                                } else {
+                                    audio_clone.set_volume(audio_clone.user_volume());
+                                }
                                 emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
                                 let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
                             }
@@ -1106,6 +1311,9 @@ fn dedup_tracks(existing: &[Track], new: Vec<Track>) -> Vec<Track> {
 
 /// Рассылает событие во все переданные каналы
 fn emit_all(senders: &[Sender<PlayerUiEvent>], event: PlayerUiEvent) {
+    if let PlayerUiEvent::Error(e) = &event {
+        eprintln!("[error] {}", e);
+    }
     for s in senders {
         let _ = s.send_blocking(event.clone());
     }
@@ -1146,5 +1354,16 @@ mod repeat_tests {
         };
         assert_eq!(cycle(false), [RepeatMode::One, RepeatMode::All, RepeatMode::Off]);
         assert_eq!(cycle(true), [RepeatMode::One, RepeatMode::Off, RepeatMode::One]);
+    }
+}
+
+#[cfg(test)]
+mod crossfade_tests {
+    use super::*;
+
+    #[test]
+    fn player_state_default_crossfade_not_triggered() {
+        let state = PlayerState::default();
+        assert_eq!(state.crossfade_triggered, false);
     }
 }

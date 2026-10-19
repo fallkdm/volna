@@ -203,14 +203,33 @@ impl YandexMusicClient {
 
     /// Получает прямую ссылку на MP3-поток трека через download-info и подпись качества вида «MP3 192»
     pub async fn get_track_direct_url(&self, track_id: &str) -> Result<(String, String), ApiError> {
-        // ссылка download-info одноразовая и живёт недолго; редкий сбой ответа лечится повтором с новой ссылкой
-        match self.get_track_direct_url_once(track_id).await {
+        // Хранилище Яндекса отвечает рывками: то 100 мс, то 2–6 с. Если первая попытка не уложилась в 900 мс,
+        // параллельно стартует вторая (новая одноразовая ссылка), берётся та, что завершилась успешно раньше.
+        let first = Box::pin(self.get_track_direct_url_once(track_id));
+        let second = Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+            self.get_track_direct_url_once(track_id).await
+        });
+        match futures_util::future::select_ok([first as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>, second]).await {
+            Ok((url, _)) => Ok(url),
+            // редкий сбой ответа лечится повтором с новой ссылкой
             Err(ApiError::XmlParse(_)) => {
                 tokio::time::sleep(std::time::Duration::from_millis(700)).await;
                 self.get_track_direct_url_once(track_id).await
             }
-            other => other,
+            Err(e) => Err(e),
         }
+    }
+
+    /// Ссылка на трек и «прогрев»: первый кусок файла запрашивается заранее, чтобы холодное хранилище Яндекса
+    /// (у части треков первый байт приходит через 3–4 с) уже было готово к моменту переключения
+    pub async fn prefetch_track(&self, track_id: &str) -> Option<(String, String)> {
+        let (url, label) = self.get_track_direct_url(track_id).await.ok()?;
+        let warm = self.client.get(&url).header(reqwest::header::RANGE, "bytes=0-65535").send().await;
+        if let Ok(resp) = warm {
+            let _ = resp.bytes().await;
+        }
+        Some((url, label))
     }
 
     async fn get_track_direct_url_once(&self, track_id: &str) -> Result<(String, String), ApiError> {
@@ -1213,5 +1232,43 @@ mod tests {
         assert!(parsed.synced_lyrics.is_some());
         assert!(parsed.plain_lyrics.is_some());
         assert!(!parse_lrc(parsed.synced_lyrics.as_deref().unwrap()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stream_speed_tests {
+    use super::*;
+
+    /// Замер скорости потока у живого Яндекса: `cargo test stream_speed_live -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn stream_speed_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        for id in ["3264", "818304", "475562"] {
+            let t = std::time::Instant::now();
+            let (url, label) = client.get_track_direct_url(id).await.expect("ссылка");
+            let link_ms = t.elapsed().as_millis();
+            let t = std::time::Instant::now();
+            let resp = reqwest::get(&url).await.expect("поток");
+            let ttfb = t.elapsed().as_millis();
+            let total_len = resp.content_length().unwrap_or(0);
+            let mut stream = resp.bytes_stream();
+            let (mut got, mut marks) = (0usize, Vec::new());
+            use futures_util::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                got += chunk.expect("кусок").len();
+                for mb in [1usize, 2, 4] {
+                    if got >= mb * 1_000_000 && !marks.iter().any(|(m, _)| *m == mb) {
+                        marks.push((mb, t.elapsed().as_millis()));
+                    }
+                }
+            }
+            eprintln!(
+                "трек {id} ({label}): ссылка {link_ms} мс, первый байт {ttfb} мс, файл {} МБ целиком за {} мс, отметки МБ→мс {:?}",
+                total_len / 1_000_000,
+                t.elapsed().as_millis(),
+                marks
+            );
+        }
     }
 }
