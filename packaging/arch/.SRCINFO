@@ -1,0 +1,26 @@
+pkgbase = volna-git
+	pkgdesc = Неофициальный лёгкий клиент Яндекс Музыки на Rust, GTK4 / Libadwaita и GStreamer
+	pkgver = r0.0000000
+	pkgrel = 1
+	url = https://github.com/fallkdm/volna
+	arch = x86_64
+	license = GPL-3.0-only
+	makedepends = git
+	makedepends = cargo
+	depends = gtk4
+	depends = libadwaita
+	depends = gstreamer
+	depends = gst-plugins-base
+	depends = gst-plugins-good
+	depends = gst-plugins-bad
+	depends = gst-plugins-bad-libs
+	depends = gst-libav
+	depends = libglvnd
+	optdepends = mprisence: статус в Discord через MPRIS (встроенный статус в настройках работает и без него)
+	provides = volna
+	conflicts = volna
+	options = !lto
+	source = volna-git::git+https://github.com/fallkdm/volna.git
+	sha256sums = SKIP
+
+pkgname = volna-git
