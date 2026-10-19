@@ -1,0 +1,53 @@
+name: Arch package
+
+# Собирает пакет для Arch Linux (pacman -U) и прикладывает его к релизу.
+# Запуск: пуш тега v* или вручную (Actions → Arch package → Run workflow, указать тег релиза).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза, к которому приложить пакет (например v0.1.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Системные пакеты
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git cargo \
+            gtk4 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
+            gst-plugins-bad-libs gst-libav libglvnd
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Сборка пакета
+        run: |
+          # makepkg не запускается от root: собираем от отдельного пользователя
+          useradd -m builder
+          cp -r packaging/arch /home/builder/pkg
+          # источник — именно тот коммит, который собирается, а не main с GitHub
+          sed -i "s|git+\$url.git|git+file://${GITHUB_WORKSPACE}#commit=${GITHUB_SHA}|" /home/builder/pkg/PKGBUILD
+          chown -R builder /home/builder/pkg
+          su builder -c "git config --global --add safe.directory '*'"
+          cd /home/builder/pkg
+          su builder -c "makepkg -fd --noconfirm"
+          # постоянное имя файла: ссылка releases/latest/download/volna-x86_64.pkg.tar.zst не меняется
+          cp volna-git-*-x86_64.pkg.tar.zst volna-x86_64.pkg.tar.zst
+          ls -la *.pkg.tar.zst
+
+      - name: В релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            /home/builder/pkg/volna-x86_64.pkg.tar.zst
+            /home/builder/pkg/volna-git-*-x86_64.pkg.tar.zst

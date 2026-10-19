@@ -80,12 +80,12 @@ sudo pacman -S gtk4 libadwaita gstreamer gst-plugins-base gst-plugins-good gst-p
 
 Готовая сборка для x86_64: [Releases](https://github.com/fallkdm/volna/releases) (предрелиз; нужны GTK 4.24+, libadwaita 1.10+, GStreamer 1.28+).
 
-### Arch Linux (AUR):
-Пакет `volna-git` собирает последний `main`; все зависимости `yay` доставит сам. Файлы для публикации лежат в `packaging/arch/` (`PKGBUILD`, `.SRCINFO`).
+### Arch Linux:
+Готовый пакет лежит в [Releases](https://github.com/fallkdm/volna/releases); `pacman` сам доставит зависимости из репозиториев Arch (`gtk4`, `libadwaita`, GStreamer и остальное):
 ```bash
-yay -S volna-git
+sudo pacman -U https://github.com/fallkdm/volna/releases/latest/download/volna-x86_64.pkg.tar.zst
 ```
-Пока пакет не опубликован в AUR, его можно собрать локально: `cd packaging/arch && makepkg -si`.
+Обновление: повторить ту же команду. Из исходников пакет можно собрать локально: `git clone https://github.com/fallkdm/volna.git && cd volna/packaging/arch && makepkg -si`. Файлы для AUR (`PKGBUILD`, `.SRCINFO`) тоже лежат в `packaging/arch/`.
 
 ### Сборка из исходников:
 ```bash
