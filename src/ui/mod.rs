@@ -30,10 +30,10 @@ pub fn load_css() {
 /// Путь к иконке приложения (`data/icons/<имя>`): рядом с исходниками при разработке, затем в установленных
 /// каталогах данных (`/usr/share/volna/icons/` для пакета). None — иконки нет, вызывающий берёт запасную из темы.
 pub fn bundled_icon(name: &str) -> Option<std::path::PathBuf> {
-    let mut candidates = vec![
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons").join(name),
-        std::path::Path::new("data/icons").join(name),
-    ];
+    let mut candidates = vec![std::path::Path::new("data/icons").join(name)];
+    // путь к исходникам вшивается только в отладочную сборку: в пакет попадать он не должен
+    #[cfg(debug_assertions)]
+    candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons").join(name));
     candidates.extend(glib::system_data_dirs().into_iter().map(|d| d.join("volna/icons").join(name)));
     candidates.into_iter().find(|p| p.exists())
 }
