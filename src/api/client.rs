@@ -2,6 +2,7 @@ use chrono::Utc;
 use md5::{Digest, Md5};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use std::fmt;
+use std::sync::Arc;
 
 use super::models::{
     parse_lrc, AccountStatus, Album, AlbumWithTracks, ArtistBrief, DownloadInfo, LikedAlbumItem, LikedTracksResult, Playlist,
@@ -86,6 +87,7 @@ pub struct YandexMusicClient {
     client: reqwest::Client,
     token: Option<String>,
     base_url: String,
+    cached_uid: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl YandexMusicClient {
@@ -97,12 +99,23 @@ impl YandexMusicClient {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             token,
             base_url: BASE_API_URL.to_string(),
+            cached_uid: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
     /// Устанавливает токен авторизации
     pub fn set_token(&mut self, token: Option<String>) {
         self.token = token;
+        if let Ok(mut c) = self.cached_uid.lock() {
+            *c = None;
+        }
+    }
+
+    /// Устанавливает закэшированный UID пользователя
+    pub fn set_cached_uid(&self, uid: String) {
+        if let Ok(mut c) = self.cached_uid.lock() {
+            *c = Some(uid);
+        }
     }
 
     /// Получает текущий токен
@@ -623,9 +636,17 @@ impl YandexMusicClient {
 
     /// UID текущего пользователя
     pub async fn get_uid(&self) -> Result<String, ApiError> {
+        if let Ok(c) = self.cached_uid.lock() {
+            if let Some(uid) = c.as_ref() {
+                return Ok(uid.clone());
+            }
+        }
         let uid = self.get_account_status().await?.account.map(|a| a.uid).unwrap_or_default();
         if uid.is_empty() {
             return Err(ApiError::InvalidResponse("не удалось определить UID пользователя".into()));
+        }
+        if let Ok(mut c) = self.cached_uid.lock() {
+            *c = Some(uid.clone());
         }
         Ok(uid)
     }

@@ -835,6 +835,7 @@ fn setup_event_listener(
                         island.like_btn.remove_css_class("liked");
                     }
                 }
+                PlayerUiEvent::TrackLiked { .. } => {}
                 PlayerUiEvent::DislikeStateChanged(disliked) => {
                     if disliked {
                         island.dislike_btn.add_css_class("disliked");

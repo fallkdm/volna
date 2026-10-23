@@ -83,6 +83,52 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
         });
     }
 
+    let rx = player.subscribe();
+    {
+        let (player, page, stack, liked_tracks, liked_count, liked_list, liked_box) = (
+            player.clone(),
+            page.clone(),
+            stack.clone(),
+            liked_tracks.clone(),
+            liked_count.clone(),
+            liked_list.clone(),
+            liked_box.clone(),
+        );
+        glib::spawn_future_local(async move {
+            while let Ok(event) = rx.recv().await {
+                if let PlayerUiEvent::TrackLiked { track, liked } = event {
+                    page.handle_track_liked(&track, liked);
+
+                    if liked {
+                        if !liked_tracks.borrow().iter().any(|t| t.id == track.id) {
+                            liked_tracks.borrow_mut().insert(0, track.clone());
+                        }
+                    } else {
+                        liked_tracks.borrow_mut().retain(|t| t.id != track.id);
+                    }
+
+                    let count = liked_tracks.borrow().len();
+                    liked_count.set_text(&format!("{} треков", count));
+
+                    liked_list.remove_all();
+                    for (i, t) in liked_tracks.borrow().iter().take(LIKED_PREVIEW).enumerate() {
+                        let (p, queue) = (player.clone(), liked_tracks.clone());
+                        let row = track_row(t, move || {
+                            p.set_queue_and_play_from(
+                                queue.borrow().clone(),
+                                i,
+                                Some(PlaySource::new("Мне нравится", Some(SourceTarget::Library))),
+                            )
+                        });
+                        row.add_suffix(&track_actions(&player, Some((&stack, &page)), t));
+                        liked_list.append(&row);
+                    }
+                    liked_box.set_visible(!liked_tracks.borrow().is_empty());
+                }
+            }
+        });
+    }
+
     // Загруженные треки: играют без интернета
     let offline_list = ListBox::new();
     offline_list.add_css_class("boxed-list");

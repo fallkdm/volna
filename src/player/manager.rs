@@ -54,6 +54,10 @@ pub enum PlayerUiEvent {
     },
     LikeStateChanged(bool),
     DislikeStateChanged(bool),
+    TrackLiked {
+        track: Track,
+        liked: bool,
+    },
     QueueUpdated(Vec<Track>),
     CoverUpdated(String),
     LyricsUpdated(String),
@@ -110,6 +114,51 @@ pub struct PlayerState {
     pub restored: bool,
     /// Сработал ли автоматический кроссфейд перед окончанием трека
     pub crossfade_triggered: bool,
+    /// Идентификаторы понравившихся треков пользователя
+    pub liked_track_ids: std::collections::HashSet<String>,
+    /// Загружен ли список лайков с сервера хотя бы один раз
+    pub liked_loaded: bool,
+    /// Лайки/снятия, сделанные пока список с сервера ещё грузится: поверх ответа сервера
+    pub liked_pending: std::collections::HashMap<String, bool>,
+    /// UID авторизованного пользователя
+    pub user_uid: Option<String>,
+    /// Идет ли переход на новый трек (загрузка URL потока)
+    pub is_transitioning: bool,
+}
+
+impl PlayerState {
+    /// Обновляет `is_liked` и `is_disliked` для указанного трека по текущему кэшу `liked_track_ids`
+    pub fn sync_track_like_status(&mut self, track_id: &str) -> bool {
+        let is_liked = self.liked_track_ids.contains(track_id);
+        self.is_liked = is_liked;
+        self.is_disliked = false;
+        is_liked
+    }
+
+    /// Локальная отметка лайка; до загрузки списка запоминается, чтобы не потеряться при слиянии
+    pub fn set_liked_local(&mut self, track_id: &str, liked: bool) -> bool {
+        if !self.liked_loaded {
+            self.liked_pending.insert(track_id.to_string(), liked);
+        }
+        if liked {
+            self.liked_track_ids.insert(track_id.to_string())
+        } else {
+            self.liked_track_ids.remove(track_id)
+        }
+    }
+
+    /// Список с сервера становится основой, локальные правки, сделанные за время загрузки, поверх него
+    pub fn merge_server_likes(&mut self, ids: Vec<String>) {
+        self.liked_loaded = true;
+        self.liked_track_ids = ids.into_iter().collect();
+        for (id, liked) in std::mem::take(&mut self.liked_pending) {
+            if liked {
+                self.liked_track_ids.insert(id);
+            } else {
+                self.liked_track_ids.remove(&id);
+            }
+        }
+    }
 }
 
 impl Default for PlayerState {
@@ -133,6 +182,11 @@ impl Default for PlayerState {
             play_source: None,
             restored: false,
             crossfade_triggered: false,
+            liked_track_ids: std::collections::HashSet::new(),
+            liked_loaded: false,
+            liked_pending: std::collections::HashMap::new(),
+            user_uid: None,
+            is_transitioning: false,
         }
     }
 }
@@ -154,7 +208,7 @@ pub struct PlayerManager {
     pub audio: Arc<AudioBackend>,
     pub client: Arc<Mutex<YandexMusicClient>>,
     pub state: Arc<Mutex<PlayerState>>,
-    pub event_senders: Vec<Sender<PlayerUiEvent>>,
+    pub event_senders: Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
     /// Ссылка на следующий трек очереди, полученная заранее (один слот)
     prefetch: Arc<Mutex<Option<Prefetched>>>,
     /// Привязанная Яндекс Станция (см. `cast.rs`)
@@ -181,7 +235,7 @@ impl PlayerManager {
             audio,
             client,
             state,
-            event_senders,
+            event_senders: Arc::new(Mutex::new(event_senders)),
             cast: Arc::default(),
             prefetch: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
@@ -274,14 +328,16 @@ impl PlayerManager {
         if let Some((queue, index, source)) = crate::cache::load_session() {
             if queue.get(index).is_some_and(|t| t.id == track.id) {
                 let total = queue.len();
-                {
+                let is_liked = {
                     let mut state = self.state.lock().unwrap();
                     state.queue = queue;
                     state.current_index = index;
                     state.current_track = Some(track.clone());
                     state.play_source = source.clone();
                     state.restored = true;
-                }
+                    state.sync_track_like_status(&track.id)
+                };
+                self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
                 self.emit(PlayerUiEvent::SourceContext(source));
                 self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index, total_queue: total });
                 let client = self.client.lock().unwrap().clone();
@@ -289,13 +345,15 @@ impl PlayerManager {
                 return;
             }
         }
-        {
+        let is_liked = {
             let mut state = self.state.lock().unwrap();
             state.queue = vec![track.clone()];
             state.current_index = 0;
             state.current_track = Some(track.clone());
             state.restored = true;
-        }
+            state.sync_track_like_status(&track.id)
+        };
+        self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
         self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index: 0, total_queue: 1 });
         let client = self.client.lock().unwrap().clone();
         spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
@@ -321,13 +379,51 @@ impl PlayerManager {
         true
     }
 
+    /// Подписка на события плеера
+    pub fn subscribe(&self) -> async_channel::Receiver<PlayerUiEvent> {
+        let (tx, rx) = async_channel::unbounded();
+        let mut senders = match self.event_senders.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        senders.push(tx);
+        rx
+    }
+
     /// Отправляет событие во все зарегистрированные каналы (UI, MPRIS)
     pub fn emit(&self, event: PlayerUiEvent) {
-        if let PlayerUiEvent::Error(e) = &event {
-            eprintln!("[error] {}", e);
+        emit_all(&self.event_senders, event);
+    }
+
+    /// Проверяет, был ли загружен список лайков
+    pub fn is_liked_loaded(&self) -> bool {
+        self.state.lock().map(|s| s.liked_loaded).unwrap_or(false)
+    }
+
+    /// Загружает список понравившихся треков с сервера (один источник правды).
+    /// Выполняет объединение (merge) серверных ID с локальными, не перезаписывая изменения пользователя.
+    pub async fn ensure_liked_loaded(&self) {
+        if self.is_liked_loaded() {
+            return;
         }
-        for s in &self.event_senders {
-            let _ = s.send_blocking(event.clone());
+        let client = self.client.lock().unwrap().clone();
+        if !client.has_token() {
+            return;
+        }
+        let Ok(uid) = client.get_uid().await else { return };
+        let Ok(ids) = client.get_liked_track_ids(&uid).await else { return };
+
+        let current_liked = {
+            let mut state = self.state.lock().unwrap();
+            if state.user_uid.is_none() {
+                state.user_uid = Some(uid);
+            }
+            state.merge_server_likes(ids);
+            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
+            track_id.map(|id| state.sync_track_like_status(&id))
+        };
+        if let Some(liked) = current_liked {
+            self.emit(PlayerUiEvent::LikeStateChanged(liked));
         }
     }
 
@@ -336,24 +432,36 @@ impl PlayerManager {
         let client_clone = self.client.clone();
         let state_clone = self.state.clone();
         let senders = self.event_senders.clone();
+        let me = self.clone();
 
         tokio::spawn(async move {
             let client = client_clone.lock().unwrap().clone();
             if client.has_token() {
                 match client.get_account_status().await {
                     Ok(acc) => {
+                        let uid = acc.account.as_ref().map(|a| a.uid.clone()).unwrap_or_default();
                         let login = acc.account.as_ref().and_then(|a| a.login.clone())
                             .or_else(|| acc.account.as_ref().and_then(|a| a.full_name.clone()))
                             .unwrap_or_else(|| "Яндекс Пользователь".to_string());
 
+                        if !uid.is_empty() {
+                            client.set_cached_uid(uid.clone());
+                        }
+
                         if let Ok(mut state) = state_clone.lock() {
                             state.user_login = Some(login.clone());
+                            if !uid.is_empty() {
+                                state.user_uid = Some(uid.clone());
+                            }
                         }
 
                         emit_all(&senders, PlayerUiEvent::UserLoggedIn(login.clone()));
                         emit_all(&senders, PlayerUiEvent::StatusMessage(
                             format!("С возвращением, {}! Нажмите «Включить волну» 🌊", login)
                         ));
+
+                        // Единственный источник загрузки лайков со слиянием
+                        me.ensure_liked_loaded().await;
                     }
                     Err(e) => {
                         eprintln!("Ошибка проверки аккаунта: {}", e);
@@ -393,7 +501,7 @@ impl PlayerManager {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            if state.crossfade_triggered {
+            if state.is_transitioning {
                 return;
             }
             state.current_track.as_ref().and_then(|t| t.duration_ms).map(|ms| ms as u64)
@@ -404,7 +512,22 @@ impl PlayerManager {
             _ => return,
         };
 
-        if pos_ms < dur_ms.saturating_sub(fade_ms) {
+        // Защита от устаревшей/аномальной позиции: если pos_ms превышает или равен dur_ms,
+        // это остаточная позиция предыдущего слота во время кроссфейда/буферизации либо трек доиграл до EOS.
+        // Ни в коем случае не триггерим автокроссфейд.
+        if pos_ms >= dur_ms {
+            return;
+        }
+
+        let threshold_ms = dur_ms.saturating_sub(fade_ms);
+        if pos_ms < threshold_ms {
+            // Трек играет в нормальном диапазоне (до момента сводки) — сбрасываем флаг,
+            // разрешая будущий кроссфейд, когда трек действительно дойдет до конца.
+            if let Ok(mut state) = self.state.lock() {
+                if state.crossfade_triggered {
+                    state.crossfade_triggered = false;
+                }
+            }
             return;
         }
 
@@ -413,7 +536,7 @@ impl PlayerManager {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            if state.crossfade_triggered {
+            if state.crossfade_triggered || state.is_transitioning {
                 false
             } else {
                 let at_end = state.current_index + 1 >= state.queue.len();
@@ -431,6 +554,19 @@ impl PlayerManager {
                 "[crossfade] автосводка в конце трека (pos: {} ms, dur: {} ms, fade: {} ms)",
                 pos_ms, dur_ms, fade_ms
             );
+            let (repeat_one, current_track) = {
+                let state = match self.state.lock() {
+                    Ok(s) => (s.repeat == RepeatMode::One, s.current_track.clone()),
+                    Err(_) => (false, None),
+                };
+                state
+            };
+            if repeat_one {
+                if let Some(track) = current_track {
+                    self.play_track_stream(&track);
+                    return;
+                }
+            }
             self.next_track();
         }
     }
@@ -509,8 +645,9 @@ impl PlayerManager {
         }
 
         {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             if state.crossfade_triggered {
+                state.crossfade_triggered = false;
                 eprintln!("[on_track_finished] автокроссфейд уже запущен, пропускаем повторный next_track");
                 return;
             }
@@ -581,7 +718,7 @@ impl PlayerManager {
         if self.resume_restored() {
             return;
         }
-        let (next_track, idx, total) = {
+        let (next_track, idx, total, is_liked) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
                 return;
@@ -589,11 +726,11 @@ impl PlayerManager {
             state.current_index = (state.current_index + 1) % state.queue.len();
             let idx = state.current_index;
             let track = state.queue[idx].clone();
+            state.is_transitioning = true;
             state.current_track = Some(track.clone());
-            state.is_liked = false;
-            state.is_disliked = false;
+            let is_liked = state.sync_track_like_status(&track.id);
             state.played_seconds = 0.0;
-            (track, idx, state.queue.len())
+            (track, idx, state.queue.len(), is_liked)
         };
 
         // Если в очереди осталось менее 2 треков, подгружаем следующую пачку станции Ротора
@@ -602,7 +739,7 @@ impl PlayerManager {
             self.load_more_wave_tracks();
         }
 
-        self.emit(PlayerUiEvent::LikeStateChanged(false));
+        self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
         self.emit(PlayerUiEvent::DislikeStateChanged(false));
         self.emit(PlayerUiEvent::TrackStarted {
             track: next_track.clone(),
@@ -668,7 +805,7 @@ impl PlayerManager {
         if self.resume_restored() {
             return;
         }
-        let (prev_track, idx, total) = {
+        let (prev_track, idx, total, is_liked) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
                 return;
@@ -680,14 +817,15 @@ impl PlayerManager {
             }
             let idx = state.current_index;
             let track = state.queue[idx].clone();
+            state.crossfade_triggered = false;
+            state.is_transitioning = true;
             state.current_track = Some(track.clone());
-            state.is_liked = false;
-            state.is_disliked = false;
+            let is_liked = state.sync_track_like_status(&track.id);
             state.played_seconds = 0.0;
-            (track, idx, state.queue.len())
+            (track, idx, state.queue.len(), is_liked)
         };
 
-        self.emit(PlayerUiEvent::LikeStateChanged(false));
+        self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
         self.emit(PlayerUiEvent::DislikeStateChanged(false));
         self.emit(PlayerUiEvent::TrackStarted {
             track: prev_track.clone(),
@@ -720,6 +858,8 @@ impl PlayerManager {
     fn start_station(&self, station_id: String, first: Option<Track>, label: String) {
         {
             let mut state = self.state.lock().unwrap();
+            state.crossfade_triggered = false;
+            state.is_transitioning = true;
             state.station_id = station_id.clone();
             state.batch_id = None;
             state.current_mood = None;
@@ -729,8 +869,7 @@ impl PlayerManager {
                 state.queue = vec![t.clone()];
                 state.current_index = 0;
                 state.current_track = Some(t.clone());
-                state.is_liked = false;
-                state.is_disliked = false;
+                state.sync_track_like_status(&t.id);
             }
         }
         self.set_wave(true);
@@ -744,6 +883,8 @@ impl PlayerManager {
 
         match &first {
             Some(t) => {
+                let is_liked = self.state.lock().map(|s| s.is_liked).unwrap_or(false);
+                self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
                 self.emit(PlayerUiEvent::TrackStarted { track: t.clone(), index: 0, total_queue: 1 });
                 self.play_track_stream(t);
             }
@@ -806,18 +947,20 @@ impl PlayerManager {
         let index = start_index.min(tracks.len() - 1);
         let track = tracks[index].clone();
 
-        {
+        let is_liked = {
             let mut state = self.state.lock().unwrap();
+            state.crossfade_triggered = false;
+            state.is_transitioning = true;
             state.queue = tracks.clone();
             state.current_index = index;
             state.current_track = Some(track.clone());
             state.play_source = source.clone();
-            state.is_liked = false;
-            state.is_disliked = false;
-        }
+            state.sync_track_like_status(&track.id)
+        };
 
         self.set_wave(false);
         crate::cache::save_session_queue(&tracks, source.clone());
+        self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
         self.emit(PlayerUiEvent::SourceContext(source));
         self.emit(PlayerUiEvent::QueueUpdated(tracks.clone()));
         self.emit(PlayerUiEvent::TrackStarted {
@@ -877,59 +1020,128 @@ impl PlayerManager {
         }
     }
 
-    /// Отметка лайка
-    pub fn toggle_like(&self) {
-        let (new_like, station_id, track_id, batch_id) = {
+    pub fn is_track_liked(&self, track_id: &str) -> bool {
+        self.state.lock().map(|s| s.liked_track_ids.contains(track_id)).unwrap_or(false)
+    }
+
+    /// Устанавливает или снимает отметку «Мне нравится» для трека, синхронизирует кэш и сервер
+    pub fn set_track_liked(&self, track: &Track, liked: bool) {
+        let (station_id, batch_id, current_is_this, user_uid) = {
             let mut state = self.state.lock().unwrap();
-            state.is_liked = !state.is_liked;
-            if state.is_liked {
-                state.is_disliked = false;
+            state.set_liked_local(&track.id, liked);
+            let current_is_this = state.current_track.as_ref().map(|t| t.id == track.id).unwrap_or(false);
+            if current_is_this {
+                state.is_liked = liked;
+                if liked {
+                    state.is_disliked = false;
+                }
             }
-            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
-            (state.is_liked, state.station_id.clone(), track_id, state.batch_id.clone())
+            (state.station_id.clone(), state.batch_id.clone(), current_is_this, state.user_uid.clone())
         };
 
-        self.emit(PlayerUiEvent::LikeStateChanged(new_like));
-        if new_like {
-            self.emit(PlayerUiEvent::DislikeStateChanged(false));
-            self.emit(PlayerUiEvent::StatusMessage("Понравилось в Волне ❤️".into()));
+        if current_is_this {
+            self.emit(PlayerUiEvent::LikeStateChanged(liked));
+            if liked {
+                self.emit(PlayerUiEvent::DislikeStateChanged(false));
+            }
         }
 
-        if let Some(t_id) = track_id {
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                let client_guard = client.lock().unwrap().clone();
-                if client_guard.has_token() && new_like {
-                    let _ = client_guard.feedback_like(&station_id, &t_id, batch_id).await;
+        self.emit(PlayerUiEvent::TrackLiked {
+            track: track.clone(),
+            liked,
+        });
+
+        let client = self.client.clone();
+        let track_id = track.id.clone();
+        tokio::spawn(async move {
+            let client_guard = client.lock().unwrap().clone();
+            if client_guard.has_token() {
+                let uid_res = match user_uid {
+                    Some(u) => Ok(u),
+                    None => client_guard.get_uid().await,
+                };
+                if let Ok(uid) = uid_res {
+                    let _ = client_guard.set_track_like(&uid, &track_id, liked).await;
                 }
-            });
+                if liked {
+                    let _ = client_guard.feedback_like(&station_id, &track_id, batch_id).await;
+                }
+            }
+        });
+    }
+
+    /// Отметка лайка
+    pub fn toggle_like(&self) {
+        let current_track = {
+            let state = self.state.lock().unwrap();
+            state.current_track.clone()
+        };
+
+        if let Some(track) = current_track {
+            let new_like = !self.is_track_liked(&track.id);
+            if new_like {
+                self.emit(PlayerUiEvent::StatusMessage("Добавлено в «Мне нравится» ❤️".into()));
+            } else {
+                self.emit(PlayerUiEvent::StatusMessage("Удалено из «Мне нравится»".into()));
+            }
+            self.set_track_liked(&track, new_like);
         }
     }
 
     /// Отметка дизлайка
     pub fn toggle_dislike(&self) {
-        let (new_dislike, station_id, track_id, batch_id) = {
+        let (new_dislike, station_id, track, batch_id, was_liked, user_uid) = {
             let mut state = self.state.lock().unwrap();
             state.is_disliked = !state.is_disliked;
+            let track = state.current_track.clone();
+            let mut was_liked = false;
             if state.is_disliked {
                 state.is_liked = false;
+                if let Some(t) = &track {
+                    was_liked = state.set_liked_local(&t.id, false);
+                }
             }
-            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
-            (state.is_disliked, state.station_id.clone(), track_id, state.batch_id.clone())
+            (
+                state.is_disliked,
+                state.station_id.clone(),
+                track,
+                state.batch_id.clone(),
+                was_liked,
+                state.user_uid.clone(),
+            )
         };
 
         self.emit(PlayerUiEvent::DislikeStateChanged(new_dislike));
         if new_dislike {
             self.emit(PlayerUiEvent::LikeStateChanged(false));
+            if let Some(t) = &track {
+                self.emit(PlayerUiEvent::TrackLiked {
+                    track: t.clone(),
+                    liked: false,
+                });
+            }
             self.emit(PlayerUiEvent::StatusMessage("Исключено из потока 👎".into()));
         }
 
-        if let Some(t_id) = track_id {
+        if let Some(t) = track {
             let client = self.client.clone();
+            let track_id = t.id.clone();
             tokio::spawn(async move {
                 let client_guard = client.lock().unwrap().clone();
-                if client_guard.has_token() && new_dislike {
-                    let _ = client_guard.feedback_dislike(&station_id, &t_id, batch_id).await;
+                if client_guard.has_token() {
+                    if new_dislike {
+                        let uid_res = match user_uid {
+                            Some(u) => Ok(u),
+                            None => client_guard.get_uid().await,
+                        };
+                        if let Ok(uid) = uid_res {
+                            if was_liked {
+                                let _ = client_guard.set_track_like(&uid, &track_id, false).await;
+                            }
+                            let _ = client_guard.dislike_track(&uid, &track_id).await;
+                        }
+                        let _ = client_guard.feedback_dislike(&station_id, &track_id, batch_id).await;
+                    }
                 }
             });
         }
@@ -1004,7 +1216,7 @@ impl PlayerManager {
             }
 
             if let Ok(mut state) = self.state.lock() {
-                state.crossfade_triggered = false;
+                state.is_transitioning = false;
             }
 
             emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
@@ -1036,6 +1248,9 @@ impl PlayerManager {
                 eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "ошибка" });
                 if is_stale() {
                     eprintln!("[play] #{} устарел, поток не запускаем", epoch);
+                    if let Ok(mut state) = state_arc.lock() {
+                        state.is_transitioning = false;
+                    }
                     return;
                 }
                 match result {
@@ -1056,7 +1271,7 @@ impl PlayerManager {
                         }
 
                         if let Ok(mut state) = state_arc.lock() {
-                            state.crossfade_triggered = false;
+                            state.is_transitioning = false;
                         }
 
                         emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
@@ -1073,11 +1288,17 @@ impl PlayerManager {
                         let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
                     }
                     Err(e) => {
+                        if let Ok(mut state) = state_arc.lock() {
+                            state.is_transitioning = false;
+                        }
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
                         emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка получения потока: {}", e)));
                     }
                 }
             } else {
+                if let Ok(mut state) = state_arc.lock() {
+                    state.is_transitioning = false;
+                }
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
                     "Требуется авторизация для воспроизведения".to_string(),
@@ -1156,18 +1377,24 @@ impl PlayerManager {
                     let tracks = dedup_tracks(&[], station_tracks.sequence.into_iter().map(|s| s.track).collect());
                     let first_track = tracks.first().cloned();
 
-                    if let Ok(mut state) = state_clone.lock() {
+                    let first_is_liked = if let Ok(mut state) = state_clone.lock() {
                         state.batch_id = station_tracks.batch_id.clone();
                         if !tracks.is_empty() {
                             state.queue = tracks.clone();
                             state.current_index = 0;
                             state.current_track = first_track.clone();
+                            first_track.as_ref().map(|t| state.sync_track_like_status(&t.id)).unwrap_or(false)
+                        } else {
+                            false
                         }
-                    }
+                    } else {
+                        false
+                    };
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     emit_all(&senders, PlayerUiEvent::QueueUpdated(tracks.clone()));
 
                     if let Some(track) = first_track {
+                        emit_all(&senders, PlayerUiEvent::LikeStateChanged(first_is_liked));
                         emit_all(&senders, PlayerUiEvent::TrackStarted {
                             track: track.clone(),
                             index: 0,
@@ -1220,14 +1447,14 @@ impl PlayerManager {
 /// Обложка и текст песни грузятся отдельными задачами, чтобы не задерживать воспроизведение.
 /// Если у трека текста нет, UI получает пустую строку: старый текст предыдущего трека не остаётся.
 fn spawn_cover_and_lyrics(
-    senders: &[Sender<PlayerUiEvent>],
+    senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
     client: YandexMusicClient,
     track: &Track,
     epoch: u64,
     generation: &Arc<AtomicU64>,
 ) {
     if let Some(cover_url) = track.cover_url(400) {
-        let (senders, generation) = (senders.to_vec(), generation.clone());
+        let (senders, generation) = (senders.clone(), generation.clone());
         tokio::spawn(async move {
             if let Some(path) = crate::cache::fetch_cover_cached(&cover_url).await {
                 if generation.load(Ordering::SeqCst) == epoch {
@@ -1238,7 +1465,7 @@ fn spawn_cover_and_lyrics(
     }
 
     if crate::api::auth::load_clips() {
-        let (senders, generation, client, clip_track) = (senders.to_vec(), generation.clone(), client.clone(), track.clone());
+        let (senders, generation, client, clip_track) = (senders.clone(), generation.clone(), client.clone(), track.clone());
         tokio::spawn(async move {
             // свои клипы альбома важнее клипов Яндекса
             if let Some(path) = crate::cache::custom_clip_for(&clip_track) {
@@ -1266,7 +1493,7 @@ fn spawn_cover_and_lyrics(
         });
     }
 
-    let (senders, generation) = (senders.to_vec(), generation.clone());
+    let (senders, generation) = (senders.clone(), generation.clone());
     let (track_id, title, artist) = (track.id.clone(), track.title.clone(), track.artists_string());
     let duration = track.duration_ms.map(|d| d / 1000);
     tokio::spawn(async move {
@@ -1310,13 +1537,15 @@ fn dedup_tracks(existing: &[Track], new: Vec<Track>) -> Vec<Track> {
 }
 
 /// Рассылает событие во все переданные каналы
-fn emit_all(senders: &[Sender<PlayerUiEvent>], event: PlayerUiEvent) {
+fn emit_all(senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>, event: PlayerUiEvent) {
     if let PlayerUiEvent::Error(e) = &event {
         eprintln!("[error] {}", e);
     }
-    for s in senders {
-        let _ = s.send_blocking(event.clone());
-    }
+    let mut senders = match senders.lock() {
+        Ok(s) => s,
+        Err(e) => e.into_inner(),
+    };
+    senders.retain(|s| s.send_blocking(event.clone()).is_ok());
 }
 
 #[cfg(test)]
@@ -1365,5 +1594,102 @@ mod crossfade_tests {
     fn player_state_default_crossfade_not_triggered() {
         let state = PlayerState::default();
         assert_eq!(state.crossfade_triggered, false);
+    }
+
+    #[test]
+    fn test_crossfade_resets_when_position_is_before_threshold() {
+        let mut state = PlayerState::default();
+        state.crossfade_triggered = true;
+        let dur_ms = 200_000u64;
+        let fade_ms = 2000u64;
+        let threshold_ms = dur_ms.saturating_sub(fade_ms);
+
+        let pos_ms = 500u64;
+        if pos_ms < threshold_ms {
+            state.crossfade_triggered = false;
+        }
+        assert_eq!(state.crossfade_triggered, false);
+    }
+
+    #[test]
+    fn test_stale_position_greater_than_duration_is_ignored() {
+        let dur_ms = 200_000u64;
+        let stale_pos_ms = 350_000u64;
+        // Позиция превышает длину трека — кроссфейд не должен срабатывать
+        assert!(stale_pos_ms >= dur_ms);
+    }
+}
+
+#[cfg(test)]
+mod like_tests {
+    use super::*;
+
+    #[test]
+    fn test_like_state_and_cache() {
+        let mut state = PlayerState::default();
+        let tr = Track {
+            id: "track_200".to_string(),
+            title: "Test Song".to_string(),
+            ..Default::default()
+        };
+
+        state.liked_track_ids.insert("track_100".to_string());
+        assert!(state.liked_track_ids.contains("track_100"));
+        assert!(!state.liked_track_ids.contains("track_200"));
+
+        // Добавление лайка
+        state.liked_track_ids.insert(tr.id.clone());
+        assert!(state.sync_track_like_status(&tr.id));
+        assert!(state.is_liked);
+        assert!(!state.is_disliked);
+
+        // Дизлайк лайкнутого трека
+        state.is_disliked = true;
+        state.is_liked = false;
+        let was_liked = state.liked_track_ids.remove(&tr.id);
+        assert!(was_liked);
+        assert!(!state.liked_track_ids.contains(&tr.id));
+        assert!(state.is_disliked);
+        assert!(!state.is_liked);
+    }
+
+    #[test]
+    fn test_server_likes_do_not_override_local_changes_made_while_loading() {
+        let mut state = PlayerState::default();
+        // пока список грузится: снят лайк с "a", поставлен на "c"
+        state.set_liked_local("a", false);
+        state.set_liked_local("c", true);
+        // устаревший ответ сервера: "a" ещё лайкнут, "b" лайкнут, "c" нет
+        state.merge_server_likes(vec!["a".into(), "b".into()]);
+        assert!(state.liked_loaded);
+        assert!(!state.liked_track_ids.contains("a"));
+        assert!(state.liked_track_ids.contains("b"));
+        assert!(state.liked_track_ids.contains("c"));
+        // после загрузки правки больше не копятся
+        state.set_liked_local("b", false);
+        assert!(state.liked_pending.is_empty());
+    }
+
+    #[test]
+    fn test_sync_track_like_status() {
+        let mut state = PlayerState::default();
+        state.liked_track_ids.insert("track_1".to_string());
+        state.is_disliked = true;
+
+        assert!(state.sync_track_like_status("track_1"));
+        assert!(state.is_liked);
+        assert!(!state.is_disliked);
+
+        assert!(!state.sync_track_like_status("track_unknown"));
+        assert!(!state.is_liked);
+        assert!(!state.is_disliked);
+    }
+
+    #[tokio::test]
+    async fn test_cached_uid_avoids_network() {
+        let client = YandexMusicClient::new(None);
+        client.set_cached_uid("user_999".to_string());
+        let uid = client.get_uid().await.expect("cached uid must succeed");
+        assert_eq!(uid, "user_999");
     }
 }

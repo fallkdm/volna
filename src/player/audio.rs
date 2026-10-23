@@ -295,6 +295,11 @@ impl AudioBackend {
             *lock = true;
         }
 
+        // Мгновенно переключаем активный слот на новый трек, чтобы position_ms() и UI
+        // не считывали устаревшую позицию конца предыдущего трека (устраняет дергание полосы
+        // прогресса и ложные срабатывания автокроссфейда).
+        self.active_slot.store(next_idx, Ordering::SeqCst);
+
         let user_volume_arc = self.user_volume.clone();
         let user_vol = self.user_volume();
 
@@ -304,7 +309,6 @@ impl AudioBackend {
 
         let generation_id = self.fade_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let fade_gen = self.fade_gen.clone();
-        let active_slot = self.active_slot.clone();
 
         if duration_ms == 0 {
             current_play.stop();
@@ -312,7 +316,6 @@ impl AudioBackend {
                 *lock = false;
             }
             next_play.set_volume(user_vol);
-            active_slot.store(next_idx, Ordering::SeqCst);
             return;
         }
 
@@ -321,21 +324,26 @@ impl AudioBackend {
         tokio::spawn(async move {
             // Ждем, пока новый поток сбуферизируется и физически перейдет в Playing
             let wait_start = tokio::time::Instant::now();
+            let mut started = false;
             loop {
                 if fade_gen.load(Ordering::SeqCst) != generation_id {
                     return;
                 }
                 if next_play.pipeline().current_state() == gstreamer::State::Playing {
+                    started = true;
                     break;
                 }
-                if wait_start.elapsed().as_millis() > 3000 {
+                // Ждём буферизацию до 15 секунд; если поток не заиграл — не глушим старый трек
+                if wait_start.elapsed().as_millis() > 15_000 {
                     break;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
             }
 
-            // Переключаем активный слот на новый строго в момент, когда он реально начал играть с 0:00
-            active_slot.store(next_idx, Ordering::SeqCst);
+            if !started {
+                eprintln!("[audio] новый поток не перешел в Playing за 15 с, отменяем затухание старого");
+                return;
+            }
 
             const STEP_MS: u64 = 25;
             let steps = (duration_ms / STEP_MS).max(1);

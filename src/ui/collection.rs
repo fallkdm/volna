@@ -1,7 +1,7 @@
 //! Общие виджеты коллекций: обложки, плитки, строки треков и страница альбома/плейлиста.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
@@ -16,8 +16,6 @@ use crate::api::models::{Album, Artist, Playlist, Track};
 use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 
 thread_local! {
-    /// Идентификаторы треков из «Мне нравится»; None, пока не загружены
-    static LIKED: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
     static COVERS: RefCell<HashMap<String, gdk::Texture>> = RefCell::new(HashMap::new());
 }
 
@@ -1090,6 +1088,42 @@ impl DetailPage {
         self.offline_btn.set_visible(!tracks.is_empty());
         *self.tracks.borrow_mut() = tracks;
     }
+
+    /// Реактивно добавляет или удаляет трек из «Мне нравится» или обновляет сердечко в открытых списках
+    pub fn handle_track_liked(&self, track: &Track, liked: bool) {
+        if self.title.text() == "Мне нравится" {
+            if liked {
+                if self.tracks.borrow().iter().any(|t| t.id == track.id) {
+                    return;
+                }
+                insert_track_row(&self.player, &self.nav, &self.tracks, &self.list, &self.empty, track);
+                let count = self.tracks.borrow().len();
+                self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
+                self.offline_btn.set_visible(true);
+            } else {
+                let pos = self.tracks.borrow().iter().position(|t| t.id == track.id);
+                if let Some(idx) = pos {
+                    self.tracks.borrow_mut().remove(idx);
+                    if let Some(row) = self.list.row_at_index(idx as i32) {
+                        self.list.remove(&row);
+                    }
+                    let count = self.tracks.borrow().len();
+                    self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
+                    if count == 0 {
+                        self.empty.set_visible(true);
+                        self.offline_btn.set_visible(false);
+                    }
+                }
+            }
+        } else {
+            // В открытых страницах альбомов, артистов или плейлистов обновляем сердечко на соответствующей строке
+            if let Some(idx) = self.tracks.borrow().iter().position(|t| t.id == track.id) {
+                if let Some(row) = self.list.row_at_index(idx as i32) {
+                    update_heart_in_widget(row.upcast_ref(), liked);
+                }
+            }
+        }
+    }
 }
 
 /// Добавляет трек в начало списка страницы (как делает сервер при добавлении в плейлист)
@@ -1327,22 +1361,42 @@ pub fn tile_row() -> (ScrolledWindow, GtkBox) {
     (scrolled, row)
 }
 
-/// Загружает «Мне нравится» один раз за запуск, чтобы сердечки в списках сразу показывали состояние
+/// Загружает «Мне нравится» через менеджер плеера один раз за запуск
 pub async fn ensure_liked(player: &PlayerManager) {
-    if LIKED.with(|l| l.borrow().is_some()) {
-        return;
-    }
-    let client = player.client.lock().unwrap().clone();
-    let ids = match client.get_uid().await {
-        Ok(uid) => client.get_liked_track_ids(&uid).await.unwrap_or_default(),
-        Err(_) => return,
-    };
-    LIKED.with(|l| *l.borrow_mut() = Some(ids.into_iter().collect()));
+    player.ensure_liked_loaded().await;
 }
 
 /// Сердечко текстом: иконки тем оформления разные, а у части из них вместо сердца звезда
 fn heart_glyph(liked: bool) -> &'static str {
     if liked { "♥" } else { "♡" }
+}
+
+/// Находит кнопку сердечка внутри строки списка и обновляет её состояние
+pub fn update_heart_in_widget(widget: &gtk4::Widget, liked: bool) {
+    if let Some(btn) = find_heart_button(widget) {
+        btn.set_label(heart_glyph(liked));
+        if liked {
+            btn.add_css_class("liked-heart");
+        } else {
+            btn.remove_css_class("liked-heart");
+        }
+    }
+}
+
+fn find_heart_button(widget: &gtk4::Widget) -> Option<Button> {
+    if let Ok(btn) = widget.clone().downcast::<Button>() {
+        if btn.has_css_class("track-heart-btn") {
+            return Some(btn);
+        }
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(btn) = find_heart_button(&c) {
+            return Some(btn);
+        }
+        child = c.next_sibling();
+    }
+    None
 }
 
 /// Запускает запрос в фоне и показывает ошибку в строке состояния
@@ -1387,26 +1441,26 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     let bx = GtkBox::new(Orientation::Horizontal, 2);
     bx.set_valign(Align::Center);
 
-    let heart = Button::with_label(heart_glyph(LIKED.with(|l| l.borrow().as_ref().is_some_and(|s| s.contains(&track.id)))));
+    let is_liked = player.is_track_liked(&track.id);
+    let heart = Button::with_label(heart_glyph(is_liked));
     heart.add_css_class("flat");
     heart.add_css_class("circular");
+    heart.add_css_class("track-heart-btn");
     heart.set_tooltip_text(Some("Мне нравится"));
-    if LIKED.with(|l| l.borrow().as_ref().is_some_and(|s| s.contains(&track.id))) {
+    if is_liked {
         heart.add_css_class("liked-heart");
     }
     {
-        let (p, id) = (player.clone(), track.id.clone());
+        let (p, track) = (player.clone(), track.clone());
         heart.connect_clicked(move |b| {
-            let like = !LIKED.with(|l| l.borrow().as_ref().is_some_and(|s| s.contains(&id)));
-            LIKED.with(|l| {
-                let mut l = l.borrow_mut();
-                let set = l.get_or_insert_with(HashSet::new);
-                if like { set.insert(id.clone()); } else { set.remove(&id); }
-            });
+            let like = !p.is_track_liked(&track.id);
             b.set_label(heart_glyph(like));
-            if like { b.add_css_class("liked-heart"); } else { b.remove_css_class("liked-heart"); }
-            let id = id.clone();
-            run_api(&p, None, move |c, uid| async move { c.set_track_like(&uid, &id, like).await });
+            if like {
+                b.add_css_class("liked-heart");
+            } else {
+                b.remove_css_class("liked-heart");
+            }
+            p.set_track_liked(&track, like);
         });
     }
     bx.append(&heart);
