@@ -727,23 +727,26 @@ mod palette_tests {
         assert!((core[0] - core[1]).abs() < 0.05);
     }
 
+    /// Тёмная обложка с тёплым акцентом: доминирующий оттенок должен остаться тёплым.
+    ///
+    /// Раньше здесь читался файл обложки из `~/.cache` конкретной машины, причём
+    /// отсутствие файла молча превращало тест в пустышку (ветка `if let Ok(..)`
+    /// без `else`). Пиксели теперь синтезируются прямо в тесте, без I/O и GDK.
     #[test]
-    fn deftones_genesis_cover_palette() {
-        let path = "/home/philk/.cache/volna/covers/5ca90a57e9dec30920696c3740ffc9dd.jpg";
-        if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, 48, 48, false) {
-            let (n, stride) = (pixbuf.n_channels() as usize, pixbuf.rowstride() as usize);
-            let bytes = pixbuf.read_pixel_bytes();
-            let mut px = Vec::with_capacity(48 * 48);
-            for y in 0..pixbuf.height() as usize {
-                for x in 0..pixbuf.width() as usize {
-                    let i = y * stride + x * n;
-                    if let Some(p) = bytes.get(i..i + 3) {
-                        px.push([p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0]);
-                    }
-                }
+    fn dark_cover_with_warm_accent_keeps_hue() {
+        let mut px = vec![[0.06, 0.05, 0.07]; 48 * 48];
+        for y in 0..20 {
+            for x in 28..48 {
+                px[y * 48 + x] = [0.85, 0.55, 0.35];
             }
-            let res = palette_from_pixels(&px);
-            assert!(res.is_some());
         }
+
+        let (core, deep, _ridge) = palette_from_pixels(&px).expect("тёплая обложка должна давать палитру");
+
+        // Пик нормируется ровно к 0.9 по старшему каналу.
+        assert!((core[0] - 0.9).abs() < 1e-9, "пик не нормирован: {core:?}");
+        // Акцент тёплый: R > G > B. Регрессия «пожелтело/посинело» ловится здесь.
+        assert!(core[0] > core[1] && core[1] > core[2], "оттенок уехал: {core:?}");
+        assert!((deep[0] - core[0] * 0.32).abs() < 1e-9, "deep не производный от core: {deep:?}");
     }
 }
