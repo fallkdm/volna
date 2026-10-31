@@ -131,6 +131,17 @@ impl VolnaWindow {
         let is_spotify_nav = nav_style == "spotify";
         let is_spotify_nav_state = Rc::new(RefCell::new(is_spotify_nav));
 
+        let initial_content_margin = if is_spotify_nav {
+            if initial_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH }
+        } else {
+            0
+        };
+        search_view.container.set_margin_start(initial_content_margin);
+        library_view.container.set_margin_start(initial_content_margin);
+
+        let search_container = search_view.container.clone();
+        let library_container = library_view.container.clone();
+
         // Внешняя обёртка: на каждом кадре анимируется ТОЛЬКО её ширина (клипп).
         // Внутренности сайдбара всегда имеют постоянный размер и не перекладываются —
         // иначе разметка кнопок и подписей (Pango, ellipsize) на каждом кадре дёргает анимацию.
@@ -252,9 +263,8 @@ impl VolnaWindow {
         let sidebar_footer = GtkBox::new(Orientation::Vertical, 4);
         sidebar_footer.add_css_class("sidebar-footer");
         sidebar_footer.set_valign(Align::End);
-        sidebar_footer.set_margin_bottom(8);
+        sidebar_footer.set_margin_bottom(16);
         sidebar_footer.set_margin_top(4);
-        sidebar_footer.set_overflow(Overflow::Hidden);
 
         // Кнопка профиля (с оверлеем для нулевого влияния на ширину при анимации)
         let auth_btn = Button::new();
@@ -374,6 +384,9 @@ impl VolnaWindow {
             let brand_box = brand_box.clone();
             let auth_name_box = auth_name_box.clone();
             let settings_label_box = settings_label_box.clone();
+            let search_container = search_container.clone();
+            let library_container = library_container.clone();
+            let is_spotify_nav_state = is_spotify_nav_state.clone();
             let nav_items = vec![nav_wave.clone(), nav_search.clone(), nav_liked.clone()];
             let anim_holder: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
 
@@ -450,8 +463,16 @@ impl VolnaWindow {
                 let sb_done = settings_label_box.clone();
                 let items_done = nav_items.clone();
                 let c_btn_done = c_btn.clone();
+                let sc_done = search_container.clone();
+                let lc_done = library_container.clone();
+                let is_sp_done = is_spotify_nav_state.clone();
 
                 anim.connect_done(move |_| {
+                    if *is_sp_done.borrow() {
+                        let m = if next_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH };
+                        sc_done.set_margin_start(m);
+                        lc_done.set_margin_start(m);
+                    }
                     if next_collapsed {
                         s_done.set_width_request(SIDEBAR_COLLAPSED_WIDTH);
                         s_done.add_css_class("collapsed");
@@ -557,11 +578,8 @@ impl VolnaWindow {
         // Нижний плеер (парящий остров или прижатый док)
         let island = create_floating_island(&player);
         super::floating_island::apply_player_layout(&island, &player_layout);
-        if player_layout == "dock" {
-            sidebar.set_margin_bottom(92);
-        } else {
-            sidebar.set_margin_bottom(0);
-        }
+        let sb_bottom = if player_layout == "dock" { 96 } else { 108 };
+        sidebar.set_margin_bottom(sb_bottom);
 
         root_overlay.set_child(Some(&app_body_overlay));
         root_overlay.add_overlay(&island.container);
@@ -1152,6 +1170,9 @@ impl VolnaWindow {
             dynamic_provider,
             is_spotify_nav_state,
             main_content_box.clone(),
+            search_view.container.clone(),
+            library_view.container.clone(),
+            is_collapsed.clone(),
         );
 
         Self { window }
@@ -1368,6 +1389,9 @@ fn setup_event_listener(
     dynamic_provider: gtk4::CssProvider,
     is_spotify_nav_state: Rc<RefCell<bool>>,
     main_content_box: GtkBox,
+    search_container: GtkBox,
+    library_container: GtkBox,
+    is_collapsed: Rc<RefCell<bool>>,
 ) {
     if player.client.lock().unwrap().has_token() {
         auth_name_label.set_text("Аккаунт");
@@ -1651,12 +1675,19 @@ fn setup_event_listener(
                     view_switcher.set_visible(!is_spotify);
                     header_brand_box.set_visible(!is_spotify);
                     header_right_box.set_visible(!is_spotify);
+                    let m = if is_spotify {
+                        if *is_collapsed.borrow() { 68 } else { 240 }
+                    } else {
+                        0
+                    };
+                    search_container.set_margin_start(m);
+                    library_container.set_margin_start(m);
                 }
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
-                    let dock_margin = if layout == "dock" { 92 } else { 0 };
-                    sidebar.set_margin_bottom(dock_margin);
-                    main_content_box.set_margin_bottom(dock_margin);
+                    let sb_margin = if layout == "dock" { 96 } else { 108 };
+                    sidebar.set_margin_bottom(sb_margin);
+                    main_content_box.set_margin_bottom(if layout == "dock" { 92 } else { 0 });
                 }
                 PlayerUiEvent::ThemeAccentChanged(accent) => {
                     *theme_accent_state.borrow_mut() = accent.clone();
