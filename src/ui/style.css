@@ -674,14 +674,12 @@ toast {
     background: rgba(14, 14, 14, 0.92);
     border-right: 1px solid rgba(255, 255, 255, 0.08);
     padding: 8px 12px 0 12px;
-    overflow: hidden;
 }
 
 /* Шапка сайдбара */
 .sidebar-header-box {
     min-height: 44px;
     padding: 0;
-    overflow: hidden;
 }
 
 .sidebar-brand-title {
@@ -689,7 +687,6 @@ toast {
     font-weight: 800;
     letter-spacing: -0.2px;
     color: #ffffff;
-    overflow: hidden;
 }
 
 button.sidebar-collapse-btn {
@@ -717,7 +714,6 @@ button.sidebar-collapse-btn:hover {
 /* Навигация */
 .sidebar-nav-container {
     padding: 6px 0;
-    overflow: hidden;
 }
 
 /* Кнопки сайдбара: единый плоский стиль со слотом 44x40 */
@@ -734,7 +730,6 @@ button.sidebar-settings-btn {
     border: none;
     outline: none;
     box-shadow: none;
-    overflow: hidden;
     transition: color 150ms ease, background-color 150ms ease;
 }
 
@@ -794,7 +789,6 @@ button.sidebar-nav-btn.active .sidebar-nav-icon {
 /* Нижняя часть (Профиль и Настройки) */
 .sidebar-footer {
     padding: 4px 0 0 0;
-    overflow: hidden;
 }
 
 .sidebar-profile-btn.logged-in {

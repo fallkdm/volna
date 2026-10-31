@@ -148,48 +148,21 @@ impl VolnaWindow {
             sidebar.add_css_class("collapsed");
         }
 
-        // Внутренняя панель имеет постоянную ширину, а внешняя плавно её обрезает.
-        // GtkOverlay не прокручивает содержимое и не учитывает ширину панели при измерении,
-        // поэтому сайдбар может на каждом кадре сужаться вплоть до 68 px.
-        let sidebar_panel = GtkBox::new(Orientation::Vertical, 0);
-        sidebar_panel.set_size_request(SIDEBAR_EXPANDED_WIDTH - 25, -1);
-        sidebar_panel.set_vexpand(true);
-        sidebar_panel.set_halign(Align::Start);
-        sidebar_panel.set_valign(Align::Fill);
-
-        let sidebar_clip = Overlay::new();
-        sidebar_clip.set_vexpand(true);
-        sidebar_clip.set_hexpand(true);
-        sidebar_clip.set_halign(Align::Fill);
-        sidebar_clip.set_valign(Align::Fill);
-        sidebar_clip.set_overflow(Overflow::Hidden);
-
-        // Пустой основной слой отвечает только за высоту; постоянная панель лежит поверх него.
-        let sidebar_sizer = GtkBox::new(Orientation::Vertical, 0);
-        sidebar_sizer.set_vexpand(true);
-        sidebar_clip.set_child(Some(&sidebar_sizer));
-        sidebar_clip.add_overlay(&sidebar_panel);
-        sidebar_clip.set_measure_overlay(&sidebar_panel, false);
-        sidebar.append(&sidebar_clip);
-
         // 1. Верхняя часть: Логотип «🌊 Волна» слева + кнопка сворачивания справа
-        let sidebar_header_handle = gtk4::WindowHandle::new();
-        sidebar_header_handle.set_hexpand(true);
-        sidebar_header_handle.set_halign(Align::Fill);
-
+        // Вынесена из sidebar_panel напрямую в sidebar, чтобы ширина шапки следовала
+        // за шириной сайдбара (68px <-> 240px), и кнопка collapse_btn была строго видна
+        // и отцентрирована в свернутом состоянии.
         let header_box = GtkBox::new(Orientation::Horizontal, 0);
         header_box.add_css_class("sidebar-header-box");
         header_box.set_valign(Align::Center);
         header_box.set_hexpand(true);
         header_box.set_halign(Align::Fill);
-        header_box.set_overflow(Overflow::Hidden);
 
         let brand_box = GtkBox::new(Orientation::Horizontal, 8);
         brand_box.set_valign(Align::Center);
         brand_box.set_halign(Align::Start);
         brand_box.set_hexpand(true);
         brand_box.set_margin_start(4);
-        brand_box.set_overflow(Overflow::Hidden);
 
         let brand_title = Label::new(Some("🌊 Волна"));
         brand_title.add_css_class("sidebar-brand-title");
@@ -227,8 +200,29 @@ impl VolnaWindow {
         header_box.append(&brand_box);
         header_box.append(&collapse_btn);
 
-        sidebar_header_handle.set_child(Some(&header_box));
-        sidebar_panel.append(&sidebar_header_handle);
+        sidebar.append(&header_box);
+
+        let sidebar_panel = GtkBox::new(Orientation::Vertical, 0);
+        sidebar_panel.add_css_class("sidebar-panel");
+        sidebar_panel.set_size_request(SIDEBAR_EXPANDED_WIDTH - 25, -1);
+        sidebar_panel.set_vexpand(true);
+        sidebar_panel.set_halign(Align::Start);
+        sidebar_panel.set_valign(Align::Fill);
+
+        let sidebar_clip = Overlay::new();
+        sidebar_clip.set_vexpand(true);
+        sidebar_clip.set_hexpand(true);
+        sidebar_clip.set_halign(Align::Fill);
+        sidebar_clip.set_valign(Align::Fill);
+        sidebar_clip.set_overflow(Overflow::Hidden);
+
+        // Пустой основной слой отвечает только за высоту; постоянная панель лежит поверх него.
+        let sidebar_sizer = GtkBox::new(Orientation::Vertical, 0);
+        sidebar_sizer.set_vexpand(true);
+        sidebar_clip.set_child(Some(&sidebar_sizer));
+        sidebar_clip.add_overlay(&sidebar_panel);
+        sidebar_clip.set_measure_overlay(&sidebar_panel, false);
+        sidebar.append(&sidebar_clip);
 
         // 2. Средняя часть: Навигационные кнопки (чистый стиль Spotify, без дублирующих эмодзи)
         let sidebar_nav_box = GtkBox::new(Orientation::Vertical, 2);
@@ -397,7 +391,23 @@ impl VolnaWindow {
 
                 c_btn.set_tooltip_text(Some(if next_collapsed { "Развернуть панель" } else { "Свернуть панель" }));
 
-                if !next_collapsed {
+                if next_collapsed {
+                    // При сворачивании СРАЗУ скрываем текст и центрируем кнопку:
+                    // при сжатии сайдбара остаются только аккуратные иконки,
+                    // и ни одна буква не торчит наружу лесенкой поверх волны.
+                    brand_box.set_visible(false);
+                    brand_box.set_opacity(0.0);
+                    auth_name_box.set_visible(false);
+                    auth_name_box.set_opacity(0.0);
+                    settings_label_box.set_visible(false);
+                    settings_label_box.set_opacity(0.0);
+                    for item in &nav_items {
+                        item.label_box.set_visible(false);
+                        item.label_box.set_opacity(0.0);
+                    }
+                    c_btn.set_halign(Align::Center);
+                    c_btn.set_hexpand(true);
+                } else {
                     brand_box.set_visible(true);
                     brand_box.set_opacity(0.0);
                     auth_name_box.set_visible(true);
@@ -422,14 +432,16 @@ impl VolnaWindow {
                     let w = val.round() as i32;
                     s.set_width_request(w);
                     let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
-                    bb.set_opacity(t);
-                    ab.set_opacity(t);
-                    sb.set_opacity(t);
-                    for item in &items {
-                        item.label_box.set_opacity(t);
+                    if !next_collapsed {
+                        bb.set_opacity(t);
+                        ab.set_opacity(t);
+                        sb.set_opacity(t);
+                        for item in &items {
+                            item.label_box.set_opacity(t);
+                        }
                     }
                 });
-                let anim = libadwaita::TimedAnimation::new(&sidebar, from_w, to_w, 250, target);
+                let anim = libadwaita::TimedAnimation::new(&sidebar, from_w, to_w, 180, target);
                 anim.set_easing(libadwaita::Easing::EaseOutCubic);
 
                 let s_done = sidebar.clone();
