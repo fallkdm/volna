@@ -2,6 +2,8 @@
 
 use super::*;
 
+use crate::api::ytmusic::YtMusicError;
+
 /// Парсинг артиста из `musicResponsiveListItemRenderer` или `musicTwoRowItemRenderer`
 pub fn parse_artist_item(item: &serde_json::Value) -> Option<Artist> {
     let renderer = if let Some(r) = item.get("musicTwoRowItemRenderer") {
@@ -76,7 +78,7 @@ fn find_artist_header(val: &serde_json::Value) -> Option<&serde_json::Value> {
 pub fn parse_artist_browse(
     json: &serde_json::Value,
     browse_id: &str,
-) -> Result<ArtistBrief, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ArtistBrief, YtMusicError> {
     let header_obj = find_artist_header(json);
 
     let mut artist_name = header_obj

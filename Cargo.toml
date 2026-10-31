@@ -33,3 +33,4 @@ uuid = { version = "1.28.0", features = ["v4"] }
 discord-rich-presence = "1.1.0"
 async-trait = "0.1"
 sha1 = "0.10"
+thiserror = "2"

@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod error;
 pub mod parser;
 
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use crate::api::models::{Album, ArtistBrief, Playlist, SearchResult, Track};
 use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId, StationBatch};
 
 pub use auth::*;
+pub use error::*;
 pub use parser::*;
 
 // ── Сетевые константы InnerTube ─────────────────────────────────────────────
@@ -208,7 +210,7 @@ impl YtMusicClient {
         client_name: &str,
         client_version: &str,
         body: serde_json::Value,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<serde_json::Value, YtMusicError> {
         let url = format!("https://music.youtube.com/youtubei/v1/{}", endpoint);
 
         let mut req_body = serde_json::json!({
@@ -303,7 +305,7 @@ impl YtMusicClient {
     pub async fn get_stream_url_visionos(
         &self,
         track_id: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<String, YtMusicError> {
         let visitor_id = self.get_visitor_id().await;
         let body = serde_json::json!({
             "context": {
@@ -348,10 +350,7 @@ impl YtMusicClient {
             .error_for_status()?;
 
         let json = resp.json::<serde_json::Value>().await?;
-        let url = parser::parse_stream_url(&json).map_err(|e| {
-            Box::new(std::io::Error::other(e))
-                as Box<dyn std::error::Error + Send + Sync>
-        })?;
+        let url = parser::parse_stream_url(&json).map_err(YtMusicError::Message)?;
 
         println!(
             "[ytmusic] Стрим {} получен НАПРЯМУЮ через VisionOS API (itag 251)",
@@ -364,7 +363,7 @@ impl YtMusicClient {
     pub async fn search_songs(
         &self,
         query: &str,
-    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<Track>, YtMusicError> {
         let body = serde_json::json!({
             "query": query,
             "params": "EgWKAQIIAWoKEAMQBBAKEAUQCRgB"
@@ -377,7 +376,7 @@ impl YtMusicClient {
     }
 
     /// Полнотекстовый поиск по всем сущностям (треки, артисты, альбомы, плейлисты)
-    pub async fn search_all(&self, query: &str) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn search_all(&self, query: &str) -> Result<SearchResult, YtMusicError> {
         let body = serde_json::json!({
             "query": query
         });
@@ -405,7 +404,7 @@ impl YtMusicClient {
     pub async fn get_artist(
         &self,
         query_or_id: &str,
-    ) -> Result<ArtistBrief, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ArtistBrief, YtMusicError> {
         let browse_id = if query_or_id.starts_with("UC") {
             query_or_id.to_string()
         } else {
@@ -436,7 +435,7 @@ impl YtMusicClient {
     }
 
     /// Загрузка понравившихся треков пользователя (через HTML LM или browse fallback)
-    pub async fn get_liked_tracks(&self) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_liked_tracks(&self) -> Result<Vec<Track>, YtMusicError> {
         // 1. Надежный запрос плейлиста LM через HTML с полной сохраненной кукой пользователя
         if let Ok(html) = self.fetch_ytmusic_html("https://music.youtube.com/playlist?list=LM").await {
             if let Some(cnt) = parser::parse_header_track_count_from_html(&html) {
@@ -537,7 +536,7 @@ impl YtMusicClient {
     }
 
     /// Запрос HTML страницы YouTube Music с кукой пользователя
-    pub async fn fetch_ytmusic_html(&self, url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn fetch_ytmusic_html(&self, url: &str) -> Result<String, YtMusicError> {
         let cookie_opt = {
             let guard = self.cookie.read().await;
             guard.clone()
@@ -564,7 +563,7 @@ impl YtMusicClient {
     pub async fn get_album_tracks(
         &self,
         browse_id: &str,
-    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<Track>, YtMusicError> {
         let body = serde_json::json!({
             "browseId": browse_id
         });
@@ -629,7 +628,7 @@ impl YtMusicClient {
     }
 
     /// Получение прямой ссылки на аудиопоток трека через VisionOS API (~100-200 мс) с автоматическим обходом блокировок GGC
-    pub async fn get_stream_url(&self, track_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_stream_url(&self, track_id: &str) -> Result<String, YtMusicError> {
         // Приоритет 1: мгновенный нативный запрос через InnerTube VisionOS API (~100-200 мс)
         let raw_url = match self.get_stream_url_visionos(track_id).await {
             Ok(url) => url,
@@ -644,14 +643,14 @@ impl YtMusicClient {
     }
 
     /// Отправляет действие оценки (like/like, like/dislike, like/removelike) во все связанные профили Google и домены (YouTube Music и YouTube Video)
-    pub async fn send_rating_action(&self, endpoint: &str, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn send_rating_action(&self, endpoint: &str, track_id: &str) -> Result<(), YtMusicError> {
         let cookie_opt = {
             let guard = self.cookie.read().await;
             guard.clone()
         };
 
         let mut success = false;
-        let mut last_error = None;
+        let mut last_error: Option<YtMusicError> = None;
 
         let targets = [
             ("https://music.youtube.com", "WEB_REMIX", "1.20240101.01.00"),
@@ -705,10 +704,10 @@ impl YtMusicClient {
                     Ok(resp) => {
                         let status = resp.status();
                         let text = resp.text().await.unwrap_or_default();
-                        last_error = Some(format!("HTTP {status}: {text}"));
+                        last_error = Some(YtMusicError::Http { status, body: text });
                     }
                     Err(e) => {
-                        last_error = Some(e.to_string());
+                        last_error = Some(YtMusicError::Network(e));
                     }
                 }
             }
@@ -718,19 +717,21 @@ impl YtMusicClient {
             println!("[ytmusic] Оценка {endpoint} для {track_id} успешно доставлена в Google YouTube");
             Ok(())
         } else {
-            let err_msg = last_error.unwrap_or_else(|| "Не удалось отправить оценку трека".to_string());
+            let err_msg = last_error.unwrap_or_else(|| YtMusicError::Message(
+                "Не удалось отправить оценку трека".to_string(),
+            ));
             eprintln!("[ytmusic] Ошибка доставки оценки {endpoint} для {track_id}: {err_msg}");
-            Err(err_msg.into())
+            Err(err_msg)
         }
     }
 
     /// Отправляет дизлайк для трека (скрыть из рекомендаций)
-    pub async fn dislike_track(&self, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn dislike_track(&self, track_id: &str) -> Result<(), YtMusicError> {
         self.send_rating_action("like/dislike", track_id).await
     }
 
     /// Добавляет трек в плейлист по его ID
-    pub async fn add_track_to_playlist(&self, playlist_id: &str, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn add_track_to_playlist(&self, playlist_id: &str, track_id: &str) -> Result<(), YtMusicError> {
         let clean_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
         let body = serde_json::json!({
             "playlistId": clean_id,
@@ -747,7 +748,7 @@ impl YtMusicClient {
     }
 
     /// Создает приватный плейлист и опционально добавляет в него первый трек
-    pub async fn create_playlist(&self, title: &str, initial_track_id: Option<&str>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn create_playlist(&self, title: &str, initial_track_id: Option<&str>) -> Result<String, YtMusicError> {
         let mut body = serde_json::json!({
             "title": title,
             "privacyStatus": "PRIVATE"
@@ -770,7 +771,7 @@ impl YtMusicClient {
     }
 
     /// Скачивает трек в `~/Music/Волна` и возвращает путь к сохраненному файлу
-    pub async fn download_track_file(&self, track: &Track) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn download_track_file(&self, track: &Track) -> Result<std::path::PathBuf, YtMusicError> {
         let stream_url = self.get_stream_url(&track.id).await?;
         let bytes = self
             .http
@@ -803,7 +804,7 @@ impl YtMusicClient {
     }
 
     /// Загружает трек и сохраняет его во внутренний офлайн-кэш приложения
-    pub async fn save_track_offline(&self, track: &Track) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn save_track_offline(&self, track: &Track) -> Result<(), YtMusicError> {
         let stream_url = self.get_stream_url(&track.id).await?;
         let bytes = self
             .http
@@ -1048,11 +1049,11 @@ fn resolve_yt_dlp() -> String {
 
 async fn get_stream_url_ytdlp_fallback(
     track_id: &str,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<String, YtMusicError> {
     let yt_dlp_binary = resolve_yt_dlp();
     if yt_dlp_binary == "yt-dlp" {
         // `resolve_yt_dlp` возвращает голое имя только если ничего не нашёл.
-        return Err(Box::new(std::io::Error::new(
+        return Err(YtMusicError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "yt-dlp не найден: установите его или задайте путь в VOLNA_YTDLP",
         )));
@@ -1070,20 +1071,21 @@ async fn get_stream_url_ytdlp_fallback(
                 println!("[ytmusic] Стрим {track_id} успешно получен через yt-dlp (itag 251)");
                 return Ok(line.to_string());
             }
-            Err(Box::new(std::io::Error::new(
+            Err(YtMusicError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("yt-dlp не вернул потоковую ссылку для {track_id}"),
             )))
         }
         Ok(out) => {
             let stderr_str = String::from_utf8_lossy(&out.stderr);
-            Err(Box::new(std::io::Error::other(
-                format!("yt-dlp завершился с ошибкой: {}", stderr_str.trim()),
-            )))
+            Err(YtMusicError::Io(std::io::Error::other(format!(
+                "yt-dlp завершился с ошибкой: {}",
+                stderr_str.trim()
+            ))))
         }
-        Err(e) => Err(Box::new(std::io::Error::other(
-            format!("Ошибка запуска yt-dlp ({yt_dlp_binary}): {e}"),
-        ))),
+        Err(e) => Err(YtMusicError::Io(std::io::Error::other(format!(
+            "Ошибка запуска yt-dlp ({yt_dlp_binary}): {e}"
+        )))),
     }
 }
 
@@ -1102,15 +1104,15 @@ impl MusicProvider for YtMusicClient {
     }
 
     async fn get_stream_url(&self, track_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.get_stream_url(track_id).await
+        self.get_stream_url(track_id).await.map_err(Into::into)
     }
 
     async fn search(&self, query: &str) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
-        self.search_all(query).await
+        self.search_all(query).await.map_err(Into::into)
     }
 
     async fn get_liked_tracks(&self) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
-        self.get_liked_tracks().await
+        self.get_liked_tracks().await.map_err(Into::into)
     }
 
     async fn get_liked_total_count(&self) -> Option<u32> {
@@ -1119,11 +1121,11 @@ impl MusicProvider for YtMusicClient {
 
     async fn set_track_like(&self, track_id: &str, liked: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let endpoint = if liked { "like/like" } else { "like/removelike" };
-        self.send_rating_action(endpoint, track_id).await
+        self.send_rating_action(endpoint, track_id).await.map_err(Into::into)
     }
 
     async fn set_track_dislike(&self, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.dislike_track(track_id).await
+        self.dislike_track(track_id).await.map_err(Into::into)
     }
 
     async fn get_liked_albums(&self) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>> {
