@@ -77,12 +77,11 @@ impl ProviderManager {
             .map(|m| m.contains_key(&id))
             .unwrap_or(false);
 
-        if has_provider {
-            if let Ok(mut active) = self.active_id.write() {
+        if has_provider
+            && let Ok(mut active) = self.active_id.write() {
                 *active = id;
                 return true;
             }
-        }
         false
     }
 

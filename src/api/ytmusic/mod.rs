@@ -11,6 +11,27 @@ use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId, StationBatc
 pub use auth::*;
 pub use parser::*;
 
+// ── Сетевые константы InnerTube ─────────────────────────────────────────────
+// Google отдаёт разный набор данных (и разные аудиокодеки) в зависимости от
+// User-Agent, поэтому строки ниже нельзя менять без перепроверки стримов.
+
+/// Windows Chrome 120 — базовые запросы к `youtubei/v1`.
+const UA_CHROME_120: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/// macOS Safari 26 — `sw.js_data` и VisionOS-подобный `player`.
+const UA_SAFARI_26: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+/// Windows Chrome 124 — HTML-страницы библиотеки и запросы оценок.
+const UA_CHROME_124: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// Таймаут пре-флайта основной ноды GGC.
+const PROBE_TIMEOUT_PRIMARY_MS: u64 = 1200;
+/// Таймаут пре-флайта резервной ноды: ей даём больше времени.
+const PROBE_TIMEOUT_FALLBACK_MS: u64 = 2000;
+
+/// Маркеры имён заблокированных в РФ кэшей GGC (`sn-...googlevideo.com`).
+/// Сравнение по подстроке — намеренно: имя ноды может содержать префикс региона.
+const BLOCKED_GGC_NODE_MARKERS: [&str; 7] =
+    ["vo-", "238s", "hxb", "5hne", "4g5edn", "4g5e6n", "5g0z"];
+
 /// Клиент YouTube Music на базе Google InnerTube API
 #[derive(Clone)]
 pub struct YtMusicClient {
@@ -119,11 +140,10 @@ impl YtMusicClient {
         // Проверяем существующий активный токен
         {
             let auth_guard = self.auth.read().await;
-            if let Some(token) = auth_guard.as_ref() {
-                if !token.is_expired() {
+            if let Some(token) = auth_guard.as_ref()
+                && !token.is_expired() {
                     return Some(token.access_token.clone());
                 }
-            }
         }
 
         // Если токена нет или он просрочен — выполняем refresh
@@ -214,7 +234,7 @@ impl YtMusicClient {
             .header("Content-Type", "application/json")
             .header(
                 "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                UA_CHROME_120,
             )
             .header("X-Goog-Api-Format-Version", "2");
 
@@ -258,7 +278,7 @@ impl YtMusicClient {
             .get("https://www.youtube.com/sw.js_data")
             .header(
                 "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+                UA_SAFARI_26,
             )
             .send()
             .await
@@ -292,7 +312,7 @@ impl YtMusicClient {
                     "clientVersion": "1.02",
                     "deviceMake": "Apple",
                     "deviceModel": "RealityDevice17,1",
-                    "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+                    "userAgent": UA_SAFARI_26,
                     "osName": "visionOS",
                     "osVersion": "26.5.23O471",
                     "hl": "en",
@@ -319,7 +339,7 @@ impl YtMusicClient {
             .header("Origin", "https://www.youtube.com")
             .header(
                 "User-Agent",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+                UA_SAFARI_26,
             )
             .header("X-Goog-Visitor-Id", &visitor_id)
             .json(&body)
@@ -329,7 +349,7 @@ impl YtMusicClient {
 
         let json = resp.json::<serde_json::Value>().await?;
         let url = parser::parse_stream_url(&json).map_err(|e| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+            Box::new(std::io::Error::other(e))
                 as Box<dyn std::error::Error + Send + Sync>
         })?;
 
@@ -441,11 +461,10 @@ impl YtMusicClient {
                     let res = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body).await;
                     match res {
                         Ok(json) => {
-                            if self.liked_total_count.read().await.is_none() {
-                                if let Some(cnt) = parser::parse_header_track_count(&json) {
+                            if self.liked_total_count.read().await.is_none()
+                                && let Some(cnt) = parser::parse_header_track_count(&json) {
                                     *self.liked_total_count.write().await = Some(cnt);
                                 }
-                            }
                             let next_tracks = parser::parse_liked_tracks(&json);
                             let next_cont = parser::find_continuation_token(&json);
                             if next_tracks.is_empty() {
@@ -527,7 +546,7 @@ impl YtMusicClient {
         let mut req = self.http.get(url)
             .header(
                 "User-Agent",
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                UA_CHROME_124,
             )
             .header("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8");
@@ -575,24 +594,23 @@ impl YtMusicClient {
     /// на рабочую резервную ноду из параметра `mn` с проверкой доступности
     pub async fn resolve_live_stream_url(&self, raw_url: &str) -> String {
         let fallback_info = build_fallback_stream_url(raw_url);
-        let user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+        let user_agent = UA_SAFARI_26;
 
-        if let Some((fallback_url, primary, fallback)) = &fallback_info {
-            if is_known_blocked_ggc_node(primary) {
+        if let Some((fallback_url, primary, fallback)) = &fallback_info
+            && is_known_blocked_ggc_node(primary) {
                 println!(
                     "[ytmusic] Обнаружена заблокированная РКН нода GGC ({primary}). Переключаем поток на резервную европейскую ноду Google ({fallback})..."
                 );
-                if let Some(verified) = check_stream_connectivity(&self.http, fallback_url, user_agent, 2000).await {
+                if let Some(verified) = check_stream_connectivity(&self.http, fallback_url, user_agent, PROBE_TIMEOUT_FALLBACK_MS).await {
                     println!("[ytmusic] Резервный поток подтвержден и готов к мгновенному воспроизведению");
                     return verified;
                 }
                 println!("[ytmusic] Резервный поток не ответил на предварительный пинг, используем fallback URL напрямую");
                 return fallback_url.clone();
             }
-        }
 
         // Если первичная нода не из черного списка блокировок, проверяем её доступность за 1200 мс
-        if let Some(verified) = check_stream_connectivity(&self.http, raw_url, user_agent, 1200).await {
+        if let Some(verified) = check_stream_connectivity(&self.http, raw_url, user_agent, PROBE_TIMEOUT_PRIMARY_MS).await {
             return verified;
         }
 
@@ -601,7 +619,7 @@ impl YtMusicClient {
             println!(
                 "[ytmusic] Первичная нода ({primary}) не ответила вовремя. Переключаем на резервную ноду ({fallback})..."
             );
-            if let Some(verified) = check_stream_connectivity(&self.http, &fallback_url, user_agent, 2000).await {
+            if let Some(verified) = check_stream_connectivity(&self.http, &fallback_url, user_agent, PROBE_TIMEOUT_FALLBACK_MS).await {
                 return verified;
             }
             return fallback_url;
@@ -661,7 +679,7 @@ impl YtMusicClient {
 
                 let mut req = self.http.post(&url)
                     .header("Content-Type", "application/json")
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                    .header("User-Agent", UA_CHROME_124)
                     .header("X-Goog-Api-Format-Version", "2")
                     .header("Origin", *origin)
                     .header("X-Origin", *origin)
@@ -818,19 +836,16 @@ impl YtMusicClient {
 
         let mut lyrics_browse_id = None;
         for t in tabs {
-            if let Some(tab) = t.get("tabRenderer") {
-                if let Some(browse_id) = tab
+            if let Some(tab) = t.get("tabRenderer")
+                && let Some(browse_id) = tab
                     .get("endpoint")
                     .and_then(|e| e.get("browseEndpoint"))
                     .and_then(|b| b.get("browseId"))
                     .and_then(|id| id.as_str())
-                {
-                    if browse_id.starts_with("MPLY") {
+                    && browse_id.starts_with("MPLY") {
                         lyrics_browse_id = Some(browse_id.to_string());
                         break;
                     }
-                }
-            }
         }
 
         let browse_id = lyrics_browse_id?;
@@ -983,13 +998,7 @@ fn build_fallback_stream_url(raw_url: &str) -> Option<(String, String, String)> 
 /// Проверяет, принадлежит ли нода к известным блокируемым в РФ российским кэшам GGC
 fn is_known_blocked_ggc_node(node: &str) -> bool {
     let n = node.to_lowercase();
-    n.contains("vo-")
-        || n.contains("238s")
-        || n.contains("hxb")
-        || n.contains("5hne")
-        || n.contains("4g5edn")
-        || n.contains("4g5e6n")
-        || n.contains("5g0z")
+    BLOCKED_GGC_NODE_MARKERS.iter().any(|marker| n.contains(marker))
 }
 
 /// Проверяет доступность стрима и возвращает финальный рабочий URL после редиректов
@@ -1013,26 +1022,41 @@ async fn check_stream_connectivity(
     }
 }
 
+/// Ищет `yt-dlp`: сначала явный путь из `VOLNA_YTDLP`, затем `PATH`.
+///
+/// Явный путь нужен упаковкам (Flatpak/AppImage), где бинарь лежит рядом с
+/// приложением и в `PATH` не попадает.
 fn resolve_yt_dlp() -> String {
-    let local_path = "/home/philk/.local/bin/yt-dlp";
-    if std::path::Path::new(local_path).exists() {
-        return local_path.to_string();
+    if let Some(explicit) = std::env::var_os("VOLNA_YTDLP")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+    {
+        return explicit.to_string_lossy().into_owned();
     }
-    if let Ok(output) = std::process::Command::new("which").arg("yt-dlp").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
-                return path;
-            }
-        }
+
+    let from_path = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("yt-dlp"))
+            .find(|candidate| candidate.is_file())
+    });
+
+    match from_path {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => "yt-dlp".to_string(),
     }
-    "yt-dlp".to_string()
 }
 
 async fn get_stream_url_ytdlp_fallback(
     track_id: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let yt_dlp_binary = resolve_yt_dlp();
+    if yt_dlp_binary == "yt-dlp" {
+        // `resolve_yt_dlp` возвращает голое имя только если ничего не нашёл.
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "yt-dlp не найден: установите его или задайте путь в VOLNA_YTDLP",
+        )));
+    }
     let track_url = format!("https://www.youtube.com/watch?v={track_id}");
     let output = tokio::process::Command::new(&yt_dlp_binary)
         .args(["--no-warnings", "-f", "251/bestaudio/140", "-g", &track_url])
@@ -1053,13 +1077,11 @@ async fn get_stream_url_ytdlp_fallback(
         }
         Ok(out) => {
             let stderr_str = String::from_utf8_lossy(&out.stderr);
-            Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            Err(Box::new(std::io::Error::other(
                 format!("yt-dlp завершился с ошибкой: {}", stderr_str.trim()),
             )))
         }
-        Err(e) => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(e) => Err(Box::new(std::io::Error::other(
             format!("Ошибка запуска yt-dlp ({yt_dlp_binary}): {e}"),
         ))),
     }

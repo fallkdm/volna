@@ -32,12 +32,11 @@ pub fn parse_duration_ms(duration_str: &str) -> Option<u64> {
 }
 
 /// Поиск массива `thumbnails` по всем известным путям и через рекурсивный обход
-fn find_thumbnails_array<'a>(val: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
-    if let Some(arr) = val.as_array() {
-        if arr.first().and_then(|item| item.get("url")).is_some() {
+fn find_thumbnails_array(val: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    if let Some(arr) = val.as_array()
+        && arr.first().and_then(|item| item.get("url")).is_some() {
             return Some(arr);
         }
-    }
     if let Some(arr) = val.get("thumbnails").and_then(|v| v.as_array()) {
         return Some(arr);
     }
@@ -199,13 +198,12 @@ fn find_thumbnails_array<'a>(val: &'a serde_json::Value) -> Option<&'a Vec<serde
     }
 
     // Рекурсивный поиск массива thumbnails с элементами, содержащими url
-    fn deep_search<'a>(v: &'a serde_json::Value) -> Option<&'a Vec<serde_json::Value>> {
+    fn deep_search(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
         if let Some(obj) = v.as_object() {
-            if let Some(arr) = obj.get("thumbnails").and_then(|a| a.as_array()) {
-                if arr.iter().any(|item| item.get("url").is_some()) {
+            if let Some(arr) = obj.get("thumbnails").and_then(|a| a.as_array())
+                && arr.iter().any(|item| item.get("url").is_some()) {
                     return Some(arr);
                 }
-            }
             for sub in obj.values() {
                 if let Some(res) = deep_search(sub) {
                     return Some(res);
@@ -225,21 +223,19 @@ fn find_thumbnails_array<'a>(val: &'a serde_json::Value) -> Option<&'a Vec<serde
 
 /// Извлечение лучшего качества URL обложки из структуры `thumbnails`
 pub fn extract_best_thumbnail(val: &serde_json::Value) -> Option<String> {
-    if let Some(list) = find_thumbnails_array(val) {
-        if let Some(best) = list.iter().max_by_key(|item| {
+    if let Some(list) = find_thumbnails_array(val)
+        && let Some(best) = list.iter().max_by_key(|item| {
             let w = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
             let h = item.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
             w * h.max(1)
-        }) {
-            if let Some(url_str) = best.get("url").and_then(|u| u.as_str()) {
+        })
+            && let Some(url_str) = best.get("url").and_then(|u| u.as_str()) {
                 let mut url = url_str.to_string();
                 if url.starts_with("//") {
                     url = format!("https:{}", url);
                 }
                 return Some(url);
             }
-        }
-    }
 
     if let Some(url_str) = val.get("url").and_then(|u| u.as_str()) {
         let mut url = url_str.to_string();
@@ -259,22 +255,20 @@ pub fn is_banner_thumbnail(item: &serde_json::Value) -> bool {
     if w > 0.0 && h > 0.0 && w > h * 1.3 {
         return true;
     }
-    if let Some(url) = item.get("url").and_then(|u| u.as_str()) {
-        if let Some(idx) = url.find("=w") {
+    if let Some(url) = item.get("url").and_then(|u| u.as_str())
+        && let Some(idx) = url.find("=w") {
             let tail = &url[idx + 2..];
             if let Some(h_idx) = tail.find("-h") {
                 let w_str = &tail[..h_idx];
                 let rest = &tail[h_idx + 2..];
                 let h_end = rest.find('-').unwrap_or(rest.len());
                 let h_str = &rest[..h_end];
-                if let (Ok(width), Ok(height)) = (w_str.parse::<f64>(), h_str.parse::<f64>()) {
-                    if width > height * 1.3 {
+                if let (Ok(width), Ok(height)) = (w_str.parse::<f64>(), h_str.parse::<f64>())
+                    && width > height * 1.3 {
                         return true;
                     }
-                }
             }
         }
-    }
     false
 }
 
@@ -286,26 +280,24 @@ pub fn extract_square_thumbnail(val: &serde_json::Value) -> Option<String> {
             let w = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
             let h = item.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
             w * h.max(1)
-        }) {
-            if let Some(url_str) = best.get("url").and_then(|u| u.as_str()) {
+        })
+            && let Some(url_str) = best.get("url").and_then(|u| u.as_str()) {
                 let mut url = url_str.to_string();
                 if url.starts_with("//") {
                     url = format!("https:{}", url);
                 }
                 return Some(url);
             }
-        }
     }
 
-    if let Some(url_str) = val.get("url").and_then(|u| u.as_str()) {
-        if !is_banner_thumbnail(val) {
+    if let Some(url_str) = val.get("url").and_then(|u| u.as_str())
+        && !is_banner_thumbnail(val) {
             let mut url = url_str.to_string();
             if url.starts_with("//") {
                 url = format!("https:{}", url);
             }
             return Some(url);
         }
-    }
 
     None
 }
@@ -361,11 +353,10 @@ pub const MUSIC_STOP_WORDS: &[&str] = &[
 /// - Проверяет стоп-слова в названии и имени артиста (в нижнем регистре). Если найдено — возвращает `false`.
 /// - Иначе `true`.
 pub fn is_clean_music_track(track: &Track) -> bool {
-    if let Some(dur_ms) = track.duration_ms {
-        if dur_ms < 30_000 || dur_ms > 1_200_000 {
+    if let Some(dur_ms) = track.duration_ms
+        && (!(30_000..=1_200_000).contains(&dur_ms)) {
             return false;
         }
-    }
     let title_lower = track.title.to_lowercase();
     let artists_lower = track.artists_string().to_lowercase();
     for &stop_word in MUSIC_STOP_WORDS {
@@ -378,99 +369,81 @@ pub fn is_clean_music_track(track: &Track) -> bool {
 
 /// Рекурсивный поиск videoId в объекте
 fn find_video_id(val: &serde_json::Value) -> Option<String> {
-    if let Some(id) = val.get("videoId").and_then(|v| v.as_str()) {
-        if !id.is_empty() {
+    if let Some(id) = val.get("videoId").and_then(|v| v.as_str())
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("playlistItemData")
         .and_then(|p| p.get("videoId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("watchEndpoint")
         .and_then(|w| w.get("videoId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("navigationEndpoint")
         .and_then(|n| n.get("watchEndpoint"))
         .and_then(|w| w.get("videoId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("onTap")
         .and_then(|n| n.get("watchEndpoint"))
         .and_then(|w| w.get("videoId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     None
 }
 
 /// Рекурсивный поиск browseId в объекте
 fn find_browse_id(val: &serde_json::Value) -> Option<String> {
-    if let Some(id) = val.get("browseId").and_then(|v| v.as_str()) {
-        if !id.is_empty() {
+    if let Some(id) = val.get("browseId").and_then(|v| v.as_str())
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("browseEndpoint")
         .and_then(|b| b.get("browseId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("navigationEndpoint")
         .and_then(|n| n.get("browseEndpoint"))
         .and_then(|b| b.get("browseId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("onTap")
         .and_then(|n| n.get("browseEndpoint"))
         .and_then(|b| b.get("browseId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(id) = val
         .get("onTap")
         .and_then(|n| n.get("navigationEndpoint"))
         .and_then(|n| n.get("browseEndpoint"))
         .and_then(|b| b.get("browseId"))
         .and_then(|v| v.as_str())
-    {
-        if !id.is_empty() {
+        && !id.is_empty() {
             return Some(id.to_string());
         }
-    }
     if let Some(runs) = val
         .get("flexColumns")
         .and_then(|fc| fc.get(0))
@@ -492,11 +465,10 @@ fn find_browse_id(val: &serde_json::Value) -> Option<String> {
             }
         }
     }
-    if let Some(header) = val.get("header").and_then(|h| h.get("musicCardShelfHeaderBasicRenderer")) {
-        if let Some(id) = find_browse_id(header) {
+    if let Some(header) = val.get("header").and_then(|h| h.get("musicCardShelfHeaderBasicRenderer"))
+        && let Some(id) = find_browse_id(header) {
             return Some(id);
         }
-    }
     None
 }
 
@@ -549,11 +521,10 @@ fn parse_track_meta_runs(
             }
         }
 
-        if duration_ms.is_none() && text.contains(':') {
-            if let Some(d) = parse_duration_ms(text) {
+        if duration_ms.is_none() && text.contains(':')
+            && let Some(d) = parse_duration_ms(text) {
                 *duration_ms = Some(d);
             }
-        }
     }
 
     if !explicit_found_artist {
@@ -598,8 +569,8 @@ fn parse_track_meta_runs(
                 }
             }
 
-            if !explicit_found_album {
-                if let Some(next_sec) = sec_iter.next() {
+            if !explicit_found_album
+                && let Some(next_sec) = sec_iter.next() {
                     let album_title = next_sec.join(" ");
                     if parse_duration_ms(&album_title).is_none() {
                         albums.push(Album {
@@ -613,7 +584,6 @@ fn parse_track_meta_runs(
                         });
                     }
                 }
-            }
         }
     }
 }
@@ -652,7 +622,7 @@ pub fn parse_responsive_track(item: &serde_json::Value) -> Option<Track> {
     }
 
     let mut cover_uri = extract_best_thumbnail(renderer).or_else(|| extract_best_thumbnail(item));
-    if cover_uri.as_deref().map_or(true, |u| u.contains("googleusercontent.com")) {
+    if cover_uri.as_deref().is_none_or(|u| u.contains("googleusercontent.com")) {
         cover_uri = Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", video_id));
     }
 
@@ -660,8 +630,8 @@ pub fn parse_responsive_track(item: &serde_json::Value) -> Option<Track> {
     let mut albums = Vec::new();
     let mut duration_ms = None;
 
-    if let Some(col1) = flex_columns.get(1) {
-        if let Some(runs) = col1
+    if let Some(col1) = flex_columns.get(1)
+        && let Some(runs) = col1
             .get("musicResponsiveListItemFlexColumnRenderer")
             .and_then(|c| c.get("text"))
             .and_then(|t| t.get("runs"))
@@ -669,25 +639,21 @@ pub fn parse_responsive_track(item: &serde_json::Value) -> Option<Track> {
         {
             parse_track_meta_runs(runs, &mut artists, &mut albums, &mut duration_ms);
         }
-    }
 
     // Дополнительный поиск длительности в fixedColumns
-    if duration_ms.is_none() {
-        if let Some(fixed) = renderer.get("fixedColumns").and_then(|fc| fc.as_array()) {
+    if duration_ms.is_none()
+        && let Some(fixed) = renderer.get("fixedColumns").and_then(|fc| fc.as_array()) {
             for col in fixed {
                 if let Some(text) = col
                     .get("musicResponsiveListItemFixedColumnRenderer")
                     .and_then(|c| c.get("text"))
                     .and_then(extract_text)
-                {
-                    if let Some(d) = parse_duration_ms(&text) {
+                    && let Some(d) = parse_duration_ms(&text) {
                         duration_ms = Some(d);
                         break;
                     }
-                }
             }
         }
-    }
 
     let content_warning = if is_explicit(renderer) {
         Some("explicit".to_string())
@@ -718,7 +684,7 @@ pub fn parse_playlist_panel_video(item: &serde_json::Value) -> Option<Track> {
     let video_id = renderer.get("videoId").and_then(|v| v.as_str())?.to_string();
     let title = renderer.get("title").and_then(extract_text).unwrap_or_default();
     let mut cover_uri = extract_best_thumbnail(renderer);
-    if cover_uri.as_deref().map_or(true, |u| u.contains("googleusercontent.com")) {
+    if cover_uri.as_deref().is_none_or(|u| u.contains("googleusercontent.com")) {
         cover_uri = Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", video_id));
     }
 
@@ -808,25 +774,22 @@ pub fn parse_album_item(item: &serde_json::Value) -> Option<Album> {
     if let Some(runs) = subtitle_runs {
         for r in runs {
             let t = r.get("text").and_then(|t| t.as_str()).unwrap_or("").trim();
-            if t.len() == 4 && (t.starts_with("19") || t.starts_with("20")) {
-                if let Ok(y) = t.parse::<u32>() {
+            if t.len() == 4 && (t.starts_with("19") || t.starts_with("20"))
+                && let Ok(y) = t.parse::<u32>() {
                     year = Some(y);
                 }
-            }
             if let Some(bid) = r
                 .get("navigationEndpoint")
                 .and_then(|n| n.get("browseEndpoint"))
                 .and_then(|b| b.get("browseId"))
                 .and_then(|id| id.as_str())
-            {
-                if bid.starts_with("UC") || bid.contains("artist") {
+                && (bid.starts_with("UC") || bid.contains("artist")) {
                     artists.push(Artist {
                         id: bid.to_string(),
                         name: t.to_string(),
                         cover: None,
                     });
                 }
-            }
         }
     }
 
@@ -931,8 +894,7 @@ pub fn parse_stream_url(json: &serde_json::Value) -> Result<String, String> {
         .get("playabilityStatus")
         .and_then(|s| s.get("status"))
         .and_then(|s| s.as_str())
-    {
-        if status != "OK" {
+        && status != "OK" {
             let reason = json
                 .get("playabilityStatus")
                 .and_then(|s| s.get("reason"))
@@ -940,7 +902,6 @@ pub fn parse_stream_url(json: &serde_json::Value) -> Result<String, String> {
                 .unwrap_or(status);
             return Err(format!("Воспроизведение недоступно: {}", reason));
         }
-    }
 
     let empty_vec = Vec::new();
     let streaming_data = json.get("streamingData");
@@ -963,8 +924,8 @@ pub fn parse_stream_url(json: &serde_json::Value) -> Result<String, String> {
 
     let mut candidates: Vec<Candidate> = Vec::new();
     for f in adaptive_formats.iter().chain(formats.iter()) {
-        if let Some(url) = f.get("url").and_then(|u| u.as_str()) {
-            if !url.is_empty() {
+        if let Some(url) = f.get("url").and_then(|u| u.as_str())
+            && !url.is_empty() {
                 let itag = f.get("itag").and_then(|i| i.as_u64()).unwrap_or(0);
                 let mime_type = f.get("mimeType").and_then(|m| m.as_str()).unwrap_or("");
                 let bitrate = f
@@ -979,7 +940,6 @@ pub fn parse_stream_url(json: &serde_json::Value) -> Result<String, String> {
                     bitrate,
                 });
             }
-        }
     }
 
     if candidates.is_empty() {
@@ -1120,7 +1080,7 @@ fn collect_responsive_tracks(json: &serde_json::Value, out: &mut Vec<Track>) {
 pub fn parse_liked_tracks(json: &serde_json::Value) -> Vec<Track> {
     let mut tracks = Vec::new();
 
-    fn find_playlist_shelf<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    fn find_playlist_shelf(val: &serde_json::Value) -> Option<&serde_json::Value> {
         if let Some(obj) = val.as_object() {
             if let Some(shelf) = obj
                 .get("musicPlaylistShelfRenderer")
@@ -1144,15 +1104,14 @@ pub fn parse_liked_tracks(json: &serde_json::Value) -> Vec<Track> {
         None
     }
 
-    if let Some(shelf) = find_playlist_shelf(json) {
-        if let Some(contents) = shelf.get("contents").and_then(|c| c.as_array()) {
+    if let Some(shelf) = find_playlist_shelf(json)
+        && let Some(contents) = shelf.get("contents").and_then(|c| c.as_array()) {
             for item in contents {
                 if let Some(t) = parse_responsive_track(item) {
                     tracks.push(t);
                 }
             }
         }
-    }
 
     if tracks.is_empty() {
         collect_responsive_tracks(json, &mut tracks);
@@ -1168,7 +1127,7 @@ pub fn parse_liked_tracks(json: &serde_json::Value) -> Vec<Track> {
     });
 
     for t in &mut tracks {
-        let needs_ytimg = t.cover_uri.as_deref().map_or(true, |u| u.contains("googleusercontent.com"));
+        let needs_ytimg = t.cover_uri.as_deref().is_none_or(|u| u.contains("googleusercontent.com"));
         if needs_ytimg && !t.id.is_empty() {
             t.cover_uri = Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", t.id));
         }
@@ -1207,11 +1166,10 @@ fn collect_playlists(json: &serde_json::Value, out: &mut Vec<Playlist>) {
         if let Some(item) = obj.get("musicTwoRowItemRenderer") {
             let bid = find_browse_id(item).unwrap_or_default();
             let title = item.get("title").and_then(extract_text).unwrap_or_default();
-            if !is_system_playlist_button(&title, &bid) {
-                if let Some(pl) = parse_playlist_item(item) {
+            if !is_system_playlist_button(&title, &bid)
+                && let Some(pl) = parse_playlist_item(item) {
                     out.push(pl);
                 }
-            }
         } else if let Some(item) = obj.get("musicResponsiveListItemRenderer") {
             let bid = find_browse_id(item).unwrap_or_default();
             let title = item
@@ -1221,11 +1179,10 @@ fn collect_playlists(json: &serde_json::Value, out: &mut Vec<Playlist>) {
                 .and_then(|c| c.get("text"))
                 .and_then(extract_text)
                 .unwrap_or_default();
-            if !is_system_playlist_button(&title, &bid) {
-                if let Some(pl) = parse_playlist_item(item) {
+            if !is_system_playlist_button(&title, &bid)
+                && let Some(pl) = parse_playlist_item(item) {
                     out.push(pl);
                 }
-            }
         } else {
             for v in obj.values() {
                 collect_playlists(v, out);
@@ -1335,7 +1292,7 @@ pub fn unescape_js_string(s: &str) -> String {
 }
 
 /// Извлечение строкового литерала JavaScript в одинарных или двойных кавычках
-fn extract_js_string_literal<'a>(slice: &'a str) -> Option<&'a str> {
+fn extract_js_string_literal(slice: &str) -> Option<&str> {
     let bytes = slice.as_bytes();
     let n = bytes.len();
     let mut i = 0;
@@ -1376,7 +1333,7 @@ fn extract_field_value(chunk: &str, field: &str) -> Option<String> {
         if let Some(pos) = chunk.find(prefix.as_str()) {
             let start = pos + prefix.len();
             let tail = &chunk[start..];
-            let end = tail.find(|c: char| c == '"' || c == '\\' || c == '\'')
+            let end = tail.find(['"', '\\', '\''])
                 .unwrap_or(tail.len());
             let val = &tail[..end];
             if !val.is_empty() {
@@ -1398,7 +1355,7 @@ fn extract_track_label(chunk: &str) -> Option<(String, String)> {
         if let Some(pos) = chunk.find(prefix) {
             let start = pos + prefix.len();
             let tail = &chunk[start..];
-            let end = tail.find(|c: char| c == '"' || c == '\\' || c == '\'')
+            let end = tail.find(['"', '\\', '\''])
                 .unwrap_or(tail.len());
             let label = &tail[..end];
 
@@ -1462,21 +1419,19 @@ pub fn parse_header_track_count(json: &serde_json::Value) -> Option<u32> {
     fn search_subtitle(val: &serde_json::Value) -> Option<u32> {
         if let Some(obj) = val.as_object() {
             for key in ["secondSubtitle", "subtitle"] {
-                if let Some(sub) = obj.get(key) {
-                    if let Some(runs) = sub.get("runs").and_then(|r| r.as_array()) {
+                if let Some(sub) = obj.get(key)
+                    && let Some(runs) = sub.get("runs").and_then(|r| r.as_array()) {
                         for r in runs {
                             if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
                                 let clean = text.replace('\u{a0}', " ");
                                 let num_str: String = clean.chars().take_while(|c| c.is_ascii_digit()).collect();
-                                if let Ok(n) = num_str.parse::<u32>() {
-                                    if n > 0 && (clean.contains("трек") || clean.contains("песн") || clean.contains("track") || clean.contains("song")) {
+                                if let Ok(n) = num_str.parse::<u32>()
+                                    && n > 0 && (clean.contains("трек") || clean.contains("песн") || clean.contains("track") || clean.contains("song")) {
                                         return Some(n);
                                     }
-                                }
                             }
                         }
                     }
-                }
             }
             for v in obj.values() {
                 if let Some(n) = search_subtitle(v) {
@@ -1504,26 +1459,22 @@ pub fn parse_header_track_count_from_html(html: &str) -> Option<u32> {
     while let Some(pos) = html[search_pos..].find(push_needle) {
         let abs_pos = search_pos + pos + push_needle.len();
         let tail = &html[abs_pos..];
-        if let Some(path_pos) = tail.find("path:") {
-            if path_pos < 120 {
+        if let Some(path_pos) = tail.find("path:")
+            && path_pos < 120 {
                 let path_tail = &tail[path_pos + 5..];
-                if let Some(path_str) = extract_js_string_literal(path_tail) {
-                    if path_str == "/browse" || path_str == "\\/browse" {
-                        if let Some(data_pos) = tail.find("data:") {
+                if let Some(path_str) = extract_js_string_literal(path_tail)
+                    && (path_str == "/browse" || path_str == "\\/browse")
+                        && let Some(data_pos) = tail.find("data:") {
                             let data_tail = &tail[data_pos + 5..];
                             if let Some(raw_data) = extract_js_string_literal(data_tail) {
                                 let unescaped = unescape_js_string(raw_data);
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&unescaped) {
-                                    if let Some(cnt) = parse_header_track_count(&json) {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&unescaped)
+                                    && let Some(cnt) = parse_header_track_count(&json) {
                                         return Some(cnt);
                                     }
-                                }
                             }
                         }
-                    }
-                }
             }
-        }
         search_pos = abs_pos;
     }
 
@@ -1542,13 +1493,11 @@ pub fn parse_header_track_count_from_html(html: &str) -> Option<u32> {
                         .split(|c: char| !c.is_ascii_digit())
                         .filter(|s| !s.is_empty())
                         .collect();
-                    if let Some(last_digits) = tokens.last() {
-                        if let Ok(n) = last_digits.parse::<u32>() {
-                            if n > 0 && n < 100_000 {
+                    if let Some(last_digits) = tokens.last()
+                        && let Ok(n) = last_digits.parse::<u32>()
+                            && n > 0 && n < 100_000 {
                                 return Some(n);
                             }
-                        }
-                    }
                 }
             }
         }
@@ -1574,12 +1523,12 @@ pub fn parse_tracks_and_continuation_from_html(html: &str) -> (Vec<Track>, Optio
     while let Some(pos) = html[search_pos..].find(push_needle) {
         let abs_pos = search_pos + pos + push_needle.len();
         let tail = &html[abs_pos..];
-        if let Some(path_pos) = tail.find("path:") {
-            if path_pos < 120 {
+        if let Some(path_pos) = tail.find("path:")
+            && path_pos < 120 {
                 let path_tail = &tail[path_pos + 5..];
-                if let Some(path_str) = extract_js_string_literal(path_tail) {
-                    if path_str == "/browse" || path_str == "\\/browse" {
-                        if let Some(data_pos) = tail.find("data:") {
+                if let Some(path_str) = extract_js_string_literal(path_tail)
+                    && (path_str == "/browse" || path_str == "\\/browse")
+                        && let Some(data_pos) = tail.find("data:") {
                             let data_tail = &tail[data_pos + 5..];
                             if let Some(raw_data) = extract_js_string_literal(data_tail) {
                                 let unescaped = unescape_js_string(raw_data);
@@ -1596,10 +1545,7 @@ pub fn parse_tracks_and_continuation_from_html(html: &str) -> (Vec<Track>, Optio
                                 }
                             }
                         }
-                    }
-                }
             }
-        }
         search_pos = abs_pos;
     }
 
@@ -1609,9 +1555,9 @@ pub fn parse_tracks_and_continuation_from_html(html: &str) -> (Vec<Track>, Optio
         let chunks: Vec<&str> = html.split(delimiter).collect();
         if chunks.len() > 1 {
             for chunk in &chunks[1..] {
-                if let Some(id) = extract_field_value(chunk, "videoId") {
-                    if id.len() == 11 && !seen_ids.contains(&id) {
-                        if let Some((title, artist)) = extract_track_label(chunk) {
+                if let Some(id) = extract_field_value(chunk, "videoId")
+                    && id.len() == 11 && !seen_ids.contains(&id)
+                        && let Some((title, artist)) = extract_track_label(chunk) {
                             seen_ids.insert(id.clone());
                             tracks.push(Track {
                                 id: id.clone(),
@@ -1632,8 +1578,6 @@ pub fn parse_tracks_and_continuation_from_html(html: &str) -> (Vec<Track>, Optio
                                 source: TrackSource::YouTubeMusic,
                             });
                         }
-                    }
-                }
             }
             if !tracks.is_empty() {
                 break;
@@ -1648,7 +1592,7 @@ pub fn parse_tracks_and_continuation_from_html(html: &str) -> (Vec<Track>, Optio
 
     // Гарантируем качественные обложки для всех найденных треков
     for t in &mut tracks {
-        let needs_ytimg = t.cover_uri.as_deref().map_or(true, |u| u.contains("googleusercontent.com"));
+        let needs_ytimg = t.cover_uri.as_deref().is_none_or(|u| u.contains("googleusercontent.com"));
         if needs_ytimg && !t.id.is_empty() {
             t.cover_uri = Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", t.id));
         }
@@ -1789,18 +1733,16 @@ fn collect_albums(json: &serde_json::Value, out: &mut Vec<Album>) {
     if let Some(obj) = json.as_object() {
         if let Some(item) = obj.get("musicTwoRowItemRenderer") {
             let bid = find_browse_id(item).unwrap_or_default();
-            if bid.starts_with("MPRE") || bid.starts_with("FEmusic_library_album") {
-                if let Some(al) = parse_album_item(item) {
+            if (bid.starts_with("MPRE") || bid.starts_with("FEmusic_library_album"))
+                && let Some(al) = parse_album_item(item) {
                     out.push(al);
                 }
-            }
         } else if let Some(item) = obj.get("musicResponsiveListItemRenderer") {
             let bid = find_browse_id(item).unwrap_or_default();
-            if bid.starts_with("MPRE") || bid.starts_with("FEmusic_library_album") {
-                if let Some(al) = parse_album_item(item) {
+            if (bid.starts_with("MPRE") || bid.starts_with("FEmusic_library_album"))
+                && let Some(al) = parse_album_item(item) {
                     out.push(al);
                 }
-            }
         } else {
             for v in obj.values() {
                 collect_albums(v, out);
@@ -1822,29 +1764,24 @@ pub fn parse_albums(json: &serde_json::Value) -> Vec<Album> {
 
 /// Извлечение текста подписи (subtitle) из объекта элемента или карточки
 fn extract_subtitle_text(val: &serde_json::Value) -> String {
-    if let Some(sub) = val.get("subtitle") {
-        if let Some(t) = extract_text(sub) {
+    if let Some(sub) = val.get("subtitle")
+        && let Some(t) = extract_text(sub) {
             return t;
         }
-    }
-    if let Some(fc) = val.get("flexColumns").and_then(|f| f.as_array()) {
-        if let Some(col1) = fc.get(1) {
-            if let Some(t) = col1
+    if let Some(fc) = val.get("flexColumns").and_then(|f| f.as_array())
+        && let Some(col1) = fc.get(1)
+            && let Some(t) = col1
                 .get("musicResponsiveListItemFlexColumnRenderer")
                 .and_then(|c| c.get("text"))
                 .and_then(extract_text)
             {
                 return t;
             }
-        }
-    }
-    if let Some(header) = val.get("header").and_then(|h| h.get("musicCardShelfHeaderBasicRenderer")) {
-        if let Some(sub) = header.get("subtitle") {
-            if let Some(t) = extract_text(sub) {
+    if let Some(header) = val.get("header").and_then(|h| h.get("musicCardShelfHeaderBasicRenderer"))
+        && let Some(sub) = header.get("subtitle")
+            && let Some(t) = extract_text(sub) {
                 return t;
             }
-        }
-    }
     String::new()
 }
 
@@ -1943,47 +1880,40 @@ fn parse_responsive_search_item(
     let renderer = item.get("musicResponsiveListItemRenderer").unwrap_or(item);
 
     // Если есть videoId -> парси как Track
-    if find_video_id(renderer).is_some() {
-        if let Some(track) = parse_responsive_track(renderer) {
+    if find_video_id(renderer).is_some()
+        && let Some(track) = parse_responsive_track(renderer) {
             tracks.push(track);
             return;
         }
-    }
 
     // Если videoId нет -> анализируй subtitle и browseId
     let browse_id = find_browse_id(renderer).unwrap_or_default();
     let sub = extract_subtitle_text(renderer).to_lowercase();
 
-    if sub.contains("исполнитель") || sub.contains("artist") || browse_id.starts_with("UC") {
-        if let Some(art) = parse_artist_item(renderer) {
+    if (sub.contains("исполнитель") || sub.contains("artist") || browse_id.starts_with("UC"))
+        && let Some(art) = parse_artist_item(renderer) {
             artists.push(art);
             return;
         }
-    }
 
-    if sub.contains("альбом")
+    if (sub.contains("альбом")
         || sub.contains("album")
         || sub.contains("сингл")
         || sub.contains("single")
         || sub.contains("ep")
-        || browse_id.starts_with("MPRE")
-    {
-        if let Some(alb) = parse_album_item(renderer) {
+        || browse_id.starts_with("MPRE"))
+        && let Some(alb) = parse_album_item(renderer) {
             albums.push(alb);
             return;
         }
-    }
 
-    if sub.contains("плейлист")
+    if (sub.contains("плейлист")
         || sub.contains("playlist")
         || browse_id.starts_with("VL")
-        || browse_id.starts_with("PL")
-    {
-        if let Some(pl) = parse_playlist_item(renderer) {
+        || browse_id.starts_with("PL"))
+        && let Some(pl) = parse_playlist_item(renderer) {
             playlists.push(pl);
-            return;
         }
-    }
 }
 
 /// Парсинг результатов поиска InnerTube (`/youtubei/v1/search`)
@@ -2101,7 +2031,7 @@ pub fn parse_search_results(json: &serde_json::Value) -> SearchResult {
 }
 
 /// Поиск заголовка артиста (musicImmersiveHeaderRenderer, musicVisualHeaderRenderer, musicResponsiveHeaderRenderer и др.)
-fn find_artist_header<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+fn find_artist_header(val: &serde_json::Value) -> Option<&serde_json::Value> {
     if let Some(h) = val.get("header") {
         if let Some(r) = h
             .get("musicImmersiveHeaderRenderer")
@@ -2114,7 +2044,7 @@ fn find_artist_header<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::
         }
         return Some(h);
     }
-    fn deep_search<'a>(v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    fn deep_search(v: &serde_json::Value) -> Option<&serde_json::Value> {
         if let Some(obj) = v.as_object() {
             if let Some(r) = obj
                 .get("musicImmersiveHeaderRenderer")
@@ -2155,30 +2085,26 @@ pub fn parse_artist_browse(
 
     // Извлекаем аватар артиста: ищем строго квадратный thumbnail, отсекаем широкоформатные баннеры (w > h * 1.3)
     let mut cover_uri = None;
-    if let Some(h) = header_obj {
-        if let Some(fg) = h.get("foregroundThumbnail") {
+    if let Some(h) = header_obj
+        && let Some(fg) = h.get("foregroundThumbnail") {
             cover_uri = extract_square_thumbnail(fg);
         }
-    }
-    if cover_uri.is_none() {
-        if let Some(h) = json.get("header") {
-            if let Some(fg) = h.get("foregroundThumbnail") {
+    if cover_uri.is_none()
+        && let Some(h) = json.get("header")
+            && let Some(fg) = h.get("foregroundThumbnail") {
                 cover_uri = extract_square_thumbnail(fg);
             }
-        }
-    }
     if cover_uri.is_none() {
         cover_uri = header_obj.and_then(extract_square_thumbnail);
     }
-    if cover_uri.is_none() {
-        if let Some(h) = json.get("header") {
+    if cover_uri.is_none()
+        && let Some(h) = json.get("header") {
             cover_uri = extract_square_thumbnail(h);
         }
-    }
 
     // Извлекаем треки из первой полки `musicShelfRenderer` («Топ треков» / «Songs»)
     let mut popular_tracks = Vec::new();
-    fn find_first_music_shelf<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    fn find_first_music_shelf(val: &serde_json::Value) -> Option<&serde_json::Value> {
         if let Some(obj) = val.as_object() {
             if let Some(shelf) = obj.get("musicShelfRenderer") {
                 return Some(shelf);
@@ -2198,11 +2124,11 @@ pub fn parse_artist_browse(
         None
     }
 
-    if let Some(shelf) = find_first_music_shelf(json) {
-        if let Some(contents) = shelf.get("contents").and_then(|c| c.as_array()) {
+    if let Some(shelf) = find_first_music_shelf(json)
+        && let Some(contents) = shelf.get("contents").and_then(|c| c.as_array()) {
             for it in contents {
                 if let Some(mut track) = parse_responsive_track(it) {
-                    let is_ytimg = track.cover_uri.as_deref().map_or(false, |u| u.starts_with("https://i.ytimg.com/vi/"));
+                    let is_ytimg = track.cover_uri.as_deref().is_some_and(|u| u.starts_with("https://i.ytimg.com/vi/"));
                     if (track.cover_uri.is_none() || is_ytimg) && cover_uri.is_some() {
                         track.cover_uri = cover_uri.clone();
                     }
@@ -2210,16 +2136,13 @@ pub fn parse_artist_browse(
                 }
             }
         }
-    }
 
     // Если имя артиста не нашлось в header, берем первого исполнителя из первого трека
-    if artist_name.is_empty() {
-        if let Some(first_track) = popular_tracks.first() {
-            if let Some(first_artist) = first_track.artists.first() {
+    if artist_name.is_empty()
+        && let Some(first_track) = popular_tracks.first()
+            && let Some(first_artist) = first_track.artists.first() {
                 artist_name = first_artist.name.clone();
             }
-        }
-    }
 
     // Извлекаем альбомы из полок `musicCarouselShelfRenderer`
     let mut albums = Vec::new();
@@ -2228,11 +2151,10 @@ pub fn parse_artist_browse(
             if let Some(carousel) = obj.get("musicCarouselShelfRenderer") {
                 if let Some(contents) = carousel.get("contents").and_then(|c| c.as_array()) {
                     for it in contents {
-                        if let Some(album) = parse_album_item(it) {
-                            if !album.id.is_empty() || album.title.is_some() {
+                        if let Some(album) = parse_album_item(it)
+                            && (!album.id.is_empty() || album.title.is_some()) {
                                 out.push(album);
                             }
-                        }
                     }
                 }
             } else {
@@ -2281,9 +2203,9 @@ pub fn parse_artist_browse(
 }
 
 /// Поиск заголовка альбома (musicResponsiveHeaderRenderer, musicDetailHeaderRenderer и др.)
-fn find_album_header<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
-    if let Some(h) = val.get("header") {
-        if let Some(r) = h
+fn find_album_header(val: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(h) = val.get("header")
+        && let Some(r) = h
             .get("musicResponsiveHeaderRenderer")
             .or_else(|| h.get("musicDetailHeaderRenderer"))
             .or_else(|| h.get("musicImmersiveHeaderRenderer"))
@@ -2292,8 +2214,7 @@ fn find_album_header<'a>(val: &'a serde_json::Value) -> Option<&'a serde_json::V
         {
             return Some(r);
         }
-    }
-    fn deep_search<'a>(v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    fn deep_search(v: &serde_json::Value) -> Option<&serde_json::Value> {
         if let Some(obj) = v.as_object() {
             if let Some(r) = obj
                 .get("musicResponsiveHeaderRenderer")
@@ -2333,7 +2254,7 @@ pub fn parse_album_tracks(json: &serde_json::Value) -> Vec<Track> {
 
     if let Some(cover) = album_cover {
         for t in &mut tracks {
-            let is_ytimg = t.cover_uri.as_deref().map_or(false, |u| u.starts_with("https://i.ytimg.com/vi/"));
+            let is_ytimg = t.cover_uri.as_deref().is_some_and(|u| u.starts_with("https://i.ytimg.com/vi/"));
             if t.cover_uri.is_none() || is_ytimg {
                 t.cover_uri = Some(cover.clone());
             }

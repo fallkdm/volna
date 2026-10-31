@@ -179,8 +179,8 @@ pub async fn fetch_lrclib_lyrics(
         LrclibFetch::NotFound => None,
     };
 
-    if let Some(response) = resp {
-        if let Ok(data) = response.json::<LrclibResponse>().await {
+    if let Some(response) = resp
+        && let Ok(data) = response.json::<LrclibResponse>().await {
             if let Some(synced) = data.synced_lyrics {
                 let trimmed = synced.trim();
                 if usable_synced(trimmed) {
@@ -194,7 +194,6 @@ pub async fn fetch_lrclib_lyrics(
                 }
             }
         }
-    }
 
     // Точное совпадение дало только обычный текст или 404: ищем запись с таймингами через поиск
     if let Some(synced) = lrclib_search_synced(http, clean_artist, &clean_title, duration_secs).await {
@@ -213,11 +212,10 @@ pub async fn get_cached_or_fetch_lrclib(
     duration_secs: Option<u64>,
 ) -> Option<String> {
     let cache_path = crate::cache::lyrics_cache_path(track_id);
-    if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-        if usable_synced(&cached) || !cached.trim().is_empty() {
+    if let Ok(cached) = std::fs::read_to_string(&cache_path)
+        && (usable_synced(&cached) || !cached.trim().is_empty()) {
             return Some(cached);
         }
-    }
 
     let lyrics = fetch_lrclib_lyrics(http, artist, title, duration_secs).await;
     if let Some(text) = &lyrics {
