@@ -131,6 +131,9 @@ impl VolnaWindow {
         let is_spotify_nav = nav_style == "spotify";
         let is_spotify_nav_state = Rc::new(RefCell::new(is_spotify_nav));
 
+        // Внешняя обёртка: на каждом кадре анимируется ТОЛЬКО её ширина (клипп).
+        // Внутренности сайдбара всегда имеют постоянный размер и не перекладываются —
+        // иначе разметка кнопок и подписей (Pango, ellipsize) на каждом кадре дёргает анимацию.
         let sidebar = GtkBox::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar");
         sidebar.add_css_class("spotify-sidebar");
@@ -144,6 +147,30 @@ impl VolnaWindow {
         if initial_collapsed {
             sidebar.add_css_class("collapsed");
         }
+
+        // Область с запрещёнными полосами прокрутки: даёт обрезку справа без изменения
+        // размеров дочерних виджетов (клипп, а не relayout на каждом кадре).
+        // Внутренняя ширина = 240 − паддинги 24 − рамка 1: в развёрнутом состоянии геометрия
+        // содержимого совпадает с прежней до пикселя.
+        let sidebar_panel = GtkBox::new(Orientation::Vertical, 0);
+        sidebar_panel.set_size_request(SIDEBAR_EXPANDED_WIDTH - 25, -1);
+        sidebar_panel.set_vexpand(true);
+        sidebar_panel.set_halign(Align::Start);
+        sidebar_panel.set_valign(Align::Fill);
+        let sidebar_scroll = ScrolledWindow::new();
+        sidebar_scroll.set_policy(PolicyType::Never, PolicyType::Never);
+        sidebar_scroll.set_vexpand(true);
+        sidebar_scroll.set_hexpand(true);
+        sidebar_scroll.set_halign(Align::Fill);
+        sidebar_scroll.set_valign(Align::Fill);
+        sidebar_scroll.set_overflow(Overflow::Hidden);
+        sidebar_scroll.set_child(Some(&sidebar_panel));
+        // Панель намеренно шире видимой области (клипп): любую прокрутку глушим,
+        // иначе колесо мыши сдвинет содержимое сайдбара.
+        let scroll_ctrl = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
+        scroll_ctrl.connect_scroll(|_, _, _| gtk4::glib::Propagation::Stop);
+        sidebar_scroll.add_controller(scroll_ctrl);
+        sidebar.append(&sidebar_scroll);
 
         // 1. Верхняя часть: Логотип «🌊 Волна» слева + кнопка сворачивания справа
         let sidebar_header_handle = gtk4::WindowHandle::new();
@@ -201,7 +228,7 @@ impl VolnaWindow {
         header_box.append(&collapse_btn);
 
         sidebar_header_handle.set_child(Some(&header_box));
-        sidebar.append(&sidebar_header_handle);
+        sidebar_panel.append(&sidebar_header_handle);
 
         // 2. Средняя часть: Навигационные кнопки (чистый стиль Spotify, без дублирующих эмодзи)
         let sidebar_nav_box = GtkBox::new(Orientation::Vertical, 2);
@@ -221,12 +248,12 @@ impl VolnaWindow {
         sidebar_nav_box.append(&btn_wave);
         sidebar_nav_box.append(&btn_search);
         sidebar_nav_box.append(&btn_liked);
-        sidebar.append(&sidebar_nav_box);
+        sidebar_panel.append(&sidebar_nav_box);
 
         // 3. Нижняя часть: Профиль пользователя и кнопка настроек (всегда вертикальный стек)
         let sidebar_sep = gtk4::Separator::new(Orientation::Horizontal);
         sidebar_sep.add_css_class("sidebar-separator");
-        sidebar.append(&sidebar_sep);
+        sidebar_panel.append(&sidebar_sep);
 
         let sidebar_footer = GtkBox::new(Orientation::Vertical, 4);
         sidebar_footer.add_css_class("sidebar-footer");
@@ -343,7 +370,7 @@ impl VolnaWindow {
 
         sidebar_footer.append(&auth_btn);
         sidebar_footer.append(&settings_btn);
-        sidebar.append(&sidebar_footer);
+        sidebar_panel.append(&sidebar_footer);
 
         // Плавная 60 FPS анимация сворачивания / разворачивания (TimedAnimation 250мс)
         {
