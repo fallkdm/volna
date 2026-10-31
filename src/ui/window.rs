@@ -148,29 +148,29 @@ impl VolnaWindow {
             sidebar.add_css_class("collapsed");
         }
 
-        // Область с запрещёнными полосами прокрутки: даёт обрезку справа без изменения
-        // размеров дочерних виджетов (клипп, а не relayout на каждом кадре).
-        // Внутренняя ширина = 240 − паддинги 24 − рамка 1: в развёрнутом состоянии геометрия
-        // содержимого совпадает с прежней до пикселя.
+        // Внутренняя панель имеет постоянную ширину, а внешняя плавно её обрезает.
+        // GtkOverlay не прокручивает содержимое и не учитывает ширину панели при измерении,
+        // поэтому сайдбар может на каждом кадре сужаться вплоть до 68 px.
         let sidebar_panel = GtkBox::new(Orientation::Vertical, 0);
         sidebar_panel.set_size_request(SIDEBAR_EXPANDED_WIDTH - 25, -1);
         sidebar_panel.set_vexpand(true);
         sidebar_panel.set_halign(Align::Start);
         sidebar_panel.set_valign(Align::Fill);
-        let sidebar_scroll = ScrolledWindow::new();
-        sidebar_scroll.set_policy(PolicyType::Never, PolicyType::Never);
-        sidebar_scroll.set_vexpand(true);
-        sidebar_scroll.set_hexpand(true);
-        sidebar_scroll.set_halign(Align::Fill);
-        sidebar_scroll.set_valign(Align::Fill);
-        sidebar_scroll.set_overflow(Overflow::Hidden);
-        sidebar_scroll.set_child(Some(&sidebar_panel));
-        // Панель намеренно шире видимой области (клипп): любую прокрутку глушим,
-        // иначе колесо мыши сдвинет содержимое сайдбара.
-        let scroll_ctrl = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::BOTH_AXES);
-        scroll_ctrl.connect_scroll(|_, _, _| gtk4::glib::Propagation::Stop);
-        sidebar_scroll.add_controller(scroll_ctrl);
-        sidebar.append(&sidebar_scroll);
+
+        let sidebar_clip = Overlay::new();
+        sidebar_clip.set_vexpand(true);
+        sidebar_clip.set_hexpand(true);
+        sidebar_clip.set_halign(Align::Fill);
+        sidebar_clip.set_valign(Align::Fill);
+        sidebar_clip.set_overflow(Overflow::Hidden);
+
+        // Пустой основной слой отвечает только за высоту; постоянная панель лежит поверх него.
+        let sidebar_sizer = GtkBox::new(Orientation::Vertical, 0);
+        sidebar_sizer.set_vexpand(true);
+        sidebar_clip.set_child(Some(&sidebar_sizer));
+        sidebar_clip.add_overlay(&sidebar_panel);
+        sidebar_clip.set_measure_overlay(&sidebar_panel, false);
+        sidebar.append(&sidebar_clip);
 
         // 1. Верхняя часть: Логотип «🌊 Волна» слева + кнопка сворачивания справа
         let sidebar_header_handle = gtk4::WindowHandle::new();
