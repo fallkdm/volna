@@ -130,37 +130,6 @@ impl VolnaWindow {
 
         let is_spotify_nav = nav_style == "spotify";
         let is_spotify_nav_state = Rc::new(RefCell::new(is_spotify_nav));
-        let k_header_holder: Rc<RefCell<Option<GtkBox>>> = Rc::default();
-
-        let update_content_margins: Rc<dyn Fn(Option<i32>)> = {
-            let s_view = search_view.container.clone();
-            let l_view = library_view.container.clone();
-            let k_holder = k_header_holder.clone();
-            let is_collapsed = is_collapsed.clone();
-            let is_spotify_state = is_spotify_nav_state.clone();
-            Rc::new(move |sidebar_w: Option<i32>| {
-                let is_spotify = *is_spotify_state.borrow();
-                let base_content_margin = 32;
-                let base_k_margin = 24;
-                let (content_margin, k_margin) = if is_spotify {
-                    let w = sidebar_w.unwrap_or_else(|| {
-                        if *is_collapsed.borrow() {
-                            SIDEBAR_COLLAPSED_WIDTH
-                        } else {
-                            SIDEBAR_EXPANDED_WIDTH
-                        }
-                    });
-                    (w + base_content_margin, w + base_k_margin)
-                } else {
-                    (base_content_margin, base_k_margin)
-                };
-                s_view.set_margin_start(content_margin);
-                l_view.set_margin_start(content_margin);
-                if let Some(kh) = k_holder.borrow().as_ref() {
-                    kh.set_margin_start(k_margin);
-                }
-            })
-        };
 
         let sidebar = GtkBox::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar");
@@ -175,8 +144,6 @@ impl VolnaWindow {
         if initial_collapsed {
             sidebar.add_css_class("collapsed");
         }
-
-        update_content_margins(Some(initial_width));
 
         // 1. Верхняя часть: Логотип «🌊 Волна» слева + кнопка сворачивания справа
         let sidebar_header_handle = gtk4::WindowHandle::new();
@@ -388,7 +355,6 @@ impl VolnaWindow {
             let settings_label_box = settings_label_box.clone();
             let nav_items = vec![nav_wave.clone(), nav_search.clone(), nav_liked.clone()];
             let anim_holder: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
-            let update_margins = update_content_margins.clone();
 
             collapse_btn.connect_clicked(move |_| {
                 if let Some(a) = anim_holder.borrow_mut().take() {
@@ -424,12 +390,10 @@ impl VolnaWindow {
                 let ab = auth_name_box.clone();
                 let sb = settings_label_box.clone();
                 let items = nav_items.clone();
-                let update_m = update_margins.clone();
 
                 let target = libadwaita::CallbackAnimationTarget::new(move |val| {
                     let w = val.round() as i32;
                     s.set_width_request(w);
-                    update_m(Some(w));
                     let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
                     bb.set_opacity(t);
                     ab.set_opacity(t);
@@ -446,14 +410,12 @@ impl VolnaWindow {
                 let ab_done = auth_name_box.clone();
                 let sb_done = settings_label_box.clone();
                 let items_done = nav_items.clone();
-                let update_m_done = update_margins.clone();
                 let c_btn_done = c_btn.clone();
 
                 anim.connect_done(move |_| {
                     if next_collapsed {
                         s_done.set_width_request(SIDEBAR_COLLAPSED_WIDTH);
                         s_done.add_css_class("collapsed");
-                        update_m_done(Some(SIDEBAR_COLLAPSED_WIDTH));
                         bb_done.set_visible(false);
                         bb_done.set_opacity(0.0);
                         ab_done.set_visible(false);
@@ -469,7 +431,6 @@ impl VolnaWindow {
                     } else {
                         s_done.set_width_request(SIDEBAR_EXPANDED_WIDTH);
                         s_done.remove_css_class("collapsed");
-                        update_m_done(Some(SIDEBAR_EXPANDED_WIDTH));
                         bb_done.set_visible(true);
                         bb_done.set_opacity(1.0);
                         bb_done.set_hexpand(true);
@@ -542,7 +503,8 @@ impl VolnaWindow {
         let main_content_box = GtkBox::new(Orientation::Vertical, 0);
         main_content_box.set_vexpand(true);
         main_content_box.set_hexpand(true);
-        main_content_box.set_margin_bottom(80);
+        // Отступ снизу нужен только под прижатый док; парящий остров — оверлей, контент идёт под него
+        main_content_box.set_margin_bottom(if player_layout == "dock" { 92 } else { 0 });
         main_content_box.append(&header_bar);
         main_content_box.append(&content_overlay);
 
@@ -709,8 +671,6 @@ impl VolnaWindow {
         k_header.set_margin_top(20);
         k_header.set_margin_start(24);
         k_header.set_margin_end(24);
-        *k_header_holder.borrow_mut() = Some(k_header.clone());
-        update_content_margins(None);
 
         let k_track_info = GtkBox::new(Orientation::Vertical, 2);
         k_track_info.set_valign(Align::Center);
@@ -1152,7 +1112,7 @@ impl VolnaWindow {
             theme_accent_state,
             dynamic_provider,
             is_spotify_nav_state,
-            update_content_margins,
+            main_content_box.clone(),
         );
 
         Self { window }
@@ -1368,7 +1328,7 @@ fn setup_event_listener(
     theme_accent_state: Rc<RefCell<String>>,
     dynamic_provider: gtk4::CssProvider,
     is_spotify_nav_state: Rc<RefCell<bool>>,
-    update_content_margins: Rc<dyn Fn(Option<i32>)>,
+    main_content_box: GtkBox,
 ) {
     if player.client.lock().unwrap().has_token() {
         auth_name_label.set_text("Аккаунт");
@@ -1540,7 +1500,6 @@ fn setup_event_listener(
                             let click = gtk4::GestureClick::new();
                             let (p, at) = (player.clone(), line.time_ms);
                             click.connect_released(move |_, _, _, _| p.seek_ms(at));
-                            lbl.add_controller(click);
                             lyrics_container.append(&lbl);
                             new_labels.push(lbl);
                         }
@@ -1653,15 +1612,12 @@ fn setup_event_listener(
                     view_switcher.set_visible(!is_spotify);
                     header_brand_box.set_visible(!is_spotify);
                     header_right_box.set_visible(!is_spotify);
-                    update_content_margins(None);
                 }
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
-                    if layout == "dock" {
-                        sidebar.set_margin_bottom(92);
-                    } else {
-                        sidebar.set_margin_bottom(0);
-                    }
+                    let dock_margin = if layout == "dock" { 92 } else { 0 };
+                    sidebar.set_margin_bottom(dock_margin);
+                    main_content_box.set_margin_bottom(dock_margin);
                 }
                 PlayerUiEvent::ThemeAccentChanged(accent) => {
                     *theme_accent_state.borrow_mut() = accent.clone();
