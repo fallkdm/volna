@@ -667,3 +667,411 @@ toast {
 .artist-ambient {
     filter: blur(9px) saturate(1.15);
 }
+
+/* ================= Сайдбар навигации (Spotify-Style) ================= */
+.sidebar,
+.spotify-sidebar {
+    background: rgba(14, 14, 14, 0.92);
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 8px 12px 0 12px;
+    overflow: hidden;
+}
+
+/* Шапка сайдбара */
+.sidebar-header-box {
+    min-height: 44px;
+    padding: 0;
+    overflow: hidden;
+}
+
+.sidebar-brand-title {
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: -0.2px;
+    color: #ffffff;
+    overflow: hidden;
+}
+
+button.sidebar-collapse-btn {
+    min-width: 44px;
+    min-height: 40px;
+    padding: 0;
+    margin: 0;
+    border-radius: 8px;
+    color: #b3b3b3;
+    background: transparent;
+    border: none;
+    outline: none;
+    box-shadow: none;
+    transition: color 150ms ease, background-color 150ms ease;
+}
+
+button.sidebar-collapse-btn:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.08);
+    outline: none;
+    box-shadow: none;
+    border: none;
+}
+
+/* Навигация */
+.sidebar-nav-container {
+    padding: 6px 0;
+    overflow: hidden;
+}
+
+/* Кнопки сайдбара: единый плоский стиль со слотом 44x40 */
+button.sidebar-nav-btn,
+button.sidebar-profile-btn,
+button.sidebar-settings-btn {
+    border-radius: 8px;
+    padding: 0;
+    margin: 2px 0;
+    min-width: 44px;
+    min-height: 40px;
+    color: #b3b3b3;
+    background: transparent;
+    border: none;
+    outline: none;
+    box-shadow: none;
+    overflow: hidden;
+    transition: color 150ms ease, background-color 150ms ease;
+}
+
+button.sidebar-nav-btn:hover,
+button.sidebar-profile-btn:hover,
+button.sidebar-settings-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #ffffff;
+    border: none;
+    outline: none;
+    box-shadow: none;
+}
+
+button.sidebar-nav-btn:hover .sidebar-nav-icon,
+button.sidebar-profile-btn:hover .sidebar-avatar-icon,
+button.sidebar-settings-btn:hover .sidebar-nav-icon {
+    color: #ffffff;
+}
+
+.sidebar-nav-icon {
+    color: #b3b3b3;
+    transition: color 150ms ease;
+}
+
+.sidebar-avatar-icon {
+    color: #b3b3b3;
+    transition: color 150ms ease;
+}
+
+.sidebar-nav-label,
+.sidebar-profile-name {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.1px;
+}
+
+/* Активный пункт меню: чистый стиль Spotify */
+button.sidebar-nav-btn.active {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+    border: none;
+    box-shadow: none;
+    outline: none;
+}
+
+button.sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #ffffff;
+}
+
+/* Разделитель */
+.sidebar-separator {
+    background-color: rgba(255, 255, 255, 0.08);
+    margin: 8px 0;
+    min-height: 1px;
+}
+
+/* Нижняя часть (Профиль и Настройки) */
+.sidebar-footer {
+    padding: 4px 0 0 0;
+    overflow: hidden;
+}
+
+.sidebar-profile-btn.logged-in {
+    color: #e0e0e0;
+}
+
+/* Явное отключение фокусных рамок и обводок кнопок сайдбара */
+button.sidebar-nav-btn,
+button.sidebar-nav-btn:focus,
+button.sidebar-nav-btn:focus-visible,
+button.sidebar-nav-btn:active,
+button.sidebar-nav-btn.active,
+button.sidebar-collapse-btn,
+button.sidebar-collapse-btn:focus,
+button.sidebar-collapse-btn:focus-visible,
+button.sidebar-collapse-btn:active,
+button.sidebar-profile-btn,
+button.sidebar-profile-btn:focus,
+button.sidebar-profile-btn:focus-visible,
+button.sidebar-profile-btn:active,
+button.sidebar-settings-btn,
+button.sidebar-settings-btn:focus,
+button.sidebar-settings-btn:focus-visible,
+button.sidebar-settings-btn:active {
+    outline: none;
+    box-shadow: none;
+    border: none;
+}
+
+/* Контейнер нижнего слота плеера под контентом и сайдбаром (Spotify layout) */
+.bottom-player-slot {
+    background: transparent;
+    padding: 0;
+    margin: 0;
+}
+
+/* ================= Док-плеер во всю ширину (Spotify-Style) ================= */
+.floating-island-player.dock-player {
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+    border-bottom: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
+    background-color: #121214;
+    background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 100%);
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.75);
+    padding: 10px 24px 10px 24px;
+}
+
+/* ================= Цветовые акценты темы ================= */
+
+/* Spotify Green (#1db954) */
+.accent-spotify .sidebar-nav-btn.active {
+    background-color: rgba(29, 185, 84, 0.16);
+    color: #ffffff;
+    border: none;
+}
+.accent-spotify .sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #1db954;
+}
+.accent-spotify .island-play {
+    background-color: #1db954;
+    background-image: linear-gradient(180deg, #22d362 0%, #1a9e48 100%);
+    box-shadow: 0 6px 18px rgba(29, 185, 84, 0.45);
+}
+.accent-spotify scale.adw-scale highlight {
+    background-color: #1db954;
+    background-image: linear-gradient(90deg, #22d362, #1db954);
+}
+.accent-spotify scale.volume-vertical highlight {
+    background-image: linear-gradient(0deg, #1db954, #22d362);
+}
+.accent-spotify .brand-badge {
+    background-color: rgba(29, 185, 84, 0.20);
+    color: #1db954;
+    border-color: rgba(29, 185, 84, 0.40);
+}
+.accent-spotify button.pill.suggested-action {
+    background-color: #1db954;
+    color: #ffffff;
+}
+.accent-spotify .rotor-filter-btn.selected {
+    background: rgba(29, 185, 84, 0.28);
+    color: #ffffff;
+}
+.accent-spotify .liked-heart {
+    color: #1db954;
+}
+
+/* Ruby Red (#e11d48) */
+.accent-ruby .sidebar-nav-btn.active {
+    background-color: rgba(225, 29, 72, 0.16);
+    color: #ffffff;
+    border: none;
+}
+.accent-ruby .sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #f43f5e;
+}
+.accent-ruby .island-play {
+    background-color: #e11d48;
+    background-image: linear-gradient(180deg, #f43f5e 0%, #be123c 100%);
+    box-shadow: 0 6px 18px rgba(225, 29, 72, 0.45);
+}
+.accent-ruby scale.adw-scale highlight {
+    background-color: #e11d48;
+    background-image: linear-gradient(90deg, #f43f5e, #e11d48);
+}
+.accent-ruby scale.volume-vertical highlight {
+    background-image: linear-gradient(0deg, #e11d48, #f43f5e);
+}
+.accent-ruby .brand-badge {
+    background-color: rgba(225, 29, 72, 0.20);
+    color: #f43f5e;
+    border-color: rgba(225, 29, 72, 0.40);
+}
+.accent-ruby button.pill.suggested-action {
+    background-color: #e11d48;
+    color: #ffffff;
+}
+.accent-ruby .rotor-filter-btn.selected {
+    background: rgba(225, 29, 72, 0.28);
+    color: #ffffff;
+}
+.accent-ruby .liked-heart {
+    color: #e11d48;
+}
+
+/* Sunset Orange (#ff6b4a) */
+.accent-sunset .sidebar-nav-btn.active {
+    background-color: rgba(255, 107, 74, 0.16);
+    color: #ffffff;
+    border: none;
+}
+.accent-sunset .sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #ff8a66;
+}
+.accent-sunset .island-play {
+    background-color: #ff6b4a;
+    background-image: linear-gradient(180deg, #ff8a66 0%, #ff5c3c 100%);
+    box-shadow: 0 6px 18px rgba(255, 107, 74, 0.45);
+}
+.accent-sunset scale.adw-scale highlight {
+    background-color: #ff6b4a;
+    background-image: linear-gradient(90deg, #ff8a5c, #ff6b4a);
+}
+.accent-sunset scale.volume-vertical highlight {
+    background-image: linear-gradient(0deg, #ff6b4a, #ff8a5c);
+}
+.accent-sunset .brand-badge {
+    background-color: rgba(255, 107, 74, 0.22);
+    color: #ff9d85;
+    border-color: rgba(255, 107, 74, 0.35);
+}
+.accent-sunset button.pill.suggested-action {
+    background-color: #ff6b4a;
+    color: #ffffff;
+}
+.accent-sunset .rotor-filter-btn.selected {
+    background: #ff6b4a;
+    color: #ffffff;
+}
+.accent-sunset .liked-heart {
+    color: #ff6b4a;
+}
+
+/* Cyber Violet (#a855f7) */
+.accent-violet .sidebar-nav-btn.active {
+    background-color: rgba(168, 85, 247, 0.16);
+    color: #ffffff;
+    border: none;
+}
+.accent-violet .sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #c084fc;
+}
+.accent-violet .island-play {
+    background-color: #a855f7;
+    background-image: linear-gradient(180deg, #c084fc 0%, #9333ea 100%);
+    box-shadow: 0 6px 18px rgba(168, 85, 247, 0.45);
+}
+.accent-violet scale.adw-scale highlight {
+    background-color: #a855f7;
+    background-image: linear-gradient(90deg, #c084fc, #a855f7);
+}
+.accent-violet scale.volume-vertical highlight {
+    background-image: linear-gradient(0deg, #a855f7, #c084fc);
+}
+.accent-violet .brand-badge {
+    background-color: rgba(168, 85, 247, 0.20);
+    color: #c084fc;
+    border-color: rgba(168, 85, 247, 0.40);
+}
+.accent-violet button.pill.suggested-action {
+    background-color: #a855f7;
+    color: #ffffff;
+}
+.accent-violet .rotor-filter-btn.selected {
+    background: rgba(168, 85, 247, 0.28);
+    color: #ffffff;
+}
+.accent-violet .liked-heart {
+    color: #a855f7;
+}
+
+/* Deep Ocean (#3b82f6) */
+.accent-ocean .sidebar-nav-btn.active {
+    background-color: rgba(59, 130, 246, 0.16);
+    color: #ffffff;
+    border: none;
+}
+.accent-ocean .sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #60a5fa;
+}
+.accent-ocean .island-play {
+    background-color: #3b82f6;
+    background-image: linear-gradient(180deg, #60a5fa 0%, #2563eb 100%);
+    box-shadow: 0 6px 18px rgba(59, 130, 246, 0.45);
+}
+.accent-ocean scale.adw-scale highlight {
+    background-color: #3b82f6;
+    background-image: linear-gradient(90deg, #60a5fa, #3b82f6);
+}
+.accent-ocean scale.volume-vertical highlight {
+    background-image: linear-gradient(0deg, #3b82f6, #60a5fa);
+}
+.accent-ocean .brand-badge {
+    background-color: rgba(59, 130, 246, 0.20);
+    color: #60a5fa;
+    border-color: rgba(59, 130, 246, 0.40);
+}
+.accent-ocean button.pill.suggested-action {
+    background-color: #3b82f6;
+    color: #ffffff;
+}
+.accent-ocean .rotor-filter-btn.selected {
+    background: rgba(59, 130, 246, 0.28);
+    color: #ffffff;
+}
+.accent-ocean .liked-heart {
+    color: #3b82f6;
+}
+
+/* Monochrome White (#ffffff) */
+.accent-monochrome .sidebar-nav-btn.active {
+    background-color: rgba(255, 255, 255, 0.16);
+    color: #ffffff;
+    border: none;
+}
+.accent-monochrome .sidebar-nav-btn.active .sidebar-nav-icon {
+    color: #ffffff;
+}
+.accent-monochrome .island-play {
+    background-color: #ffffff;
+    background-image: linear-gradient(180deg, #ffffff 0%, #dcdcdc 100%);
+    color: #111111;
+    box-shadow: 0 6px 18px rgba(255, 255, 255, 0.35);
+}
+.accent-monochrome scale.adw-scale highlight {
+    background-color: #ffffff;
+    background-image: none;
+}
+.accent-monochrome scale.volume-vertical highlight {
+    background-color: #ffffff;
+    background-image: none;
+}
+.accent-monochrome .brand-badge {
+    background-color: rgba(255, 255, 255, 0.18);
+    color: #ffffff;
+    border-color: rgba(255, 255, 255, 0.35);
+}
+.accent-monochrome button.pill.suggested-action {
+    background-color: #ffffff;
+    color: #111111;
+}
+.accent-monochrome .rotor-filter-btn.selected {
+    background: rgba(255, 255, 255, 0.28);
+    color: #ffffff;
+}
+.accent-monochrome .liked-heart {
+    color: #ffffff;
+}

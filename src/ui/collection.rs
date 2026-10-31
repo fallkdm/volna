@@ -662,7 +662,7 @@ impl DetailPage {
         self.set_cover_upload(&uid, &kind);
 
         let menu = GtkBox::new(Orientation::Vertical, 0);
-        let wave = menu_item("media-playlist-consecutive-symbolic", "Моя волна по плейлисту");
+        let wave = menu_item("media-playlist-consecutive-symbolic", "Волна по плейлисту");
         let share = menu_item("edit-copy-symbolic", "Скопировать ссылку");
 
         let delete = menu_item("user-trash-symbolic", "Удалить плейлист");
@@ -1494,7 +1494,7 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
 
     {
         let (p, t) = (player.clone(), track.clone());
-        add("media-playlist-consecutive-symbolic", "Моя волна по треку", Box::new(move || p.play_single_track(t.clone())));
+        add("media-playlist-consecutive-symbolic", "Волна по треку", Box::new(move || p.play_single_track(t.clone())));
     }
     {
         let (p, id) = (player.clone(), track.id.clone());

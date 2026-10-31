@@ -14,6 +14,7 @@ use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 
 pub struct LibraryViewWidgets {
     pub container: GtkBox,
+    pub open_liked: Rc<dyn Fn()>,
 }
 
 const TILE_SIZE: i32 = 160;
@@ -73,13 +74,21 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     main.append(&liked_box);
 
     let liked_tracks: Rc<RefCell<Vec<crate::api::models::Track>>> = Rc::default();
-    for open_liked in [liked_title.clone(), liked_all.clone()] {
-        let (page, stack, tracks) = (page.clone(), stack.clone(), liked_tracks.clone());
-        open_liked.connect_clicked(move |_| {
+    let open_liked_fn: Rc<dyn Fn()> = {
+        let page = page.clone();
+        let stack = stack.clone();
+        let tracks = liked_tracks.clone();
+        Rc::new(move || {
             let tracks = tracks.borrow().clone();
             let sub = format!("{} треков", tracks.len());
             page.show("Коллекция", "Мне нравится", &sub, None, tracks);
             stack.set_visible_child_name("detail");
+        })
+    };
+    for open_liked in [liked_title.clone(), liked_all.clone()] {
+        let f = open_liked_fn.clone();
+        open_liked.connect_clicked(move |_| {
+            f();
         });
     }
 
@@ -238,7 +247,10 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
         });
     }
 
-    LibraryViewWidgets { container }
+    LibraryViewWidgets {
+        container,
+        open_liked: open_liked_fn,
+    }
 }
 
 /// Плитка создания и плейлисты пользователя; после создания список перерисовывается

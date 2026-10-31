@@ -267,7 +267,8 @@ pub fn create_wave_view(
     title_label.set_wrap(true);
     title_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     title_label.set_justify(gtk4::Justification::Center);
-    title_label.set_max_width_chars(24);
+    title_label.set_max_width_chars(28);
+    title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     let explicit_badge = super::collection::explicit_badge();
     explicit_badge.set_margin_start(12);
     explicit_badge.add_css_class("hero");
@@ -282,7 +283,8 @@ pub fn create_wave_view(
     artist_label.set_wrap(true);
     artist_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
     artist_label.set_justify(gtk4::Justification::Center);
-    artist_label.set_max_width_chars(48);
+    artist_label.set_max_width_chars(32);
+    artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     bottom_box.append(&artist_label);
 
     // Центральная кнопка фильтров Ротора «Настроить волну»

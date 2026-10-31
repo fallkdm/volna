@@ -68,6 +68,7 @@ pub enum PlayerUiEvent {
     WaveContext(Option<String>),
     /// Реальный формат потока, например «MP3 192»
     StreamQuality(String),
+    Seeked(u64),
     LoadingState(bool),
     AuthRequired,
     UserLoggedIn(String),
@@ -87,6 +88,12 @@ pub enum PlayerUiEvent {
         enabled: bool,
         duration: u32,
     },
+    /// Изменился режим интерфейса / навигации: "wave" или "spotify"
+    NavLayoutChanged(String),
+    /// Изменился стиль плеера: "dock" или "floating"
+    PlayerLayoutChanged(String),
+    /// Изменился цветовой акцент: "dynamic", "spotify", "ruby", "sunset", "violet", "ocean", "monochrome"
+    ThemeAccentChanged(String),
 }
 
 /// Состояние очереди и воспроизведения
@@ -990,6 +997,7 @@ impl PlayerManager {
         if !self.cast_seek(ms / 1000) {
             self.audio.seek_ms(ms);
         }
+        self.emit(PlayerUiEvent::Seeked(ms / 1000));
     }
 
     /// Перемотка к заданной секунде
@@ -998,6 +1006,7 @@ impl PlayerManager {
             return;
         }
         self.audio.seek_seconds(seconds);
+        self.emit(PlayerUiEvent::Seeked(seconds));
     }
 
     /// Установка громкости (обновляет целевую громкость user_volume)

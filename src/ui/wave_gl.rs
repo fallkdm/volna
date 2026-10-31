@@ -264,14 +264,11 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
                 g.gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, f.width, f.height, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&f.data)));
             }
             if g.clip_size != (f.width, f.height) {
-                g.clip_rect = None;
+                g.clip_size = (f.width, f.height);
+                g.clip_rect = Some((0, 0, f.width, f.height));
             }
-            g.clip_size = (f.width, f.height);
-            if let Some(b) = super::wave_clip::content_bounds(&f) {
-                g.clip_rect = Some(match g.clip_rect {
-                    Some(r) => (r.0.min(b.0), r.1.min(b.1), r.2.max(b.2), r.3.max(b.3)),
-                    None => b,
-                });
+            if g.clip_rect.is_none() {
+                g.clip_rect = Some((0, 0, f.width, f.height));
             }
         }
         if !clip.active() {

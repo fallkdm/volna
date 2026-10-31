@@ -694,5 +694,7 @@ mod tests {
         // Следующий crossfade_to_url переключает обратно (1 -> 0)
         backend.crossfade_to_url("file:///tmp/dummy2.mp3", 0);
         assert_eq!(backend.active_slot.load(Ordering::SeqCst), 0);
+
+        std::mem::forget(backend);
     }
 }

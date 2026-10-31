@@ -47,6 +47,29 @@ fn flex_width(child: &impl IsA<gtk4::Widget>, nat: i32) -> GtkBox {
     wrap
 }
 
+/// Применяет стиль расположения плеера:
+/// - "dock": полноширинный нижний бар от края до края (Spotify-style)
+/// - "floating": парящая капсула с отступами и скруглениями над экраном
+pub fn apply_player_layout(island: &FloatingIslandWidgets, layout: &str) {
+    if layout == "dock" {
+        island.container.add_css_class("dock-player");
+        island.container.set_valign(Align::End);
+        island.container.set_halign(Align::Fill);
+        island.container.set_hexpand(true);
+        island.container.set_margin_bottom(0);
+        island.container.set_margin_start(0);
+        island.container.set_margin_end(0);
+    } else {
+        island.container.remove_css_class("dock-player");
+        island.container.set_valign(Align::End);
+        island.container.set_halign(Align::Center);
+        island.container.set_hexpand(false);
+        island.container.set_margin_bottom(16);
+        island.container.set_margin_start(16);
+        island.container.set_margin_end(16);
+    }
+}
+
 pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     // Капсула: верхний ряд (трек | транспорт | функции) + полоса перемотки во всю ширину
     let container = GtkBox::new(Orientation::Vertical, 6);

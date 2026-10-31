@@ -7,9 +7,10 @@ use libadwaita::{
 };
 
 use crate::api::auth::{
-    load_clips, load_crossfade, load_discord, load_genius_token, load_lastfm_key, load_quality,
-    load_token, save_clips, save_crossfade, save_discord_client_id, save_discord_rpc,
-    save_genius_token, save_lastfm_key, save_quality, save_token,
+    load_clips, load_crossfade, load_discord, load_genius_token, load_lastfm_key, load_nav_style,
+    load_player_layout, load_quality, load_theme_accent, load_token, save_clips, save_crossfade,
+    save_discord_client_id, save_discord_rpc, save_genius_token, save_lastfm_key, save_nav_style,
+    save_player_layout, save_quality, save_theme_accent, save_token,
 };
 use crate::cache::{clear_clips_cache, clear_covers_cache, clips_cache_size, covers_cache_size};
 use crate::player::PlayerManager;
@@ -50,6 +51,99 @@ pub fn show_preferences_dialog(
     }
     wave_group.add(&wave_row);
     page.add(&wave_group);
+
+    // Внешний вид
+    let appearance_group = PreferencesGroup::new();
+    appearance_group.set_title("Внешний вид");
+
+    // 1. Режим интерфейса
+    let nav_style_row = ComboRow::builder()
+        .title("Режим интерфейса")
+        .subtitle("Расположение навигации: оригинальный верхний бар или левый сайдбар")
+        .model(&gtk4::StringList::new(&["Оригинальный (Wave-First)", "Spotify-Style"]))
+        .build();
+    nav_style_row.set_selected(match load_nav_style().as_str() {
+        "spotify" => 1,
+        _ => 0,
+    });
+    {
+        let p = player.clone();
+        nav_style_row.connect_selected_notify(move |row| {
+            let val = match row.selected() {
+                1 => "spotify",
+                _ => "wave",
+            };
+            let _ = save_nav_style(val);
+            p.emit(crate::player::PlayerUiEvent::NavLayoutChanged(val.to_string()));
+        });
+    }
+    appearance_group.add(&nav_style_row);
+
+    // 2. Стиль плеера
+    let layout_row = ComboRow::builder()
+        .title("Стиль плеера")
+        .subtitle("Форма панели воспроизведения: парящая капсула или прижатая полоса")
+        .model(&gtk4::StringList::new(&["Парящий остров", "Прижатый док (Spotify)"]))
+        .build();
+    layout_row.set_selected(match load_player_layout().as_str() {
+        "dock" => 1,
+        _ => 0,
+    });
+    {
+        let p = player.clone();
+        layout_row.connect_selected_notify(move |row| {
+            let val = match row.selected() {
+                1 => "dock",
+                _ => "floating",
+            };
+            let _ = save_player_layout(val);
+            p.emit(crate::player::PlayerUiEvent::PlayerLayoutChanged(val.to_string()));
+        });
+    }
+    appearance_group.add(&layout_row);
+
+    // 3. Цветовой акцент
+    let accent_row = ComboRow::builder()
+        .title("Цветовой акцент")
+        .subtitle("Цвет подсветки, элементов плеера и линий волны")
+        .model(&gtk4::StringList::new(&[
+            "Динамический (по обложке)",
+            "Spotify Green",
+            "Ruby Red",
+            "Sunset Orange",
+            "Cyber Violet",
+            "Deep Ocean",
+            "Белый монохром",
+        ]))
+        .build();
+    accent_row.set_selected(match load_theme_accent().as_str() {
+        "spotify" => 1,
+        "ruby" => 2,
+        "sunset" => 3,
+        "violet" => 4,
+        "ocean" => 5,
+        "monochrome" => 6,
+        _ => 0,
+    });
+    {
+        let p = player.clone();
+        accent_row.connect_selected_notify(move |row| {
+            let val = match row.selected() {
+                1 => "spotify",
+                2 => "ruby",
+                3 => "sunset",
+                4 => "violet",
+                5 => "ocean",
+                6 => "monochrome",
+                _ => "dynamic",
+            };
+            let _ = save_theme_accent(val);
+            p.emit(crate::player::PlayerUiEvent::ThemeAccentChanged(val.to_string()));
+        });
+    }
+    appearance_group.add(&accent_row);
+
+    page.add(&appearance_group);
 
     // Воспроизведение: качество звука и плавный переход
     let playback_group = PreferencesGroup::new();

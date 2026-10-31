@@ -52,6 +52,18 @@ pub struct AppConfig {
     /// Длительность перехода в секундах (по умолчанию 3)
     #[serde(default = "default_crossfade_duration")]
     pub crossfade_duration: u32,
+    /// Стиль навигации: `wave` (по умолчанию, классический верхний бар) или `spotify` (левый сайдбар)
+    #[serde(default)]
+    pub nav_style: Option<String>,
+    /// Стиль плеера: `floating` (по умолчанию, парящий остров) или `dock` (прижатый док)
+    #[serde(default)]
+    pub player_layout: Option<String>,
+    /// Цветовой акцент: `dynamic` (по умолчанию), `spotify`, `ruby`, `sunset`, `violet`, `ocean`, `monochrome`
+    #[serde(default)]
+    pub theme_accent: Option<String>,
+    /// Свернут ли левый сайдбар (компактный режим)
+    #[serde(default)]
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for AppConfig {
@@ -69,6 +81,10 @@ impl Default for AppConfig {
             history_items: Vec::new(),
             crossfade: false,
             crossfade_duration: 3,
+            nav_style: None,
+            player_layout: None,
+            theme_accent: None,
+            sidebar_collapsed: false,
         }
     }
 }
@@ -203,6 +219,63 @@ pub fn save_crossfade(enabled: bool, duration: u32) -> Result<(), Box<dyn std::e
     let mut config = load_config().unwrap_or_default();
     config.crossfade = enabled;
     config.crossfade_duration = duration;
+    save_config(&config)
+}
+
+/// Выбранный стиль навигации: `wave` (по умолчанию, верхний бар) или `spotify` (левый сайдбар)
+pub fn load_nav_style() -> String {
+    match load_config().ok().and_then(|c| c.nav_style).as_deref() {
+        Some("spotify") => "spotify".to_string(),
+        _ => "wave".to_string(),
+    }
+}
+
+/// Сохраняет стиль навигации
+pub fn save_nav_style(style: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.nav_style = Some(style.to_string());
+    save_config(&config)
+}
+
+/// Выбранный стиль плеера: `floating` (по умолчанию, парящий остров) или `dock` (прижатый док)
+pub fn load_player_layout() -> String {
+    match load_config().ok().and_then(|c| c.player_layout).as_deref() {
+        Some("dock") => "dock".to_string(),
+        _ => "floating".to_string(),
+    }
+}
+
+/// Сохраняет стиль плеера
+pub fn save_player_layout(layout: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.player_layout = Some(layout.to_string());
+    save_config(&config)
+}
+
+/// Выбранный акцент темы: `dynamic` (по умолчанию), `spotify`, `ruby`, `sunset`, `violet`, `ocean`, `monochrome`
+pub fn load_theme_accent() -> String {
+    match load_config().ok().and_then(|c| c.theme_accent).as_deref() {
+        Some(a @ ("spotify" | "ruby" | "sunset" | "violet" | "ocean" | "monochrome")) => a.to_string(),
+        _ => "dynamic".to_string(),
+    }
+}
+
+/// Сохраняет акцент темы
+pub fn save_theme_accent(accent: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.theme_accent = Some(accent.to_string());
+    save_config(&config)
+}
+
+/// Состояние свернутости сайдбара
+pub fn load_sidebar_collapsed() -> bool {
+    load_config().map(|c| c.sidebar_collapsed).unwrap_or(false)
+}
+
+/// Сохраняет состояние свернутости сайдбара
+pub fn save_sidebar_collapsed(collapsed: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.sidebar_collapsed = collapsed;
     save_config(&config)
 }
 

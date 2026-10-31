@@ -34,6 +34,7 @@ pub fn bundled_icon(name: &str) -> Option<std::path::PathBuf> {
     // путь к исходникам вшивается только в отладочную сборку: в пакет попадать он не должен
     #[cfg(debug_assertions)]
     candidates.push(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons").join(name));
+    candidates.push(glib::user_data_dir().join("volna/icons").join(name));
     candidates.extend(glib::system_data_dirs().into_iter().map(|d| d.join("volna/icons").join(name)));
     candidates.into_iter().find(|p| p.exists())
 }
