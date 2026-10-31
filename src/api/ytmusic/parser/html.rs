@@ -186,16 +186,14 @@ pub(super) fn extract_track_label(chunk: &str) -> Option<(String, String)> {
 pub(super) fn extract_continuation_from_raw_html(html: &str) -> Option<String> {
     for needle in &["nextContinuationData", "\\x22nextContinuationData\\x22"] {
         if let Some(pos) = html.find(needle) {
+            // Значение читаем тем же экстрактором, что и остальные поля:
+            // он знает про экранированные (\x22) и обычные кавычки,
+            // а также про пробел после двоеточия.
             let tail = &html[pos..];
-            if let Some(cont_pos) = tail.find("continuation") {
-                let after = &tail[cont_pos + 12..];
-                let mut chars = after.chars().skip_while(|c| *c != '"' && *c != '\'');
-                if let Some(quote) = chars.next() {
-                    let val: String = chars.take_while(|c| *c != quote && *c != '\\').collect();
-                    if !val.is_empty() && val.len() > 10 {
-                        return Some(val);
-                    }
-                }
+            if let Some(value) = extract_field_value(tail, "continuation")
+                && value.len() > 10
+            {
+                return Some(value);
             }
         }
     }

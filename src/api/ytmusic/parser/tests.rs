@@ -1830,3 +1830,38 @@ fn test_parse_playlist_panel_video() {
     // Без videoId трек не создаётся
     assert!(parse_playlist_panel_video(&json!({ "title": { "simpleText": "x" } })).is_none());
 }
+
+// --- Continuation-токен из сырого HTML (фолбэк) ---
+
+#[test]
+fn test_extract_continuation_from_raw_html() {
+    // Канонический JSON из инлайн-скрипта
+    let html = r#"<script>var data = {"nextContinuationData":{"continuation":"CBQSCOPL_TOKEN_1234567890"}};</script>"#;
+    assert_eq!(
+        extract_continuation_from_raw_html(html).as_deref(),
+        Some("CBQSCOPL_TOKEN_1234567890")
+    );
+
+    // Тот же токен в экранированном виде (data: '...')
+    let html = r#"<script>data: '{\x22nextContinuationData\x22:{\x22continuation\x22:\x22CBQSESCAPED_TOKEN_0987654321\x22}}'</script>"#;
+    assert_eq!(
+        extract_continuation_from_raw_html(html).as_deref(),
+        Some("CBQSESCAPED_TOKEN_0987654321")
+    );
+
+    // Пробел после двоеточия не мешает
+    let html = r#"{"nextContinuationData": {"continuation": "CBQSSPACED_TOKEN_5555555555"}}"#;
+    assert_eq!(
+        extract_continuation_from_raw_html(html).as_deref(),
+        Some("CBQSSPACED_TOKEN_5555555555")
+    );
+
+    // Слишком короткое значение — это не токен
+    assert_eq!(
+        extract_continuation_from_raw_html(r#"{"nextContinuationData":{"continuation":"short"}}"#),
+        None
+    );
+
+    // Без nextContinuationData токена нет
+    assert_eq!(extract_continuation_from_raw_html("<html></html>"), None);
+}
