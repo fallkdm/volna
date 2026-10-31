@@ -1274,3 +1274,559 @@ fn test_parse_header_track_count_from_html() {
     let html_fallback = r#"<div>musicResponsiveHeaderRenderer ... secondSubtitle: {"runs":[{"text":"325 треков"}]}</div>"#;
     assert_eq!(parse_header_track_count_from_html(html_fallback), Some(325));
 }
+
+// --- Извлечение аудиопотока (/youtubei/v1/player) ---
+
+/// Формат потока для фикстур `parse_stream_url` — как в реальном `adaptiveFormats`.
+fn stream_format(itag: u64, mime_type: &str, bitrate: u64) -> serde_json::Value {
+    json!({
+        "itag": itag,
+        "mimeType": mime_type,
+        "bitrate": bitrate,
+        "url": format!("https://r1.googlevideo.com/videoplayback?itag={itag}"),
+    })
+}
+
+/// Ответ player-эндпоинта с успешным статусом и списком адаптивных форматов.
+fn player_json(adaptive_formats: Vec<serde_json::Value>) -> serde_json::Value {
+    json!({
+        "playabilityStatus": { "status": "OK" },
+        "streamingData": { "adaptiveFormats": adaptive_formats },
+    })
+}
+
+#[test]
+fn test_parse_stream_url_reports_playability_reason() {
+    // Текст ошибки показывается пользователю — держим его дословно
+    let json = json!({
+        "playabilityStatus": {
+            "status": "LOGIN_REQUIRED",
+            "reason": "Sign in to confirm you're not a bot"
+        }
+    });
+    assert_eq!(
+        parse_stream_url(&json).unwrap_err(),
+        "Воспроизведение недоступно: Sign in to confirm you're not a bot"
+    );
+
+    // Без reason в сообщение попадает сам статус
+    let json = json!({ "playabilityStatus": { "status": "ERROR" } });
+    assert_eq!(
+        parse_stream_url(&json).unwrap_err(),
+        "Воспроизведение недоступно: ERROR"
+    );
+
+    // Статус OK сам по себе ничего не даёт: без форматов возвращается ошибка
+    let json = json!({ "playabilityStatus": { "status": "OK" } });
+    assert_eq!(
+        parse_stream_url(&json).unwrap_err(),
+        "Не найдено прямых аудиопотоков в ответе InnerTube"
+    );
+}
+
+#[test]
+fn test_parse_stream_url_ignores_formats_without_direct_url() {
+    // signatureCipher и пустой url не годятся: нужен прямой адрес
+    let json = json!({
+        "playabilityStatus": { "status": "OK" },
+        "streamingData": {
+            "adaptiveFormats": [
+                {
+                    "itag": 251,
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "signatureCipher": "s=abc"
+                },
+                {
+                    "itag": 140,
+                    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "bitrate": 128000,
+                    "url": ""
+                }
+            ]
+        }
+    });
+    assert_eq!(
+        parse_stream_url(&json).unwrap_err(),
+        "Не найдено прямых аудиопотоков в ответе InnerTube"
+    );
+}
+
+#[test]
+fn test_parse_stream_url_prefers_opus_over_video() {
+    // У видео-дорожки битрейт выше, но приоритет у Opus (itag 251)
+    let json = player_json(vec![
+        stream_format(137, "video/mp4; codecs=\"avc1.640028\"", 4_000_000),
+        stream_format(251, "audio/webm; codecs=\"opus\"", 160_000),
+    ]);
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?itag=251"
+    );
+}
+
+#[test]
+fn test_parse_stream_url_picks_loudest_opus_and_falls_back_to_average_bitrate() {
+    // Из нескольких Opus-дорожек выбирается самая битрейтная
+    let json = player_json(vec![
+        json!({
+            "itag": 251,
+            "mimeType": "audio/webm; codecs=\"opus\"",
+            "bitrate": 130_000,
+            "url": "https://r1.googlevideo.com/videoplayback?q=quiet",
+        }),
+        json!({
+            "itag": 251,
+            "mimeType": "audio/webm; codecs=\"opus\"",
+            "bitrate": 160_000,
+            "url": "https://r1.googlevideo.com/videoplayback?q=loud",
+        }),
+    ]);
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?q=loud"
+    );
+
+    // Если bitrate нет, используется averageBitrate
+    let json = player_json(vec![
+        json!({
+            "itag": 251,
+            "mimeType": "audio/webm; codecs=\"opus\"",
+            "averageBitrate": 160_000,
+            "url": "https://r1.googlevideo.com/videoplayback?a=avg",
+        }),
+        json!({
+            "itag": 251,
+            "mimeType": "audio/webm; codecs=\"opus\"",
+            "bitrate": 130_000,
+            "url": "https://r1.googlevideo.com/videoplayback?a=bit",
+        }),
+    ]);
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?a=avg"
+    );
+}
+
+#[test]
+fn test_parse_stream_url_falls_back_to_aac_then_any_audio() {
+    // Без Opus выбирается AAC (itag 140)
+    let json = player_json(vec![
+        stream_format(137, "video/mp4; codecs=\"avc1\"", 3_000_000),
+        stream_format(140, "audio/mp4; codecs=\"mp4a.40.2\"", 129_000),
+    ]);
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?itag=140"
+    );
+
+    // Любой audio/* подходит, если нет ни Opus, ни AAC
+    let json = player_json(vec![json!({
+        "itag": 250,
+        "mimeType": "audio/webm; codecs=\"vorbis\"",
+        "bitrate": 64_000,
+        "url": "https://r1.googlevideo.com/videoplayback?codec=vorbis",
+    })]);
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?codec=vorbis"
+    );
+
+    // Последний фолбэк: формат без audio в mimeType — берётся самый битрейтный
+    let json = player_json(vec![
+        stream_format(137, "video/mp4; codecs=\"avc1\"", 3_000_000),
+        stream_format(248, "video/webm; codecs=\"vp9\"", 1_500_000),
+    ]);
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?itag=137"
+    );
+}
+
+#[test]
+fn test_parse_stream_url_reads_muxed_formats_array() {
+    // `formats` (мультиплекс) просматривается наравне с `adaptiveFormats`
+    let json = json!({
+        "streamingData": {
+            "formats": [{
+                "itag": 18,
+                "mimeType": "video/mp4; codecs=\"avc1, mp4a.40.2\"",
+                "bitrate": 96_000,
+                "url": "https://r1.googlevideo.com/videoplayback?itag=18",
+            }]
+        }
+    });
+    assert_eq!(
+        parse_stream_url(&json).unwrap(),
+        "https://r1.googlevideo.com/videoplayback?itag=18"
+    );
+}
+
+// --- Разбор JS-строк и полей из HTML ---
+
+#[test]
+fn test_extract_js_string_literal_quotes_and_escapes() {
+    // Ведущие пробельные символы пропускаются
+    assert_eq!(
+        extract_js_string_literal("  \n\t'/browse', params: 1"),
+        Some("/browse")
+    );
+    // Двойные кавычки поддерживаются наравне с одинарными
+    assert_eq!(extract_js_string_literal("\"VLPL123\""), Some("VLPL123"));
+    // Экранированная кавычка не закрывает литерал
+    assert_eq!(extract_js_string_literal(r"'it\'s'"), Some(r"it\'s"));
+    // Пустой литерал — валидная строка
+    assert_eq!(extract_js_string_literal("''"), Some(""));
+    // Незакрытый литерал, не-строка и пустой ввод дают None
+    assert_eq!(extract_js_string_literal("'abc"), None);
+    assert_eq!(extract_js_string_literal("path: /browse"), None);
+    assert_eq!(extract_js_string_literal("   "), None);
+}
+
+#[test]
+fn test_extract_field_value_supported_shapes() {
+    // Экранированная форма из `data: '...'`
+    assert_eq!(
+        extract_field_value(r#"..."\x22videoId\x22:\x22dQw4w9WgXcQ\x22..."#, "videoId").as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    // Обычный JSON без пробела и с пробелом после двоеточия
+    assert_eq!(
+        extract_field_value(r#""videoId":"dQw4w9WgXcQ""#, "videoId").as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    assert_eq!(
+        extract_field_value(r#""videoId": "dQw4w9WgXcQ""#, "videoId").as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    // Форма без экранирования открывающей кавычки ключа
+    assert_eq!(
+        extract_field_value(r#"videoId\x22:\x22dQw4w9WgXcQ"#, "videoId").as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    // Пустое значение и отсутствующее поле — None
+    assert_eq!(extract_field_value(r#""videoId":"""#, "videoId"), None);
+    assert_eq!(extract_field_value("no fields here", "videoId"), None);
+}
+
+#[test]
+fn test_extract_track_label_splits_title_and_artist() {
+    // Полный label из accessibility-атрибута
+    let chunk =
+        r#"{"label":"Happy Song - Bring Me The Horizon - 3 минуты 57 секунд – воспроизвести"}"#;
+    assert_eq!(
+        extract_track_label(chunk),
+        Some(("Happy Song".to_string(), "Bring Me The Horizon".to_string()))
+    );
+
+    // Экранированная форма и английский суффикс "play"
+    let chunk = r#"label\x22:\x22Change - Deftones - play"#;
+    assert_eq!(
+        extract_track_label(chunk),
+        Some(("Change".to_string(), "Deftones".to_string()))
+    );
+
+    // Дефис без пробелов — запасной вариант разбиения
+    let chunk = r#""label":"Song-Deftones""#;
+    assert_eq!(
+        extract_track_label(chunk),
+        Some(("Song".to_string(), "Deftones".to_string()))
+    );
+
+    // Разделителя нет — трек не распознан
+    assert_eq!(
+        extract_track_label(r#""label":"JustASong – воспроизвести""#),
+        None
+    );
+    assert_eq!(extract_track_label("no label at all"), None);
+}
+
+#[test]
+fn test_parse_tracks_and_continuation_from_html() {
+    // Один проход отдаёт и треки из initialData, и токен продолжения
+    let html = r#"<script>initialData.push({path: '/browse', params: JSON.parse('{}'), data: '{\x22musicPlaylistShelfRenderer\x22:{\x22contents\x22:[{\x22musicResponsiveListItemRenderer\x22:{\x22playlistItemData\x22:{\x22videoId\x22:\x22dQw4w9WgXcQ\x22},\x22flexColumns\x22:[{\x22musicResponsiveListItemFlexColumnRenderer\x22:{\x22text\x22:{\x22runs\x22:[{\x22text\x22:\x22Never Gonna Give You Up\x22}]}}},{\x22musicResponsiveListItemFlexColumnRenderer\x22:{\x22text\x22:{\x22runs\x22:[{\x22text\x22:\x22Rick Astley\x22}]}}}]}}],\x22continuations\x22:[{\x22nextContinuationData\x22:{\x22continuation\x22:\x22CBQSTOKEN_1234567890\x22}}]}}'});</script>"#;
+
+    let (tracks, continuation) = parse_tracks_and_continuation_from_html(html);
+    assert_eq!(continuation.as_deref(), Some("CBQSTOKEN_1234567890"));
+    assert_eq!(tracks.len(), 1);
+    assert_eq!(tracks[0].id, "dQw4w9WgXcQ");
+    assert_eq!(tracks[0].title, "Never Gonna Give You Up");
+    assert_eq!(tracks[0].artists[0].name, "Rick Astley");
+    assert_eq!(
+        tracks[0].cover_uri.as_deref(),
+        Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
+    );
+}
+
+// --- Поиск идентификаторов и текста в ответах InnerTube ---
+
+#[test]
+fn test_find_video_id_supported_shapes() {
+    // Все пять форм videoId, встречающихся в рендерерах
+    assert_eq!(
+        find_video_id(&json!({ "videoId": "dQw4w9WgXcQ" })).as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    assert_eq!(
+        find_video_id(&json!({ "playlistItemData": { "videoId": "dQw4w9WgXcQ" } })).as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    assert_eq!(
+        find_video_id(&json!({ "watchEndpoint": { "videoId": "dQw4w9WgXcQ" } })).as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    assert_eq!(
+        find_video_id(
+            &json!({ "navigationEndpoint": { "watchEndpoint": { "videoId": "dQw4w9WgXcQ" } } })
+        )
+        .as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+    assert_eq!(
+        find_video_id(&json!({ "onTap": { "watchEndpoint": { "videoId": "dQw4w9WgXcQ" } } }))
+            .as_deref(),
+        Some("dQw4w9WgXcQ")
+    );
+
+    // Пустой идентификатор отбрасывается
+    assert_eq!(find_video_id(&json!({ "videoId": "" })), None);
+    assert_eq!(find_video_id(&json!({ "title": "без id" })), None);
+}
+
+#[test]
+fn test_find_browse_id_supported_shapes() {
+    // Прямой browseId и browseEndpoint
+    assert_eq!(
+        find_browse_id(&json!({ "browseId": "UCartist123" })).as_deref(),
+        Some("UCartist123")
+    );
+    assert_eq!(
+        find_browse_id(&json!({ "browseEndpoint": { "browseId": "UCartist123" } })).as_deref(),
+        Some("UCartist123")
+    );
+    // Цепочки navigationEndpoint/onTap
+    assert_eq!(
+        find_browse_id(
+            &json!({ "navigationEndpoint": { "browseEndpoint": { "browseId": "UCartist123" } } })
+        )
+        .as_deref(),
+        Some("UCartist123")
+    );
+    assert_eq!(
+        find_browse_id(&json!({ "onTap": { "browseEndpoint": { "browseId": "UCartist123" } } }))
+            .as_deref(),
+        Some("UCartist123")
+    );
+    assert_eq!(
+        find_browse_id(&json!({
+            "onTap": { "navigationEndpoint": { "browseEndpoint": { "browseId": "UCartist123" } } }
+        }))
+        .as_deref(),
+        Some("UCartist123")
+    );
+
+    // browseId спрятанный в runs первой колонки списка
+    let json = json!({
+        "flexColumns": [{
+            "musicResponsiveListItemFlexColumnRenderer": {
+                "text": { "runs": [{
+                    "text": "Deftones",
+                    "navigationEndpoint": { "browseEndpoint": { "browseId": "UCdeftones" } }
+                }] }
+            }
+        }]
+    });
+    assert_eq!(find_browse_id(&json).as_deref(), Some("UCdeftones"));
+
+    // browseId в заголовке карточки
+    let json = json!({
+        "header": {
+            "musicCardShelfHeaderBasicRenderer": {
+                "browseId": "UCcard123"
+            }
+        }
+    });
+    assert_eq!(find_browse_id(&json).as_deref(), Some("UCcard123"));
+
+    assert_eq!(find_browse_id(&json!({ "browseId": "" })), None);
+}
+
+#[test]
+fn test_extract_text_supported_shapes() {
+    // Простая строка, simpleText и склейка runs
+    assert_eq!(
+        extract_text(&json!("raw text")),
+        Some("raw text".to_string())
+    );
+    assert_eq!(
+        extract_text(&json!({ "simpleText": "Simple" })),
+        Some("Simple".to_string())
+    );
+    assert_eq!(
+        extract_text(&json!({ "runs": [{ "text": "Never " }, { "text": "Gonna" }] })),
+        Some("Never Gonna".to_string())
+    );
+    // Пустой runs и неподходящий тип — None
+    assert_eq!(extract_text(&json!({ "runs": [] })), None);
+    assert_eq!(extract_text(&json!(42)), None);
+}
+
+// --- Обложки: пропорции и выбор квадратной ---
+
+#[test]
+fn test_is_banner_thumbnail_detects_wide_images() {
+    // Широкоформатный баннер по числовым полям
+    assert!(is_banner_thumbnail(
+        &json!({ "width": 1920, "height": 540 })
+    ));
+    // Квадрат баннером не считается
+    assert!(!is_banner_thumbnail(
+        &json!({ "width": 544, "height": 544 })
+    ));
+
+    // Если ширины/высоты нет, пропорции берутся из параметров URL
+    assert!(is_banner_thumbnail(
+        &json!({ "url": "https://lh3.googleusercontent.com/banner=w1920-h1080-l90-rj" })
+    ));
+    assert!(!is_banner_thumbnail(
+        &json!({ "url": "https://lh3.googleusercontent.com/cover=w1060-h1060-l90-rj" })
+    ));
+}
+
+#[test]
+fn test_extract_square_thumbnail_skips_banner() {
+    // Баннер больше по площади, но квадратная обложка должна победить
+    let json = json!({
+        "thumbnails": [
+            {
+                "url": "https://lh3.googleusercontent.com/banner.jpg=w1920-h540",
+                "width": 1920,
+                "height": 540
+            },
+            {
+                "url": "https://lh3.googleusercontent.com/cover.jpg=w544-h544",
+                "width": 544,
+                "height": 544
+            }
+        ]
+    });
+    assert_eq!(
+        extract_square_thumbnail(&json).as_deref(),
+        Some("https://lh3.googleusercontent.com/cover.jpg=w544-h544")
+    );
+    // extract_best_thumbnail баннеры не фильтрует — это его штатное поведение
+    assert_eq!(
+        extract_best_thumbnail(&json).as_deref(),
+        Some("https://lh3.googleusercontent.com/banner.jpg=w1920-h540")
+    );
+}
+
+// --- Радио и очередь воспроизведения ---
+
+#[test]
+fn test_find_continuation_token_supported_shapes() {
+    // Четыре формы токена, встречающиеся в ответах InnerTube
+    assert_eq!(
+        find_continuation_token(&json!({ "nextContinuationData": { "continuation": "TOKEN_A" } }))
+            .as_deref(),
+        Some("TOKEN_A")
+    );
+    assert_eq!(
+        find_continuation_token(
+            &json!({ "nextRadioContinuationData": { "continuation": "TOKEN_B" } })
+        )
+        .as_deref(),
+        Some("TOKEN_B")
+    );
+    assert_eq!(
+        find_continuation_token(&json!({ "continuationCommand": { "token": "TOKEN_C" } }))
+            .as_deref(),
+        Some("TOKEN_C")
+    );
+    assert_eq!(
+        find_continuation_token(&json!({
+            "continuationItemRenderer": {
+                "continuationEndpoint": { "continuationCommand": { "token": "TOKEN_D" } }
+            }
+        }))
+        .as_deref(),
+        Some("TOKEN_D")
+    );
+
+    // Токен находится и внутри массива
+    let json = json!({
+        "contents": [
+            { "x": 1 },
+            { "nextContinuationData": { "continuation": "TOKEN_E" } }
+        ]
+    });
+    assert_eq!(find_continuation_token(&json).as_deref(), Some("TOKEN_E"));
+
+    assert_eq!(find_continuation_token(&json!({ "contents": [] })), None);
+}
+
+#[test]
+fn test_parse_playlist_panel_video() {
+    let renderer = json!({
+        "videoId": "abcDEF12345",
+        "title": { "runs": [{ "text": "Minerva" }] },
+        "lengthText": { "runs": [{ "text": "4:32" }] },
+        "longBylineText": {
+            "runs": [{
+                "text": "Deftones",
+                "navigationEndpoint": { "browseEndpoint": { "browseId": "UCdeftones" } }
+            }]
+        },
+        "thumbnail": {
+            "thumbnails": [{
+                "url": "https://lh3.googleusercontent.com/minerva.jpg",
+                "width": 544,
+                "height": 544
+            }]
+        },
+        "badges": [{
+            "musicInlineBadgeRenderer": { "icon": { "iconType": "MUSIC_EXPLICIT_BADGE" } }
+        }]
+    });
+
+    let track = parse_playlist_panel_video(&renderer).expect("трек должен распарситься");
+    assert_eq!(track.id, "abcDEF12345");
+    assert_eq!(track.title, "Minerva");
+    assert_eq!(track.duration_ms, Some(272_000));
+    assert_eq!(track.artists[0].name, "Deftones");
+    // Обложка с googleusercontent не грузится напрямую — подменяется на i.ytimg.com
+    assert_eq!(
+        track.cover_uri.as_deref(),
+        Some("https://i.ytimg.com/vi/abcDEF12345/hqdefault.jpg")
+    );
+    assert_eq!(track.content_warning.as_deref(), Some("explicit"));
+    assert_eq!(track.available, Some(true));
+    assert_eq!(track.source, TrackSource::YouTubeMusic);
+
+    // Обёртка playlistPanelVideoRenderer разворачивается
+    let wrapped = json!({ "playlistPanelVideoRenderer": renderer });
+    assert_eq!(
+        parse_playlist_panel_video(&wrapped).map(|t| t.id),
+        Some("abcDEF12345".to_string())
+    );
+
+    // Готовая обложка i.ytimg.com остаётся как есть
+    let with_own_cover = json!({
+        "videoId": "abcDEF12345",
+        "thumbnail": {
+            "thumbnails": [{
+                "url": "https://i.ytimg.com/vi/abcDEF12345/mqdefault.jpg",
+                "width": 320,
+                "height": 180
+            }]
+        }
+    });
+    assert_eq!(
+        parse_playlist_panel_video(&with_own_cover)
+            .and_then(|t| t.cover_uri)
+            .as_deref(),
+        Some("https://i.ytimg.com/vi/abcDEF12345/mqdefault.jpg")
+    );
+
+    // Без videoId трек не создаётся
+    assert!(parse_playlist_panel_video(&json!({ "title": { "simpleText": "x" } })).is_none());
+}
