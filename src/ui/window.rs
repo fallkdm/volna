@@ -12,11 +12,12 @@ use libadwaita::{
 };
 
 use crate::api::models::{parse_lrc, LrcLine};
+use crate::api::provider::ProviderId;
 use crate::player::{PlayerManager, PlayerUiEvent, RepeatMode};
 use super::auth_dialog::show_auth_dialog;
 use super::floating_island::{create_floating_island, FloatingIslandWidgets};
 use super::library_view::create_library_view;
-use super::preferences_dialog::show_preferences_dialog;
+use super::preferences_dialog::{show_preferences_dialog, show_ytmusic_auth_dialog};
 use super::search_view::create_search_view;
 use super::wave_view::{create_wave_view, WaveViewWidgets};
 
@@ -266,6 +267,100 @@ impl VolnaWindow {
         sidebar_footer.set_margin_bottom(16);
         sidebar_footer.set_margin_top(4);
 
+        // Кнопка-селектор текущего музыкального сервиса (источника)
+        let source_btn = gtk4::MenuButton::new();
+        source_btn.add_css_class("flat");
+        source_btn.add_css_class("sidebar-source-btn");
+        source_btn.set_focusable(false);
+        source_btn.set_halign(Align::Fill);
+        source_btn.set_hexpand(true);
+        source_btn.set_overflow(Overflow::Hidden);
+        source_btn.set_tooltip_text(Some("Выбор источника музыки"));
+
+        let source_overlay = Overlay::new();
+        source_overlay.set_hexpand(true);
+        source_overlay.set_halign(Align::Fill);
+        source_overlay.set_overflow(Overflow::Hidden);
+
+        let source_icon_box = GtkBox::new(Orientation::Horizontal, 0);
+        source_icon_box.set_size_request(44, 40);
+        source_icon_box.set_halign(Align::Start);
+        source_icon_box.set_valign(Align::Center);
+
+        let cur_prov = player.providers.active_id();
+        let (initial_icon, initial_label) = match cur_prov {
+            crate::api::provider::ProviderId::YouTubeMusic => ("🔴", "YouTube Music"),
+            _ => ("🌊", "Яндекс"),
+        };
+
+        let source_icon = Label::new(Some(initial_icon));
+        source_icon.set_halign(Align::Center);
+        source_icon.set_valign(Align::Center);
+        source_icon.set_hexpand(true);
+        source_icon_box.append(&source_icon);
+
+        source_overlay.set_child(Some(&source_icon_box));
+
+        let source_label_box = GtkBox::new(Orientation::Horizontal, 0);
+        source_label_box.set_valign(Align::Center);
+        source_label_box.set_halign(Align::Start);
+        source_label_box.set_margin_start(44);
+        source_label_box.set_overflow(Overflow::Hidden);
+
+        let source_label = Label::new(Some(initial_label));
+        source_label.set_halign(Align::Start);
+        source_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        source_label.set_width_chars(1);
+        source_label.add_css_class("sidebar-nav-label");
+        source_label_box.append(&source_label);
+
+        source_overlay.add_overlay(&source_label_box);
+        source_overlay.set_measure_overlay(&source_label_box, false);
+
+        if initial_collapsed {
+            source_label_box.set_visible(false);
+            source_label_box.set_opacity(0.0);
+        }
+
+        source_btn.set_child(Some(&source_overlay));
+
+        let source_popover = gtk4::Popover::new();
+        let source_pop_box = GtkBox::new(Orientation::Vertical, 4);
+        source_pop_box.set_margin_top(8);
+        source_pop_box.set_margin_bottom(8);
+        source_pop_box.set_margin_start(8);
+        source_pop_box.set_margin_end(8);
+
+        let ya_item = Button::with_label("🌊  Яндекс Музыка");
+        ya_item.add_css_class("flat");
+        ya_item.set_halign(Align::Fill);
+
+        let yt_item = Button::with_label("🔴  YouTube Music");
+        yt_item.add_css_class("flat");
+        yt_item.set_halign(Align::Fill);
+
+        {
+            let p = player.clone();
+            let pop = source_popover.clone();
+            ya_item.connect_clicked(move |_| {
+                p.switch_provider(crate::api::provider::ProviderId::Yandex);
+                pop.popdown();
+            });
+        }
+        {
+            let p = player.clone();
+            let pop = source_popover.clone();
+            yt_item.connect_clicked(move |_| {
+                p.switch_provider(crate::api::provider::ProviderId::YouTubeMusic);
+                pop.popdown();
+            });
+        }
+
+        source_pop_box.append(&ya_item);
+        source_pop_box.append(&yt_item);
+        source_popover.set_child(Some(&source_pop_box));
+        source_btn.set_popover(Some(&source_popover));
+
         // Кнопка профиля (с оверлеем для нулевого влияния на ширину при анимации)
         let auth_btn = Button::new();
         auth_btn.add_css_class("flat");
@@ -286,13 +381,12 @@ impl VolnaWindow {
         auth_avatar_box.set_halign(Align::Start);
         auth_avatar_box.set_valign(Align::Center);
 
-        let auth_avatar = gtk4::Image::from_icon_name("avatar-default-symbolic");
-        auth_avatar.set_pixel_size(24);
-        auth_avatar.set_halign(Align::Center);
-        auth_avatar.set_valign(Align::Center);
-        auth_avatar.set_hexpand(true);
-        auth_avatar.add_css_class("sidebar-avatar-icon");
-        auth_avatar_box.append(&auth_avatar);
+        let auth_icon = Label::new(None);
+        auth_icon.set_halign(Align::Center);
+        auth_icon.set_valign(Align::Center);
+        auth_icon.set_hexpand(true);
+        auth_icon.add_css_class("sidebar-avatar-icon");
+        auth_avatar_box.append(&auth_icon);
 
         auth_overlay.set_child(Some(&auth_avatar_box));
 
@@ -302,7 +396,7 @@ impl VolnaWindow {
         auth_name_box.set_margin_start(44);
         auth_name_box.set_overflow(Overflow::Hidden);
 
-        let auth_name_label = Label::new(Some("Войти в Яндекс ID"));
+        let auth_name_label = Label::new(None);
         auth_name_label.set_halign(Align::Start);
         auth_name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         auth_name_label.set_width_chars(1);
@@ -318,6 +412,7 @@ impl VolnaWindow {
         }
 
         auth_btn.set_child(Some(&auth_overlay));
+        update_auth_ui(&auth_btn, &auth_icon, &auth_name_label, &header_auth_btn, &player, None);
 
         // Кнопка настроек (с оверлеем)
         let settings_btn = Button::new();
@@ -372,6 +467,7 @@ impl VolnaWindow {
 
         settings_btn.set_child(Some(&settings_overlay));
 
+        sidebar_footer.append(&source_btn);
         sidebar_footer.append(&auth_btn);
         sidebar_footer.append(&settings_btn);
         sidebar_panel.append(&sidebar_footer);
@@ -382,6 +478,7 @@ impl VolnaWindow {
             let sidebar = sidebar.clone();
             let c_btn = collapse_btn.clone();
             let brand_box = brand_box.clone();
+            let source_label_box = source_label_box.clone();
             let auth_name_box = auth_name_box.clone();
             let settings_label_box = settings_label_box.clone();
             let search_container = search_container.clone();
@@ -410,6 +507,8 @@ impl VolnaWindow {
                     // и ни одна буква не торчит наружу лесенкой поверх волны.
                     brand_box.set_visible(false);
                     brand_box.set_opacity(0.0);
+                    source_label_box.set_visible(false);
+                    source_label_box.set_opacity(0.0);
                     auth_name_box.set_visible(false);
                     auth_name_box.set_opacity(0.0);
                     settings_label_box.set_visible(false);
@@ -423,6 +522,8 @@ impl VolnaWindow {
                 } else {
                     brand_box.set_visible(true);
                     brand_box.set_opacity(0.0);
+                    source_label_box.set_visible(true);
+                    source_label_box.set_opacity(0.0);
                     auth_name_box.set_visible(true);
                     auth_name_box.set_opacity(0.0);
                     settings_label_box.set_visible(true);
@@ -437,6 +538,7 @@ impl VolnaWindow {
 
                 let s = sidebar.clone();
                 let bb = brand_box.clone();
+                let slb = source_label_box.clone();
                 let ab = auth_name_box.clone();
                 let sb = settings_label_box.clone();
                 let items = nav_items.clone();
@@ -454,6 +556,7 @@ impl VolnaWindow {
                     let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
                     if !next_collapsed {
                         bb.set_opacity(t);
+                        slb.set_opacity(t);
                         ab.set_opacity(t);
                         sb.set_opacity(t);
                         for item in &items {
@@ -466,6 +569,7 @@ impl VolnaWindow {
 
                 let s_done = sidebar.clone();
                 let bb_done = brand_box.clone();
+                let slb_done = source_label_box.clone();
                 let ab_done = auth_name_box.clone();
                 let sb_done = settings_label_box.clone();
                 let items_done = nav_items.clone();
@@ -485,6 +589,8 @@ impl VolnaWindow {
                         s_done.add_css_class("collapsed");
                         bb_done.set_visible(false);
                         bb_done.set_opacity(0.0);
+                        slb_done.set_visible(false);
+                        slb_done.set_opacity(0.0);
                         ab_done.set_visible(false);
                         ab_done.set_opacity(0.0);
                         sb_done.set_visible(false);
@@ -501,6 +607,8 @@ impl VolnaWindow {
                         bb_done.set_visible(true);
                         bb_done.set_opacity(1.0);
                         bb_done.set_hexpand(true);
+                        slb_done.set_visible(true);
+                        slb_done.set_opacity(1.0);
                         ab_done.set_visible(true);
                         ab_done.set_opacity(1.0);
                         sb_done.set_visible(true);
@@ -540,7 +648,14 @@ impl VolnaWindow {
 
         {
             let u = update_active_nav.clone();
-            view_stack.connect_visible_child_notify(move |_| u());
+            let vs = view_stack.clone();
+            let rel = search_view.reload_history.clone();
+            view_stack.connect_visible_child_notify(move |_| {
+                u();
+                if vs.visible_child_name().as_deref() == Some("search") {
+                    rel();
+                }
+            });
         }
 
         {
@@ -549,7 +664,11 @@ impl VolnaWindow {
         }
         {
             let vs = view_stack.clone();
-            btn_search.connect_clicked(move |_| vs.set_visible_child_name("search"));
+            let rel = search_view.reload_history.clone();
+            btn_search.connect_clicked(move |_| {
+                vs.set_visible_child_name("search");
+                rel();
+            });
         }
         {
             let vs = view_stack.clone();
@@ -873,25 +992,63 @@ impl VolnaWindow {
             let win_weak = window.downgrade();
             Rc::new(move || {
                 if let Some(w) = win_weak.upgrade() {
-                    let is_logged_in = p_clone.client.lock().unwrap().has_token();
-                    if is_logged_in {
-                        // Диалог с предложением выйти
-                        let alert = libadwaita::AlertDialog::new(
-                            Some("Управление аккаунтом"),
-                            Some("Вы авторизованы в Яндекс Музыке."),
-                        );
-                        alert.add_response("cancel", "Отмена");
-                        alert.add_response("logout", "Выйти из аккаунта");
-                        alert.set_response_appearance("logout", libadwaita::ResponseAppearance::Destructive);
+                    let active_id = p_clone.providers.active_id();
+                    if active_id == ProviderId::YouTubeMusic {
+                        let is_auth = p_clone
+                            .providers
+                            .get(ProviderId::YouTubeMusic)
+                            .map_or(false, |p| p.is_authenticated())
+                            || crate::api::auth::load_ytmusic_cookie().is_some();
+                        if is_auth {
+                            let alert = libadwaita::AlertDialog::new(
+                                Some("Google Аккаунт"),
+                                Some("Вы авторизованы в YouTube Music через аккаунт Google."),
+                            );
+                            alert.add_response("cancel", "Отмена");
+                            alert.add_response("logout", "Выйти из Google");
+                            alert.set_response_appearance("logout", libadwaita::ResponseAppearance::Destructive);
 
-                        let p_inner = p_clone.clone();
-                        alert.choose(Some(&w), None::<&gio::Cancellable>, move |response| {
-                            if response == "logout" {
-                                p_inner.logout();
-                            }
-                        });
+                            let p_inner = p_clone.clone();
+                            alert.choose(Some(&w), None::<&gtk4::gio::Cancellable>, move |response| {
+                                if response == "logout" {
+                                    let _ = crate::api::auth::clear_ytmusic_refresh_token();
+                                    let _ = crate::api::auth::clear_ytmusic_cookie();
+                                    let guest = std::sync::Arc::new(crate::api::ytmusic::YtMusicClient::new())
+                                        as std::sync::Arc<dyn crate::api::provider::MusicProvider>;
+                                    p_inner.providers.register(guest);
+                                    p_inner.emit(crate::player::PlayerUiEvent::StatusMessage(
+                                        "Вы вышли из аккаунта Google (YouTube Music)".to_string(),
+                                    ));
+                                    if p_inner.providers.active_id() == ProviderId::YouTubeMusic {
+                                        p_inner.emit(crate::player::PlayerUiEvent::ProviderChanged(ProviderId::YouTubeMusic));
+                                    }
+                                }
+                            });
+                        } else {
+                            let p_inner = p_clone.clone();
+                            show_ytmusic_auth_dialog(&w, &p_inner, move || {});
+                        }
                     } else {
-                        show_auth_dialog(&w, &p_clone);
+                        let is_logged_in = p_clone.client.lock().map_or(false, |c| c.has_token());
+                        if is_logged_in {
+                            // Диалог с предложением выйти
+                            let alert = libadwaita::AlertDialog::new(
+                                Some("Управление аккаунтом"),
+                                Some("Вы авторизованы в Яндекс Музыке."),
+                            );
+                            alert.add_response("cancel", "Отмена");
+                            alert.add_response("logout", "Выйти из аккаунта");
+                            alert.set_response_appearance("logout", libadwaita::ResponseAppearance::Destructive);
+
+                            let p_inner = p_clone.clone();
+                            alert.choose(Some(&w), None::<&gtk4::gio::Cancellable>, move |response| {
+                                if response == "logout" {
+                                    p_inner.logout();
+                                }
+                            });
+                        } else {
+                            show_auth_dialog(&w, &p_clone);
+                        }
                     }
                 }
             })
@@ -1155,7 +1312,10 @@ impl VolnaWindow {
             toast_overlay,
             wave_view,
             island,
+            source_icon,
+            source_label,
             auth_btn,
+            auth_icon,
             auth_name_label,
             header_auth_btn,
             player.clone(),
@@ -1368,13 +1528,115 @@ fn create_sidebar_nav_btn(icon_name: &str, label_text: &str, is_collapsed: bool)
     SidebarNavItem { btn, overlay, icon_box, icon, label, label_box }
 }
 
+fn update_auth_ui(
+    auth_btn: &Button,
+    auth_icon: &Label,
+    auth_name_label: &Label,
+    header_auth_btn: &Button,
+    player: &PlayerManager,
+    yandex_login: Option<&str>,
+) {
+    let active_id = player.providers.active_id();
+    match active_id {
+        ProviderId::YouTubeMusic => {
+            let prov_is_auth = player
+                .providers
+                .get(ProviderId::YouTubeMusic)
+                .map_or(false, |p| p.is_authenticated());
+
+            let config_cookie = crate::api::auth::load_ytmusic_cookie();
+            let is_auth = if !prov_is_auth {
+                if let Some(cookie) = config_cookie {
+                    let yt_client = crate::api::ytmusic::YtMusicClient::with_cookie(cookie);
+                    player.providers.register(
+                        std::sync::Arc::new(yt_client) as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+            auth_icon.set_text("🔴");
+            if is_auth {
+                auth_name_label.set_text("Google Аккаунт");
+                auth_btn.set_tooltip_text(Some("Подключен Google (YouTube Music)"));
+                auth_btn.remove_css_class("login-required");
+                auth_btn.add_css_class("logged-in");
+
+                header_auth_btn.set_label("🔴 Google Аккаунт");
+                header_auth_btn.set_tooltip_text(Some("Подключен Google (YouTube Music)"));
+                header_auth_btn.remove_css_class("login-required");
+                header_auth_btn.remove_css_class("suggested-action");
+                header_auth_btn.add_css_class("flat");
+                header_auth_btn.add_css_class("logged-in");
+            } else {
+                auth_name_label.set_text("Войти в Google");
+                auth_btn.set_tooltip_text(Some("Войти в Google"));
+                auth_btn.remove_css_class("logged-in");
+                auth_btn.add_css_class("login-required");
+
+                header_auth_btn.set_label("🔴 Войти в Google");
+                header_auth_btn.set_tooltip_text(Some("Войти в Google"));
+                header_auth_btn.remove_css_class("flat");
+                header_auth_btn.remove_css_class("logged-in");
+                header_auth_btn.add_css_class("login-required");
+                header_auth_btn.add_css_class("suggested-action");
+            }
+        }
+        _ => {
+            let is_auth = player.client.lock().map_or(false, |c| c.has_token());
+            auth_icon.set_text("🌊");
+            if is_auth {
+                let name = yandex_login.unwrap_or("Аккаунт");
+                auth_name_label.set_text(name);
+                let tooltip = if let Some(login) = yandex_login {
+                    format!("Вы вошли как {}", login)
+                } else {
+                    "Вы вошли в Яндекс ID".to_string()
+                };
+                auth_btn.set_tooltip_text(Some(&tooltip));
+                auth_btn.remove_css_class("login-required");
+                auth_btn.add_css_class("logged-in");
+
+                if let Some(login) = yandex_login {
+                    header_auth_btn.set_label(&format!("🌊 {}", login));
+                } else {
+                    header_auth_btn.set_label("🌊 Аккаунт");
+                }
+                header_auth_btn.set_tooltip_text(Some(&tooltip));
+                header_auth_btn.remove_css_class("login-required");
+                header_auth_btn.remove_css_class("suggested-action");
+                header_auth_btn.add_css_class("flat");
+                header_auth_btn.add_css_class("logged-in");
+            } else {
+                auth_name_label.set_text("Войти в Яндекс ID");
+                auth_btn.set_tooltip_text(Some("Войти в Яндекс ID"));
+                auth_btn.remove_css_class("logged-in");
+                auth_btn.remove_css_class("login-required");
+
+                header_auth_btn.set_label("🌊 Войти в Яндекс ID");
+                header_auth_btn.set_tooltip_text(Some("Войти в Яндекс ID"));
+                header_auth_btn.remove_css_class("flat");
+                header_auth_btn.remove_css_class("logged-in");
+                header_auth_btn.remove_css_class("login-required");
+                header_auth_btn.add_css_class("suggested-action");
+            }
+        }
+    }
+}
+
 fn setup_event_listener(
     receiver: Receiver<PlayerUiEvent>,
     window: ApplicationWindow,
     toast_overlay: ToastOverlay,
     wave_view: WaveViewWidgets,
     island: FloatingIslandWidgets,
+    source_icon: Label,
+    source_label: Label,
     auth_btn: Button,
+    auth_icon: Label,
     auth_name_label: Label,
     header_auth_btn: Button,
     player: PlayerManager,
@@ -1400,14 +1662,15 @@ fn setup_event_listener(
     library_container: GtkBox,
     is_collapsed: Rc<RefCell<bool>>,
 ) {
-    if player.client.lock().unwrap().has_token() {
-        auth_name_label.set_text("Аккаунт");
-        auth_btn.add_css_class("logged-in");
-        header_auth_btn.set_label("Аккаунт");
-        header_auth_btn.remove_css_class("suggested-action");
-        header_auth_btn.add_css_class("flat");
-        header_auth_btn.add_css_class("logged-in");
-    }
+    let yandex_login_state: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    update_auth_ui(
+        &auth_btn,
+        &auth_icon,
+        &auth_name_label,
+        &header_auth_btn,
+        &player,
+        None,
+    );
     let win_weak = window.downgrade();
     gtk4::glib::spawn_future_local(async move {
         while let Ok(event) = receiver.recv().await {
@@ -1440,6 +1703,14 @@ fn setup_event_listener(
                     island.title_label.set_markup(&track.title_markup());
                     island.explicit_badge.set_visible(track.is_explicit());
                     island.artist_label.set_text(&artists);
+
+                    let is_liked = player.is_track_liked(&track.id);
+                    if is_liked {
+                        island.like_btn.add_css_class("liked");
+                    } else {
+                        island.like_btn.remove_css_class("liked");
+                    }
+                    island.dislike_btn.remove_css_class("disliked");
 
                     k_track_title.set_markup(&track.title_markup());
                     k_explicit.set_visible(track.is_explicit());
@@ -1567,9 +1838,16 @@ fn setup_event_listener(
                             lbl.set_justify(gtk4::Justification::Center);
                             // клик по строке перематывает трек к её началу
                             lbl.set_cursor_from_name(Some("pointer"));
+                            lbl.set_can_target(true);
                             let click = gtk4::GestureClick::new();
                             let (p, at) = (player.clone(), line.time_ms);
-                            click.connect_released(move |_, _, _, _| p.seek_ms(at));
+                            click.connect_pressed(move |_, _, _, _| {
+                                p.seek_ms(at);
+                                if !p.audio.is_playing() {
+                                    p.resume();
+                                }
+                            });
+                            lbl.add_controller(click);
                             lyrics_container.append(&lbl);
                             new_labels.push(lbl);
                         }
@@ -1622,38 +1900,43 @@ fn setup_event_listener(
                     }
                 }
                 PlayerUiEvent::AuthRequired => {
-                    auth_name_label.set_text("Войти в Яндекс ID");
-                    auth_btn.set_tooltip_text(Some("Войти в Яндекс ID"));
-                    auth_btn.remove_css_class("logged-in");
+                    *yandex_login_state.borrow_mut() = None;
+                    update_auth_ui(
+                        &auth_btn,
+                        &auth_icon,
+                        &auth_name_label,
+                        &header_auth_btn,
+                        &player,
+                        None,
+                    );
 
-                    header_auth_btn.set_label("Войти в Яндекс ID");
-                    header_auth_btn.remove_css_class("flat");
-                    header_auth_btn.remove_css_class("logged-in");
-                    header_auth_btn.add_css_class("suggested-action");
-
-                    if let Some(w) = win_weak.upgrade() {
-                        show_auth_dialog(&w, &player);
+                    if player.providers.active_id() == ProviderId::Yandex {
+                        if let Some(w) = win_weak.upgrade() {
+                            show_auth_dialog(&w, &player);
+                        }
                     }
                 }
                 PlayerUiEvent::UserLoggedIn(login) => {
-                    auth_name_label.set_text(&login);
-                    auth_btn.set_tooltip_text(Some(&format!("Вы вошли как {}", login)));
-                    auth_btn.add_css_class("logged-in");
-
-                    header_auth_btn.set_label(&format!("👤 {}", login));
-                    header_auth_btn.remove_css_class("suggested-action");
-                    header_auth_btn.add_css_class("flat");
-                    header_auth_btn.add_css_class("logged-in");
+                    *yandex_login_state.borrow_mut() = Some(login);
+                    update_auth_ui(
+                        &auth_btn,
+                        &auth_icon,
+                        &auth_name_label,
+                        &header_auth_btn,
+                        &player,
+                        yandex_login_state.borrow().as_deref(),
+                    );
                 }
                 PlayerUiEvent::UserLoggedOut => {
-                    auth_name_label.set_text("Войти в Яндекс ID");
-                    auth_btn.set_tooltip_text(Some("Войти в Яндекс ID"));
-                    auth_btn.remove_css_class("logged-in");
-
-                    header_auth_btn.set_label("Войти в Яндекс ID");
-                    header_auth_btn.remove_css_class("flat");
-                    header_auth_btn.remove_css_class("logged-in");
-                    header_auth_btn.add_css_class("suggested-action");
+                    *yandex_login_state.borrow_mut() = None;
+                    update_auth_ui(
+                        &auth_btn,
+                        &auth_icon,
+                        &auth_name_label,
+                        &header_auth_btn,
+                        &player,
+                        None,
+                    );
 
                     wave_view.title_label.set_text("Волна");
                     wave_view.explicit_badge.set_visible(false);
@@ -1718,6 +2001,26 @@ fn setup_event_listener(
                             update_dynamic_accent_css(&dynamic_provider, core[0], core[1], core[2]);
                         }
                     }
+                }
+                PlayerUiEvent::ProviderChanged(id) => {
+                    match id {
+                        crate::api::provider::ProviderId::YouTubeMusic => {
+                            source_icon.set_text("🔴");
+                            source_label.set_text("YouTube Music");
+                        }
+                        _ => {
+                            source_icon.set_text("🌊");
+                            source_label.set_text("Яндекс");
+                        }
+                    }
+                    update_auth_ui(
+                        &auth_btn,
+                        &auth_icon,
+                        &auth_name_label,
+                        &header_auth_btn,
+                        &player,
+                        yandex_login_state.borrow().as_deref(),
+                    );
                 }
                 _ => {}
             }

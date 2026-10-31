@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cache;
 pub mod discord;
+pub mod ipc;
 pub mod mpris;
 pub mod player;
 pub mod station;
@@ -24,6 +25,62 @@ fn main() {
         .expect("Не удалось инициализировать Tokio runtime");
     let _guard = rt.enter();
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "mcp" {
+        // Запускаем MCP сервер без инициализации GTK!
+        rt.block_on(crate::ipc::mcp::run_mcp_server());
+        return;
+    }
+    if args.len() > 1 && args[1] == "cmd" {
+        // Простой CLI-клиент для вызова команд из терминала
+        let cmd_name = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+        let cmd_json = match cmd_name {
+            "status" | "play" | "pause" | "toggle" | "next" | "prev" | "like" | "dislike" => {
+                serde_json::json!({ "cmd": cmd_name })
+            }
+            "volume" => {
+                let val = args.get(3).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.5);
+                serde_json::json!({ "cmd": "volume", "val": val })
+            }
+            "switch_provider" => {
+                let prov = args.get(3).map(|s| s.as_str()).unwrap_or("yandex");
+                serde_json::json!({ "cmd": "switch_provider", "provider": prov })
+            }
+            "wave" | "start_wave" => {
+                let station = args.get(3).map(|s| s.to_string());
+                serde_json::json!({ "cmd": "start_wave", "station_id": station })
+            }
+            "search" | "search_and_play" => {
+                let query = args[3..].join(" ");
+                serde_json::json!({ "cmd": "search_and_play", "query": query })
+            }
+            "set_cookie" => {
+                let cookie = args.get(3).cloned().unwrap_or_default();
+                serde_json::json!({ "cmd": "set_cookie", "cookie": cookie })
+            }
+            other => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(other) {
+                    val
+                } else {
+                    serde_json::json!({ "cmd": other })
+                }
+            }
+        };
+
+        rt.block_on(async {
+            match crate::ipc::send_cmd(&cmd_json).await {
+                Ok(resp) => {
+                    println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()));
+                }
+                Err(e) => {
+                    eprintln!("Ошибка IPC: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+        return;
+    }
+
     // Создаем приложение Libadwaita
     let app = Application::builder()
         .application_id(APP_ID)
@@ -45,6 +102,9 @@ fn main() {
         // Инициализируем плеер со связкой каналов
         match PlayerManager::new(client, vec![ui_tx, mpris_tx, discord_tx]) {
             Ok(player) => {
+                // Запускаем IPC сервер
+                ipc::spawn_ipc_server(player.clone());
+
                 // Запускаем системный MPRIS2 D-Bus сервер
                 mpris::spawn_mpris_server(player.clone(), mpris_rx);
                 discord::spawn_bridge(player.clone(), discord_rx);

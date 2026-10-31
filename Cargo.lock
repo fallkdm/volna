@@ -2922,6 +2922,7 @@ name = "volna"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "async-trait",
  "chrono",
  "discord-rich-presence",
  "futures-util",
@@ -2941,6 +2942,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

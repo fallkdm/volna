@@ -342,6 +342,77 @@ pub fn show_preferences_dialog(
     auth_group.add(&token_row);
     page.add(&auth_group);
 
+    // Сервисы: YouTube Music
+    let services_group = PreferencesGroup::new();
+    services_group.set_title("Сервисы");
+
+    let is_yt_auth = crate::api::auth::load_ytmusic_cookie().is_some()
+        || crate::api::auth::load_ytmusic_refresh_token().is_some();
+    let yt_status_row = ActionRow::builder()
+        .title("YouTube Music")
+        .subtitle(if is_yt_auth { "Авторизован в YouTube Music" } else { "Не авторизован (гостевой режим)" })
+        .build();
+
+    let yt_btn_box = GtkBox::new(Orientation::Horizontal, 8);
+
+    let yt_login_btn = Button::with_label("Войти");
+    yt_login_btn.add_css_class("suggested-action");
+    yt_login_btn.add_css_class("pill");
+    yt_login_btn.set_valign(gtk4::Align::Center);
+    yt_login_btn.set_visible(!is_yt_auth);
+
+    let yt_logout_btn = Button::with_label("Выйти");
+    yt_logout_btn.add_css_class("destructive-action");
+    yt_logout_btn.add_css_class("pill");
+    yt_logout_btn.set_valign(gtk4::Align::Center);
+    yt_logout_btn.set_visible(is_yt_auth);
+
+    {
+        let p = player.clone();
+        let status_row_clone = yt_status_row.clone();
+        let in_btn_clone = yt_login_btn.clone();
+        let out_btn_clone = yt_logout_btn.clone();
+        let parent_widget = parent.upcast_ref::<gtk4::Widget>().clone();
+
+        yt_login_btn.connect_clicked(move |_| {
+            let row = status_row_clone.clone();
+            let ib = in_btn_clone.clone();
+            let ob = out_btn_clone.clone();
+            show_ytmusic_auth_dialog(&parent_widget, &p, move || {
+                row.set_subtitle("Авторизован в YouTube Music");
+                ib.set_visible(false);
+                ob.set_visible(true);
+            });
+        });
+    }
+
+    {
+        let p = player.clone();
+        let status_row_clone = yt_status_row.clone();
+        let in_btn_clone = yt_login_btn.clone();
+        let out_btn_clone = yt_logout_btn.clone();
+
+        yt_logout_btn.connect_clicked(move |_| {
+            let _ = crate::api::auth::clear_ytmusic_cookie();
+            let _ = crate::api::auth::clear_ytmusic_refresh_token();
+            let guest = std::sync::Arc::new(crate::api::ytmusic::YtMusicClient::new()) as std::sync::Arc<dyn crate::api::provider::MusicProvider>;
+            p.providers.register(guest);
+            status_row_clone.set_subtitle("Не авторизован (гостевой режим)");
+            in_btn_clone.set_visible(true);
+            out_btn_clone.set_visible(false);
+            p.emit(crate::player::PlayerUiEvent::StatusMessage("Вы вышли из аккаунта YouTube Music".to_string()));
+            if p.providers.active_id() == crate::api::provider::ProviderId::YouTubeMusic {
+                p.emit(crate::player::PlayerUiEvent::ProviderChanged(crate::api::provider::ProviderId::YouTubeMusic));
+            }
+        });
+    }
+
+    yt_btn_box.append(&yt_login_btn);
+    yt_btn_box.append(&yt_logout_btn);
+    yt_status_row.add_suffix(&yt_btn_box);
+    services_group.add(&yt_status_row);
+    page.add(&services_group);
+
     // Genius: справка об исполнителях, которых нет в Википедии
     let genius_group = PreferencesGroup::new();
     genius_group.set_title("Справка об исполнителях");
@@ -383,6 +454,132 @@ pub fn show_preferences_dialog(
     about_group.add(&about_row);
     page.add(&about_group);
 
+    dialog.add(&page);
+    dialog.present(Some(parent));
+}
+
+/// Отображает диалог входа по Cookie для YouTube Music
+pub fn show_ytmusic_auth_dialog(
+    parent: &impl IsA<gtk4::Widget>,
+    player: &PlayerManager,
+    on_success: impl Fn() + 'static,
+) {
+    let dialog = PreferencesDialog::new();
+    dialog.set_title("Вход в YouTube Music");
+
+    let page = PreferencesPage::new();
+
+    let group = PreferencesGroup::new();
+    group.set_title("Вход в YouTube Music");
+    group.set_description(Some(
+        "Войдите в YouTube Music через сессию браузера для доступа к вашим плейлистам, любимым трекам и персональной Волне.",
+    ));
+
+    // Шаг 1: Кнопка «Открыть music.youtube.com ↗»
+    let step1_row = ActionRow::builder()
+        .title("Шаг 1: Откройте YouTube Music в браузере")
+        .subtitle("Перейдите на сайт и убедитесь, что вы авторизованы")
+        .build();
+
+    let open_browser_btn = Button::with_label("Открыть music.youtube.com ↗");
+    open_browser_btn.add_css_class("suggested-action");
+    open_browser_btn.add_css_class("pill");
+    open_browser_btn.set_valign(gtk4::Align::Center);
+    open_browser_btn.connect_clicked(|_| {
+        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+            "https://music.youtube.com",
+            None::<&gtk4::gio::AppLaunchContext>,
+        );
+    });
+    step1_row.add_suffix(&open_browser_btn);
+    group.add(&step1_row);
+
+    // Шаг 2: Подсказка
+    let step2_row = ActionRow::builder()
+        .title("Шаг 2: Скопируйте Cookie из браузера")
+        .subtitle(
+            "В браузере откройте инструменты разработчика (F12) → вкладка Network (Сеть) → кликните по любому запросу к YouTube Music и скопируйте заголовок Cookie",
+        )
+        .build();
+    step2_row.set_subtitle_lines(0);
+    group.add(&step2_row);
+
+    // Шаг 3: Поле ввода с кнопкой вставки из буфера
+    let cookie_row = PasswordEntryRow::builder()
+        .title("Шаг 3: Заголовок Cookie")
+        .build();
+
+    if let Some(saved_cookie) = crate::api::auth::load_ytmusic_cookie() {
+        cookie_row.set_text(&saved_cookie);
+    }
+
+    let paste_btn = Button::from_icon_name("edit-paste-symbolic");
+    paste_btn.set_tooltip_text(Some("Вставить из буфера обмена"));
+    paste_btn.add_css_class("flat");
+    paste_btn.set_valign(gtk4::Align::Center);
+
+    let cookie_row_weak = cookie_row.downgrade();
+    paste_btn.connect_clicked(move |_| {
+        if let Some(display) = gtk4::gdk::Display::default() {
+            let clipboard = display.clipboard();
+            let row_weak = cookie_row_weak.clone();
+            clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |res| {
+                if let Ok(Some(text)) = res {
+                    if let Some(row) = row_weak.upgrade() {
+                        row.set_text(&text);
+                    }
+                }
+            });
+        }
+    });
+    cookie_row.add_suffix(&paste_btn);
+    group.add(&cookie_row);
+
+    // Кнопка «Войти»
+    let action_row = ActionRow::builder()
+        .title("Завершить вход")
+        .subtitle("Применить куки и подключить YouTube Music")
+        .build();
+
+    let login_btn = Button::with_label("Войти");
+    login_btn.add_css_class("suggested-action");
+    login_btn.add_css_class("pill");
+    login_btn.set_valign(gtk4::Align::Center);
+
+    let player_clone = player.clone();
+    let dialog_weak = dialog.downgrade();
+    let cookie_row_clone = cookie_row.clone();
+    let on_success = std::rc::Rc::new(on_success);
+
+    login_btn.connect_clicked(move |_| {
+        let cookie_text = cookie_row_clone.text().to_string();
+        let cookie_trimmed = cookie_text.trim();
+        if !cookie_trimmed.is_empty() {
+            if let Err(e) = crate::api::auth::save_ytmusic_cookie(cookie_trimmed) {
+                eprintln!("[ytmusic] Ошибка сохранения cookie: {e}");
+            }
+            let yt_client = crate::api::ytmusic::YtMusicClient::with_cookie(cookie_trimmed.to_string());
+            player_clone.providers.register(
+                std::sync::Arc::new(yt_client) as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+            );
+            on_success();
+            player_clone.emit(crate::player::PlayerUiEvent::StatusMessage(
+                "Успешный вход в YouTube Music! 🔴".to_string(),
+            ));
+            if player_clone.providers.active_id() == crate::api::provider::ProviderId::YouTubeMusic {
+                player_clone.emit(crate::player::PlayerUiEvent::ProviderChanged(
+                    crate::api::provider::ProviderId::YouTubeMusic,
+                ));
+            }
+            if let Some(d) = dialog_weak.upgrade() {
+                d.close();
+            }
+        }
+    });
+    action_row.add_suffix(&login_btn);
+    group.add(&action_row);
+
+    page.add(&group);
     dialog.add(&page);
     dialog.present(Some(parent));
 }

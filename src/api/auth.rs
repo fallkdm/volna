@@ -64,6 +64,18 @@ pub struct AppConfig {
     /// Свернут ли левый сайдбар (компактный режим)
     #[serde(default)]
     pub sidebar_collapsed: bool,
+    /// Активный музыкальный провайдер ("yandex" или "ytmusic")
+    #[serde(default)]
+    pub active_provider: Option<String>,
+    /// Google OAuth refresh token для YouTube Music
+    #[serde(default)]
+    pub ytmusic_refresh_token: Option<String>,
+    /// Browser Cookie для YouTube Music
+    #[serde(default)]
+    pub ytmusic_cookie: Option<String>,
+    /// История поиска YouTube Music
+    #[serde(default)]
+    pub ytmusic_history_items: Vec<serde_json::Value>,
 }
 
 impl Default for AppConfig {
@@ -79,12 +91,16 @@ impl Default for AppConfig {
             discord_client_id: None,
             station_id: None,
             history_items: Vec::new(),
+            ytmusic_history_items: Vec::new(),
             crossfade: false,
             crossfade_duration: 3,
             nav_style: None,
             player_layout: None,
             theme_accent: None,
             sidebar_collapsed: false,
+            active_provider: None,
+            ytmusic_refresh_token: None,
+            ytmusic_cookie: None,
         }
     }
 }
@@ -294,6 +310,65 @@ pub fn clear_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     save_config(&config)
 }
 
+/// Загружает сохраненного активного провайдера (по умолчанию ProviderId::Yandex)
+pub fn load_active_provider() -> crate::api::provider::ProviderId {
+    match load_config().ok().and_then(|c| c.active_provider).as_deref() {
+        Some("ytmusic") => crate::api::provider::ProviderId::YouTubeMusic,
+        _ => crate::api::provider::ProviderId::Yandex,
+    }
+}
+
+/// Сохраняет активного провайдера в конфигурацию
+pub fn save_active_provider(provider: crate::api::provider::ProviderId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    let val = match provider {
+        crate::api::provider::ProviderId::YouTubeMusic => "ytmusic",
+        _ => "yandex",
+    };
+    config.active_provider = Some(val.to_string());
+    save_config(&config)
+}
+
+/// Загружает refresh-токен YouTube Music или None
+pub fn load_ytmusic_refresh_token() -> Option<String> {
+    load_config().ok().and_then(|c| c.ytmusic_refresh_token).filter(|t| !t.trim().is_empty())
+}
+
+/// Сохраняет refresh-токен YouTube Music
+pub fn save_ytmusic_refresh_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let clean = token.trim();
+    let mut config = load_config().unwrap_or_default();
+    config.ytmusic_refresh_token = if clean.is_empty() { None } else { Some(clean.to_string()) };
+    save_config(&config)
+}
+
+/// Удаляет refresh-токен YouTube Music
+pub fn clear_ytmusic_refresh_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.ytmusic_refresh_token = None;
+    save_config(&config)
+}
+
+/// Загружает сохраненную куку YouTube Music или None
+pub fn load_ytmusic_cookie() -> Option<String> {
+    load_config().ok().and_then(|c| c.ytmusic_cookie).filter(|t| !t.trim().is_empty())
+}
+
+/// Сохраняет полную куку YouTube Music (включая LOGIN_INFO для привязки к аккаунту и каналу пользователя)
+pub fn save_ytmusic_cookie(cookie: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sanitized = crate::api::ytmusic::sanitize_cookie(cookie);
+    let mut config = load_config().unwrap_or_default();
+    config.ytmusic_cookie = if sanitized.is_empty() { None } else { Some(sanitized) };
+    save_config(&config)
+}
+
+/// Удаляет куку YouTube Music
+pub fn clear_ytmusic_cookie() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.ytmusic_cookie = None;
+    save_config(&config)
+}
+
 /// Извлекает чистый токен из произвольного ввода пользователя
 /// (например из URL https://music.yandex.ru/#access_token=y0_AgAAAA...&token_type=bearer)
 pub fn extract_token_from_input(raw: &str) -> String {
@@ -378,5 +453,30 @@ mod tests {
         let parsed_custom: AppConfig = serde_json::from_str(json_custom).unwrap();
         assert!(parsed_custom.crossfade);
         assert_eq!(parsed_custom.crossfade_duration, 5);
+    }
+
+    #[test]
+    fn test_provider_and_ytmusic_config() {
+        let json = r#"{"active_provider": "ytmusic", "ytmusic_refresh_token": "1//test_token"}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.active_provider.as_deref(), Some("ytmusic"));
+        assert_eq!(cfg.ytmusic_refresh_token.as_deref(), Some("1//test_token"));
+
+        let default_cfg = AppConfig::default();
+        assert_eq!(default_cfg.active_provider, None);
+        assert_eq!(default_cfg.ytmusic_refresh_token, None);
+    }
+
+    #[test]
+    fn test_ytmusic_cookie_config() {
+        let json = r#"{"ytmusic_cookie": "SAPISID=12345; __Secure-3PAPISID=67890"}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.ytmusic_cookie.as_deref(),
+            Some("SAPISID=12345; __Secure-3PAPISID=67890")
+        );
+
+        let default_cfg = AppConfig::default();
+        assert_eq!(default_cfg.ytmusic_cookie, None);
     }
 }

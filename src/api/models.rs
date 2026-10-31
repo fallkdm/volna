@@ -42,6 +42,8 @@ pub struct Album {
     pub year: Option<u32>,
     #[serde(rename = "coverUri")]
     pub cover_uri: Option<String>,
+    #[serde(rename = "ogImage", default)]
+    pub og_image: Option<String>,
     #[serde(default)]
     pub artists: Vec<Artist>,
     #[serde(rename = "trackCount")]
@@ -80,7 +82,7 @@ impl Artist {
 
 impl Album {
     pub fn cover_url(&self, size: u32) -> Option<String> {
-        self.cover_uri.as_deref().map(|u| cover_url(u, size))
+        self.cover_uri.as_ref().or(self.og_image.as_ref()).map(|u| cover_url(u, size))
     }
 
     /// Имена артистов через запятую
@@ -90,9 +92,26 @@ impl Album {
 }
 
 impl Playlist {
+    pub fn id(&self) -> &str {
+        if !self.kind.is_empty() {
+            &self.kind
+        } else {
+            &self.uid
+        }
+    }
+
     pub fn cover_url(&self, size: u32) -> Option<String> {
         self.og_image.as_deref().map(|u| cover_url(u, size))
     }
+}
+
+/// Источник трека (музыкальный сервис)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TrackSource {
+    #[default]
+    Yandex,
+    YouTubeMusic,
+    Vk,
 }
 
 /// Трек
@@ -119,6 +138,8 @@ pub struct Track {
     pub content_warning: Option<String>,
     #[serde(rename = "derivedColors")]
     pub derived_colors: Option<DerivedColors>,
+    #[serde(default)]
+    pub source: TrackSource,
 }
 
 /// Производные акцентные цвета трека из Яндекс Музыки
@@ -177,6 +198,15 @@ impl DerivedColors {
 }
 
 impl Track {
+    /// Бейдж сервиса-источника трека
+    pub fn source_badge(&self) -> &'static str {
+        match self.source {
+            TrackSource::Yandex => "🌊",
+            TrackSource::YouTubeMusic => "🔴",
+            TrackSource::Vk => "🔵",
+        }
+    }
+
     /// Название для Pango-разметки: версия («Slowed») идёт следом приглушённым цветом
     pub fn title_markup(&self) -> String {
         let t = gtk4::glib::markup_escape_text(&self.title);
@@ -206,15 +236,24 @@ impl Track {
 
     /// Формирует URL обложки с заданным размером (например, 200, 400)
     pub fn cover_url(&self, size: u32) -> Option<String> {
+        // Для треков YouTube Music c 11-символьным videoId i.ytimg.com отдается мгновенно и без сбоев
+        if self.source == TrackSource::YouTubeMusic && self.id.len() == 11 {
+            return Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", self.id));
+        }
         self.cover_uri.as_ref().or(self.og_image.as_ref()).map(|u| cover_url(u, size))
     }
 
-    /// Возвращает длительность в формате "MM:SS"
+    /// Возвращает длительность в формате "MM:SS" или пустую строку, если неизвестна
     pub fn formatted_duration(&self) -> String {
-        let total_secs = self.duration_ms.unwrap_or(0) / 1000;
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        format!("{:02}:{:02}", mins, secs)
+        match self.duration_ms {
+            None | Some(0) => String::new(),
+            Some(ms) => {
+                let total_secs = ms / 1000;
+                let mins = total_secs / 60;
+                let secs = total_secs % 60;
+                format!("{:02}:{:02}", mins, secs)
+            }
+        }
     }
 
     /// Основной акцентный цвет шейдера Волны
@@ -599,6 +638,11 @@ mod tests {
         assert_eq!(track.title, "Спокойная ночь");
         assert_eq!(track.artists_string(), "Кино");
         assert_eq!(track.formatted_duration(), "06:07");
+        let mut track_no_dur = track.clone();
+        track_no_dur.duration_ms = None;
+        assert_eq!(track_no_dur.formatted_duration(), "");
+        track_no_dur.duration_ms = Some(0);
+        assert_eq!(track_no_dur.formatted_duration(), "");
         assert_eq!(
             track.cover_url(400),
             Some("https://avatars.yandex.net/get-music-content/12345/400x400".to_string())
@@ -671,5 +715,26 @@ mod tests {
             serde_json::from_str(r#"{"result":{"albums":{"results":[]},"albums":{"results":[]}}}"#).unwrap();
         let r: YandexApiResponse<SearchResult> = serde_json::from_value(v).unwrap();
         assert!(r.result.albums.is_some());
+    }
+
+    #[test]
+    fn test_playlist_id_helper() {
+        let pl_kind = Playlist {
+            uid: "user123".into(),
+            kind: "VLPL123".into(),
+            title: "Test".into(),
+            track_count: None,
+            og_image: None,
+        };
+        assert_eq!(pl_kind.id(), "VLPL123");
+
+        let pl_uid = Playlist {
+            uid: "PL456".into(),
+            kind: "".into(),
+            title: "Test".into(),
+            track_count: None,
+            og_image: None,
+        };
+        assert_eq!(pl_uid.id(), "PL456");
     }
 }

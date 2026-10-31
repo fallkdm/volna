@@ -3,6 +3,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use md5::{Digest, Md5};
 
+pub mod cover_resolver;
+pub use cover_resolver::{resolve_artist_avatar, resolve_studio_cover};
+
 /// Возвращает путь к директории кэша обложек (~/.cache/volna/covers/)
 pub fn covers_cache_dir() -> PathBuf {
     let base = std::env::var("XDG_CACHE_HOME")
@@ -226,6 +229,78 @@ fn safe_id(id: &str) -> String {
     id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
 }
 
+/// Папка дискового кэша потокового аудио (~/.cache/volna/audio/)
+pub fn audio_cache_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".cache")
+        });
+    let dir = base.join("volna").join("audio");
+    let _ = create_dir_all(&dir);
+    dir
+}
+
+/// Проверяет наличие файлов mp3, opus или m4a в кэше размером > 128 КБ
+pub fn cached_audio_path(track_id: &str) -> Option<PathBuf> {
+    let dir = audio_cache_dir();
+    let s_id = safe_id(track_id);
+    for ext in ["mp3", "opus", "m4a"] {
+        let p = dir.join(format!("{}.{}", s_id, ext));
+        if let Ok(meta) = p.metadata() {
+            if meta.is_file() && meta.len() > 128 * 1024 {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// Временный путь для сохранения скачиваемого трека
+pub fn temp_audio_cache_path(track_id: &str, ext: &str) -> PathBuf {
+    audio_cache_dir().join(format!("{}.{}.part", safe_id(track_id), ext))
+}
+
+/// Финальный путь сохранённого в кэше трека
+pub fn final_audio_cache_path(track_id: &str, ext: &str) -> PathBuf {
+    audio_cache_dir().join(format!("{}.{}", safe_id(track_id), ext))
+}
+
+/// Удаляет старые файлы кэша аудио по алгоритму LRU, пока общий размер не станет <= 75% от max_bytes
+pub fn clean_audio_cache_lru(max_bytes: u64) {
+    let dir = audio_cache_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                let size = meta.len();
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                total_bytes = total_bytes.saturating_add(size);
+                files.push((mtime, size, entry.path()));
+            }
+        }
+    }
+
+    if total_bytes > max_bytes {
+        files.sort_by_key(|&(mtime, _, _)| mtime);
+        let target_bytes = (max_bytes * 3) / 4;
+        for (_, size, path) in files {
+            if total_bytes <= target_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(size);
+            }
+        }
+    }
+}
+
 /// Путь к сохранённому mp3, если трек есть офлайн
 pub fn offline_audio_path(track_id: &str) -> Option<PathBuf> {
     let p = offline_dir().join(format!("{}.mp3", safe_id(track_id)));
@@ -327,3 +402,41 @@ mod session_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+
+#[cfg(test)]
+mod audio_cache_tests {
+    use super::*;
+
+    #[test]
+    fn test_audio_cache_paths_and_clean() {
+        let _dir = audio_cache_dir();
+        let track_id = "test_audio_track_999";
+        let final_path = final_audio_cache_path(track_id, "mp3");
+        let temp_path = temp_audio_cache_path(track_id, "mp3");
+        assert!(temp_path.to_string_lossy().ends_with(".part"));
+        assert!(final_path.to_string_lossy().ends_with(".mp3"));
+
+        // Удалим перед тестом если остался
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::remove_file(&temp_path);
+
+        assert!(cached_audio_path(track_id).is_none());
+
+        // Файл слишком маленький (меньше 128 КБ) -> cached_audio_path должен вернуть None
+        let small_data = vec![0u8; 100 * 1024];
+        std::fs::write(&final_path, &small_data).unwrap();
+        assert!(cached_audio_path(track_id).is_none());
+
+        // Файл больше 128 КБ -> Some(path)
+        let valid_data = vec![0u8; 150 * 1024];
+        std::fs::write(&final_path, &valid_data).unwrap();
+        assert_eq!(cached_audio_path(track_id), Some(final_path.clone()));
+
+        // Проверим clean_audio_cache_lru
+        clean_audio_cache_lru(100 * 1024); // лимит 100 КБ, наш файл 150 КБ -> должен очиститься
+        assert!(cached_audio_path(track_id).is_none());
+
+        let _ = std::fs::remove_file(&final_path);
+    }
+}
+

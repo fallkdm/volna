@@ -668,7 +668,23 @@ fn palette_from_pixels(px: &[[f64; 3]]) -> Option<([f64; 3], [f64; 3], [f64; 3])
         total += w;
     }
     if total < 0.03 * px.len() as f64 {
-        return None;
+        // Обложка монохромная / чёрно-белая / серая (например, Deftones, метал- и нуар-альбомы):
+        // формируем стильную серебристо-лунную палитру вместо отката к оранжевому цвету
+        let mut sum_luma = 0.0;
+        let mut count = 0.0;
+        for &[r, g, b] in px {
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if luma > 0.05 {
+                sum_luma += luma;
+                count += 1.0;
+            }
+        }
+        let avg_luma = if count > 0.0 { sum_luma / count } else { 0.5 };
+        let brightness = avg_luma.clamp(0.75, 0.92);
+        let core = [brightness * 0.95, brightness * 0.97, brightness];
+        let deep = [0.08, 0.08, 0.10];
+        let ridge = [0.95, 0.96, 0.98];
+        return Some((core, deep, ridge));
     }
     // лучший оттенок вместе с соседями по кругу, чтобы граница корзин не рвала цвет
     let score = |i: usize| bins[(i + BINS - 1) % BINS].0 + bins[i].0 + bins[(i + 1) % BINS].0;
@@ -704,7 +720,30 @@ mod palette_tests {
     }
 
     #[test]
-    fn gray_cover_keeps_yandex_colors() {
-        assert!(palette_from_pixels(&vec![[0.5, 0.5, 0.52]; 500]).is_none());
+    fn gray_cover_gives_monochrome_palette() {
+        let res = palette_from_pixels(&vec![[0.5, 0.5, 0.52]; 500]);
+        assert!(res.is_some());
+        let (core, _, _) = res.unwrap();
+        assert!((core[0] - core[1]).abs() < 0.05);
+    }
+
+    #[test]
+    fn deftones_genesis_cover_palette() {
+        let path = "/home/philk/.cache/volna/covers/5ca90a57e9dec30920696c3740ffc9dd.jpg";
+        if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, 48, 48, false) {
+            let (n, stride) = (pixbuf.n_channels() as usize, pixbuf.rowstride() as usize);
+            let bytes = pixbuf.read_pixel_bytes();
+            let mut px = Vec::with_capacity(48 * 48);
+            for y in 0..pixbuf.height() as usize {
+                for x in 0..pixbuf.width() as usize {
+                    let i = y * stride + x * n;
+                    if let Some(p) = bytes.get(i..i + 3) {
+                        px.push([p[0] as f64 / 255.0, p[1] as f64 / 255.0, p[2] as f64 / 255.0]);
+                    }
+                }
+            }
+            let res = palette_from_pixels(&px);
+            assert!(res.is_some());
+        }
     }
 }

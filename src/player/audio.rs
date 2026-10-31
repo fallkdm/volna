@@ -1,7 +1,7 @@
 use gstreamer::prelude::*;
 use gstreamer_play::{Play, PlaySignalAdapter};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // spectrum: nfft = 2*bands-2 = 1024 → ~43 Гц на полосу при 44.1 кГц, окно ~23 мс
@@ -116,6 +116,8 @@ struct PlayerSlot {
     _adapter: PlaySignalAdapter,
     is_playing: Arc<Mutex<bool>>,
     bass: BassQueue,
+    pub current_uri: Arc<Mutex<Option<String>>>,
+    pub is_prerolled: Arc<AtomicBool>,
 }
 
 impl PlayerSlot {
@@ -139,8 +141,36 @@ impl PlayerSlot {
 
         let pipeline = play.pipeline();
         if pipeline.find_property("flags").is_some() {
-            pipeline.set_property_from_str("flags", "audio+soft-volume+download");
+            pipeline.set_property_from_str("flags", "audio+soft-volume+buffering");
         }
+        use gtk4::glib::prelude::ObjectExt;
+        if pipeline.has_property("buffer-duration") {
+            let _ = pipeline.set_property("buffer-duration", (5 * 1_000_000_000u64) as i64);
+        }
+        if pipeline.has_property("buffer-size") {
+            let _ = pipeline.set_property("buffer-size", (4 * 1024 * 1024) as i32);
+        }
+
+        pipeline.connect("source-setup", false, |values| {
+            if let Some(source) = values.get(1).and_then(|v| v.get::<gstreamer::Element>().ok()) {
+                if source.has_property("user-agent") {
+                    let _ = source.set_property(
+                        "user-agent",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+                    );
+                }
+                if source.has_property("iradio-mode") {
+                    let _ = source.set_property("iradio-mode", false);
+                }
+                if source.has_property("keep-alive") {
+                    let _ = source.set_property("keep-alive", true);
+                }
+                if source.has_property("blocksize") {
+                    let _ = source.set_property("blocksize", 65536u32);
+                }
+            }
+            None
+        });
 
         let bass = BassQueue::default();
         if let Err(e) = attach_bass_analyzer(&play.pipeline(), bass.clone()) {
@@ -148,12 +178,16 @@ impl PlayerSlot {
         }
 
         let is_playing = Arc::new(Mutex::new(false));
+        let current_uri = Arc::new(Mutex::new(None));
+        let is_prerolled = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             play,
             _adapter: adapter,
             is_playing,
             bass,
+            current_uri,
+            is_prerolled,
         })
     }
 }
@@ -226,23 +260,75 @@ impl AudioBackend {
         }
     }
 
+    /// Предварительно подготавливает и буферизует следующий трек в неактивный слот GStreamer (Prebuffering / Preroll).
+    /// Поток подключается по сети, заполняет внутренний буфер и декодирует начало в состоянии PAUSED с нулевой громкостью.
+    pub fn preroll_next_url(&self, url: &str) {
+        let inactive_idx = 1 - (self.active_slot.load(Ordering::SeqCst) % 2);
+        let slot = &self.slots[inactive_idx];
+
+        // Если в слоте уже подготовлен именно этот URL — повторно не переинициализируем
+        if let Ok(cur) = slot.current_uri.lock() {
+            if cur.as_deref() == Some(url) && slot.is_prerolled.load(Ordering::SeqCst) {
+                return;
+            }
+        }
+
+        slot.play.stop();
+        slot.play.set_volume(0.0);
+        slot.play.set_uri(Some(url));
+        slot.play.pause(); // Начинает сетевую буферизацию до 100% без воспроизведения звука
+        slot.is_prerolled.store(true, Ordering::SeqCst);
+        if let Ok(mut cur) = slot.current_uri.lock() {
+            *cur = Some(url.to_string());
+        }
+        eprintln!("[audio] Аппаратная предбуферизация следующего трека в слот {}: {}", inactive_idx, url);
+    }
+
     /// Загружает и начинает воспроизведение трека по прямой ссылке в текущий слот (без кроссфейда)
     pub fn play_url(&self, url: &str) {
         eprintln!("[audio] play_url {}", url.chars().take(90).collect::<String>());
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
         let curr_idx = self.active_slot.load(Ordering::SeqCst) % 2;
-        let other_idx = 1 - curr_idx;
+        let inactive_idx = 1 - curr_idx;
 
-        self.slots[other_idx].play.stop();
-        if let Ok(mut lock) = self.slots[other_idx].is_playing.lock() {
+        let slot = &self.slots[inactive_idx];
+        let is_match = {
+            let cur_match = slot.current_uri.lock().map(|cur| cur.as_deref() == Some(url)).unwrap_or(false);
+            cur_match && slot.is_prerolled.load(Ordering::SeqCst)
+        };
+
+        if is_match {
+            let old_idx = self.active_slot.swap(inactive_idx, Ordering::SeqCst);
+            self.slots[old_idx].play.stop();
+            self.slots[old_idx].is_prerolled.store(false, Ordering::SeqCst);
+            if let Ok(mut lock) = self.slots[old_idx].is_playing.lock() {
+                *lock = false;
+            }
+            let vol = *self.user_volume.lock().unwrap();
+            self.slots[inactive_idx].play.set_volume(vol);
+            self.slots[inactive_idx].play.play();
+            if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
+                *lock = true;
+            }
+            eprintln!("[audio] Мгновенный 0-мс старт предбуферизованного слота {}", inactive_idx);
+            return;
+        }
+
+        self.slots[inactive_idx].play.stop();
+        slot.is_prerolled.store(false, Ordering::SeqCst);
+        if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
             *lock = false;
         }
 
-        let user_vol = self.user_volume();
         let current = &self.slots[curr_idx];
-        current.play.set_volume(user_vol);
+        current.is_prerolled.store(false, Ordering::SeqCst);
+        let vol = *self.user_volume.lock().unwrap();
+        current.play.set_volume(vol);
         current.play.set_uri(Some(url));
         current.play.play();
+        if let Ok(mut cur) = current.current_uri.lock() {
+            *cur = Some(url.to_string());
+        }
         if let Ok(mut lock) = current.is_playing.lock() {
             *lock = true;
         }
@@ -253,17 +339,46 @@ impl AudioBackend {
         eprintln!("[audio] play_url_fade_in ({} ms) {}", duration_ms, url.chars().take(90).collect::<String>());
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
         let curr_idx = self.active_slot.load(Ordering::SeqCst) % 2;
-        let other_idx = 1 - curr_idx;
+        let inactive_idx = 1 - curr_idx;
 
-        self.slots[other_idx].play.stop();
-        if let Ok(mut lock) = self.slots[other_idx].is_playing.lock() {
+        let slot = &self.slots[inactive_idx];
+        let is_match = {
+            let cur_match = slot.current_uri.lock().map(|cur| cur.as_deref() == Some(url)).unwrap_or(false);
+            cur_match && slot.is_prerolled.load(Ordering::SeqCst)
+        };
+
+        if is_match {
+            let old_idx = self.active_slot.swap(inactive_idx, Ordering::SeqCst);
+            self.slots[old_idx].play.stop();
+            self.slots[old_idx].is_prerolled.store(false, Ordering::SeqCst);
+            if let Ok(mut lock) = self.slots[old_idx].is_playing.lock() {
+                *lock = false;
+            }
+            self.slots[inactive_idx].is_prerolled.store(false, Ordering::SeqCst);
+            self.slots[inactive_idx].play.set_volume(0.0);
+            self.slots[inactive_idx].play.play();
+            if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
+                *lock = true;
+            }
+            eprintln!("[audio] Мгновенный 0-мс старт предбуферизованного слота {} с fade-in", inactive_idx);
+            self.fade_in(duration_ms);
+            return;
+        }
+
+        self.slots[inactive_idx].play.stop();
+        slot.is_prerolled.store(false, Ordering::SeqCst);
+        if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
             *lock = false;
         }
 
         let current = &self.slots[curr_idx];
+        current.is_prerolled.store(false, Ordering::SeqCst);
         current.play.set_volume(0.0);
         current.play.set_uri(Some(url));
         current.play.play();
+        if let Ok(mut cur) = current.current_uri.lock() {
+            *cur = Some(url.to_string());
+        }
         if let Ok(mut lock) = current.is_playing.lock() {
             *lock = true;
         }
@@ -287,10 +402,24 @@ impl AudioBackend {
         let current_slot = &self.slots[current_idx];
         let next_slot = &self.slots[next_idx];
 
-        // Подготавливаем следующий слот с нулевой громкостью и запускаем воспроизведение
-        next_slot.play.set_volume(0.0);
-        next_slot.play.set_uri(Some(url));
-        next_slot.play.play();
+        let is_already_prerolled = {
+            let cur_match = next_slot.current_uri.lock().map(|cur| cur.as_deref() == Some(url)).unwrap_or(false);
+            cur_match && next_slot.is_prerolled.load(Ordering::SeqCst)
+        };
+
+        if is_already_prerolled {
+            eprintln!("[audio] мгновенный старт предзагруженного трека из слота {} (0 мс задержки)!", next_idx);
+            next_slot.play.set_volume(0.0);
+            next_slot.play.play();
+        } else {
+            next_slot.play.set_volume(0.0);
+            next_slot.play.set_uri(Some(url));
+            next_slot.play.play();
+            if let Ok(mut cur) = next_slot.current_uri.lock() {
+                *cur = Some(url.to_string());
+            }
+        }
+        next_slot.is_prerolled.store(false, Ordering::SeqCst);
         if let Ok(mut lock) = next_slot.is_playing.lock() {
             *lock = true;
         }
@@ -384,6 +513,10 @@ impl AudioBackend {
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
         for slot in &self.slots {
             slot.play.stop();
+            slot.is_prerolled.store(false, Ordering::SeqCst);
+            if let Ok(mut cur) = slot.current_uri.lock() {
+                *cur = None;
+            }
             if let Ok(mut lock) = slot.is_playing.lock() {
                 *lock = false;
             }
@@ -503,6 +636,11 @@ impl AudioBackend {
     /// Полная длительность трека активного слота в секундах
     pub fn duration_seconds(&self) -> Option<u64> {
         self.active().play.duration().map(|t| t.seconds())
+    }
+
+    /// Полная длительность трека активного слота в миллисекундах
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.active().play.duration().map(|t| t.mseconds())
     }
 
     /// Плавная интерполяция громкости через короткие шаги (25 мс) в фоновом потоке Tokio

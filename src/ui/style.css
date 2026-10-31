@@ -368,6 +368,9 @@ scale.volume-vertical slider {
     transform: scale(0.7);
     transition: color 250ms ease, transform 250ms ease;
 }
+.karaoke-line:hover {
+    color: rgba(255, 255, 255, 0.75);
+}
 .karaoke-line.active {
     color: #ffffff;
     transform: scale(1);
@@ -719,7 +722,9 @@ button.sidebar-collapse-btn:hover {
 /* Кнопки сайдбара: единый плоский стиль со слотом 44x40 */
 button.sidebar-nav-btn,
 button.sidebar-profile-btn,
-button.sidebar-settings-btn {
+button.sidebar-settings-btn,
+button.sidebar-source-btn,
+menubutton.sidebar-source-btn > button {
     border-radius: 8px;
     padding: 0;
     margin: 2px 0;
@@ -735,7 +740,9 @@ button.sidebar-settings-btn {
 
 button.sidebar-nav-btn:hover,
 button.sidebar-profile-btn:hover,
-button.sidebar-settings-btn:hover {
+button.sidebar-settings-btn:hover,
+button.sidebar-source-btn:hover,
+menubutton.sidebar-source-btn > button:hover {
     background-color: rgba(255, 255, 255, 0.08);
     color: #ffffff;
     border: none;
@@ -793,6 +800,19 @@ button.sidebar-nav-btn.active .sidebar-nav-icon {
 
 .sidebar-profile-btn.logged-in {
     color: #e0e0e0;
+}
+
+.sidebar-profile-btn.login-required {
+    color: #ff5252;
+}
+
+button.sidebar-profile-btn.login-required:hover {
+    background-color: rgba(255, 82, 82, 0.15);
+    color: #ff6e6e;
+}
+
+button.header-auth-btn.login-required {
+    color: #ff5252;
 }
 
 /* Явное отключение фокусных рамок и обводок кнопок сайдбара */

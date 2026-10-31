@@ -31,3 +31,5 @@ mdns-sd = "0.21.5"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 discord-rich-presence = "1.1.0"
+async-trait = "0.1"
+sha1 = "0.10"

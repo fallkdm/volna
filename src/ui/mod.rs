@@ -10,6 +10,7 @@ pub mod wave_view;
 pub mod window;
 
 pub use auth_dialog::show_auth_dialog;
+pub use preferences_dialog::show_ytmusic_auth_dialog;
 pub use window::VolnaWindow;
 
 /// Загружает встроенные CSS стили приложения

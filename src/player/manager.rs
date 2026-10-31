@@ -3,8 +3,12 @@ use std::sync::{Arc, Mutex};
 use async_channel::Sender;
 
 use crate::api::client::YandexMusicClient;
-use crate::api::models::{Album, Playlist, Track};
+use crate::api::models::{Album, Playlist, Track, TrackSource};
+use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId};
+use crate::api::provider_manager::ProviderManager;
+use crate::api::ytmusic::YtMusicClient;
 use super::audio::AudioBackend;
+use super::wave_engine::WaveEngine;
 
 /// Режим повтора: нет, один трек, вся очередь (для Волны «вся очередь» недоступна)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -94,6 +98,8 @@ pub enum PlayerUiEvent {
     PlayerLayoutChanged(String),
     /// Изменился цветовой акцент: "dynamic", "spotify", "ruby", "sunset", "violet", "ocean", "monochrome"
     ThemeAccentChanged(String),
+    /// Изменился активный музыкальный провайдер
+    ProviderChanged(crate::api::provider::ProviderId),
 }
 
 /// Состояние очереди и воспроизведения
@@ -214,7 +220,10 @@ const PREFETCH_TTL: std::time::Duration = std::time::Duration::from_secs(90);
 pub struct PlayerManager {
     pub audio: Arc<AudioBackend>,
     pub client: Arc<Mutex<YandexMusicClient>>,
+    pub providers: Arc<ProviderManager>,
+    pub yt_client: Arc<YtMusicClient>,
     pub state: Arc<Mutex<PlayerState>>,
+    pub wave_engine: Arc<Mutex<WaveEngine>>,
     pub event_senders: Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
     /// Ссылка на следующий трек очереди, полученная заранее (один слот)
     prefetch: Arc<Mutex<Option<Prefetched>>>,
@@ -233,15 +242,35 @@ impl PlayerManager {
         event_senders: Vec<Sender<PlayerUiEvent>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let audio = Arc::new(AudioBackend::new()?);
-        let client = Arc::new(Mutex::new(client));
+        let client_mutex = Arc::new(Mutex::new(client.clone()));
         let state = Arc::new(Mutex::new(PlayerState::default()));
+        let wave_engine = Arc::new(Mutex::new(WaveEngine::new()));
         let (cf_enabled, cf_dur) = crate::api::auth::load_crossfade();
         let crossfade = Arc::new(Mutex::new((cf_enabled, cf_dur)));
 
+        let yt_client = if let Some(cookie) = crate::api::auth::load_ytmusic_cookie() {
+            YtMusicClient::with_cookie(cookie)
+        } else if let Some(token) = crate::api::auth::load_ytmusic_refresh_token() {
+            YtMusicClient::with_refresh_token(token)
+        } else {
+            YtMusicClient::new()
+        };
+        let yt_client_arc = Arc::new(yt_client.clone());
+
+        let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = Arc::new(yt_client) as Arc<dyn MusicProvider>;
+        let provider_manager = ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+        let active_provider = crate::api::auth::load_active_provider();
+        provider_manager.switch_provider(active_provider);
+        let providers = Arc::new(provider_manager);
+
         let manager = Self {
             audio,
-            client,
+            client: client_mutex,
+            providers,
+            yt_client: yt_client_arc,
             state,
+            wave_engine,
             event_senders: Arc::new(Mutex::new(event_senders)),
             cast: Arc::default(),
             prefetch: Arc::default(),
@@ -402,6 +431,21 @@ impl PlayerManager {
         emit_all(&self.event_senders, event);
     }
 
+    /// Переключает активного музыкального провайдера
+    pub fn switch_provider(&self, id: ProviderId) {
+        if self.providers.switch_provider(id) {
+            let _ = crate::api::auth::save_active_provider(id);
+            if let Ok(mut state) = self.state.lock() {
+                state.liked_loaded = false;
+            }
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.ensure_liked_loaded().await;
+            });
+            self.emit(PlayerUiEvent::ProviderChanged(id));
+        }
+    }
+
     /// Проверяет, был ли загружен список лайков
     pub fn is_liked_loaded(&self) -> bool {
         self.state.lock().map(|s| s.liked_loaded).unwrap_or(false)
@@ -413,6 +457,26 @@ impl PlayerManager {
         if self.is_liked_loaded() {
             return;
         }
+
+        // Если активен YouTube Music: загружаем понравившиеся треки из YouTube Music
+        let provider = self.providers.current();
+        if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
+            if let Ok(tracks) = provider.get_liked_tracks().await {
+                let ids: Vec<String> = tracks.into_iter().map(|t| t.id).filter(|id| !id.is_empty()).collect();
+                let current_liked = {
+                    let mut state = self.state.lock().unwrap();
+                    state.liked_loaded = true;
+                    state.merge_server_likes(ids);
+                    let track_id = state.current_track.as_ref().map(|t| t.id.clone());
+                    track_id.map(|id| state.sync_track_like_status(&id))
+                };
+                if let Some(liked) = current_liked {
+                    self.emit(PlayerUiEvent::LikeStateChanged(liked));
+                }
+                return;
+            }
+        }
+
         let client = self.client.lock().unwrap().clone();
         if !client.has_token() {
             return;
@@ -476,7 +540,15 @@ impl PlayerManager {
                     }
                 }
             } else {
-                emit_all(&senders, PlayerUiEvent::AuthRequired);
+                let provider = me.providers.current();
+                if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
+                    emit_all(&senders, PlayerUiEvent::StatusMessage(
+                        "Подключен Google (YouTube Music) 🔴".to_string(),
+                    ));
+                    me.ensure_liked_loaded().await;
+                } else {
+                    emit_all(&senders, PlayerUiEvent::AuthRequired);
+                }
             }
         });
     }
@@ -589,6 +661,23 @@ impl PlayerManager {
 
     /// Запускает или переключает воспроизведение (Play/Pause)
     pub fn toggle_play(&self) {
+        if !self.is_playing() && self.providers.active_id() == ProviderId::YouTubeMusic {
+            let is_yandex_track = {
+                let state = self.state.lock().unwrap();
+                state.current_track.as_ref()
+                    .or_else(|| state.queue.get(state.current_index))
+                    .map(|t| t.source == TrackSource::Yandex)
+                    .unwrap_or(false)
+            };
+            if is_yandex_track && !self.client.lock().unwrap().has_token() {
+                if let Ok(mut state) = self.state.lock() {
+                    state.restored = false;
+                }
+                self.start_station("user:onyourwave".to_string(), None, "Моя Волна".to_string());
+                return;
+            }
+        }
+
         if self.resume_restored() {
             return;
         }
@@ -598,17 +687,32 @@ impl PlayerManager {
         };
 
         if !has_tracks {
-            let has_token = self.client.lock().unwrap().has_token();
-            if !has_token {
-                self.emit(PlayerUiEvent::AuthRequired);
-                self.emit(PlayerUiEvent::StatusMessage(
-                    "Для запуска Волны выполните вход через Яндекс ID".to_string(),
-                ));
+            let provider = self.providers.current();
+            let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+            if is_yt {
+                if !provider.is_authenticated() {
+                    self.emit(PlayerUiEvent::StatusMessage(
+                        "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
+                    ));
+                } else {
+                    self.emit(PlayerUiEvent::StatusMessage(
+                        "Загружаем персональную Волну... 🔴".to_string(),
+                    ));
+                    self.fetch_wave_tracks("onyourwave");
+                }
             } else {
-                self.emit(PlayerUiEvent::StatusMessage(
-                    "Загружаем персональную Волну... 🌊".to_string(),
-                ));
-                self.fetch_wave_tracks("onyourwave");
+                let has_token = self.client.lock().unwrap().has_token();
+                if !has_token {
+                    self.emit(PlayerUiEvent::AuthRequired);
+                    self.emit(PlayerUiEvent::StatusMessage(
+                        "Для запуска Волны выполните вход через Яндекс ID".to_string(),
+                    ));
+                } else {
+                    self.emit(PlayerUiEvent::StatusMessage(
+                        "Загружаем персональную Волну... 🌊".to_string(),
+                    ));
+                    self.fetch_wave_tracks("onyourwave");
+                }
             }
             return;
         }
@@ -740,9 +844,12 @@ impl PlayerManager {
             (track, idx, state.queue.len(), is_liked)
         };
 
-        // Если в очереди осталось менее 2 треков, подгружаем следующую пачку станции Ротора
+        // Если очередь подходит к концу (осталось <= 3 треков) и включен режим волны,
+        // автоматически в фоне запрашиваем следующую порцию радио
         let remaining = total.saturating_sub(idx + 1);
-        if remaining < 2 {
+        let is_wave = self.state.lock().unwrap().wave;
+        let refill_needed = self.wave_engine.lock().unwrap().refill_needed(total, idx);
+        if is_wave && (remaining <= 3 || refill_needed) {
             self.load_more_wave_tracks();
         }
 
@@ -755,18 +862,100 @@ impl PlayerManager {
         });
 
         self.play_track_stream(&next_track);
+        self.prefetch_next_track();
+    }
+
+    /// Предварительно подготавливает и буферизует следующий трек очереди (на диске и аппаратно в GStreamer)
+    pub fn prefetch_next_track(&self) {
+        let next = {
+            let state = self.state.lock().unwrap();
+            state.queue.get(state.current_index + 1).cloned()
+        };
+        let Some(next) = next else { return };
+
+        if let Some(path) = crate::cache::offline_audio_path(&next.id).or_else(|| crate::cache::cached_audio_path(&next.id)) {
+            let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
+            self.audio.preroll_next_url(&uri);
+            eprintln!("[prefetch] «{}» уже на диске, preroll локального файла: {}", next.title, uri);
+            return;
+        }
+
+        let prefetch_arc = self.prefetch.clone();
+        let audio = self.audio.clone();
+        let client = self.client.lock().unwrap().clone();
+        let providers = self.providers.clone();
+        let is_yt = next.source == TrackSource::YouTubeMusic;
+        let track_id = next.id.clone();
+        let track_title = next.title.clone();
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let stream_res: Result<(String, String), String> = if is_yt {
+                if let Some(yt) = providers.get(ProviderId::YouTubeMusic) {
+                    yt.get_stream_url(&track_id).await.map(|u| (u, "Opus 160".to_string())).map_err(|e| e.to_string())
+                } else {
+                    Err("YouTube Music недоступен".to_string())
+                }
+            } else {
+                client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
+            };
+
+            let (stream_url, label) = match stream_res {
+                Ok((url, lbl)) => (url, lbl),
+                Err(e) => {
+                    eprintln!("[prefetch] Ошибка получения URL для «{}»: {}", track_title, e);
+                    return;
+                }
+            };
+
+            eprintln!("[prefetch] Ссылка для «{}» получена за {} мс", track_title, started.elapsed().as_millis());
+            *prefetch_arc.lock().unwrap() = Some(Prefetched {
+                track_id: track_id.clone(),
+                url: stream_url.clone(),
+                label,
+                at: std::time::Instant::now(),
+            });
+
+            audio.preroll_next_url(&stream_url);
+
+            let ext = if is_yt { "opus" } else { "mp3" };
+            if let Some(path) = download_audio_to_cache(&stream_url, &track_id, ext).await {
+                let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
+                audio.preroll_next_url(&local_uri);
+                eprintln!("[prefetch] «{}» скачан на диск и переведен в локальный preroll: {}", track_title, local_uri);
+            }
+        });
+    }
+
+    /// Добавляет треки в очередь с фильтрацией через алгоритмический движок волны
+    pub fn append_to_queue(&self, tracks: Vec<Track>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let filtered = self.wave_engine.lock().unwrap().filter_candidates(tracks);
+        let updated_queue = {
+            let mut state = self.state.lock().unwrap();
+            let new_tracks = dedup_tracks(&state.queue, filtered);
+            state.queue.extend(new_tracks);
+            state.queue.clone()
+        };
+        self.emit(PlayerUiEvent::QueueUpdated(updated_queue));
+        self.prefetch_next_track();
     }
 
     /// Подгружает следующую порцию треков Волны и добавляет в хвост очереди
     pub fn load_more_wave_tracks(&self) {
         let client_clone = self.client.clone();
+        let providers_clone = self.providers.clone();
         let state_clone = self.state.clone();
+        let wave_engine_clone = self.wave_engine.clone();
         let senders = self.event_senders.clone();
 
-        let (station_id, mood, language, character) = {
+        let (station_id, batch_id, mood, language, character) = {
             let state = self.state.lock().unwrap();
             (
                 state.station_id.clone(),
+                state.batch_id.clone(),
                 state.current_mood.clone(),
                 state.current_language.clone(),
                 state.current_character.clone(),
@@ -774,6 +963,28 @@ impl PlayerManager {
         };
 
         tokio::spawn(async move {
+            let provider = providers_clone.current();
+            if provider.provider_id() == ProviderId::YouTubeMusic {
+                if !provider.is_authenticated() {
+                    return;
+                }
+                if let Ok(station_batch) = provider.get_station_tracks(&station_id, batch_id.as_deref()).await {
+                    if station_batch.tracks.is_empty() {
+                        return;
+                    }
+                    let filtered = wave_engine_clone.lock().unwrap().filter_candidates(station_batch.tracks);
+                    let updated_queue = {
+                        let mut state = state_clone.lock().unwrap();
+                        state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
+                        let new_tracks = dedup_tracks(&state.queue, filtered);
+                        state.queue.extend(new_tracks);
+                        state.queue.clone()
+                    };
+                    emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                }
+                return;
+            }
+
             let client = client_clone.lock().unwrap().clone();
             if !client.has_token() {
                 return;
@@ -793,11 +1004,12 @@ impl PlayerManager {
                 if new_tracks.is_empty() {
                     return;
                 }
+                let filtered = wave_engine_clone.lock().unwrap().filter_candidates(new_tracks);
 
                 let updated_queue = {
                     let mut state = state_clone.lock().unwrap();
                     state.batch_id = station_tracks.batch_id;
-                    let new_tracks = dedup_tracks(&state.queue, new_tracks);
+                    let new_tracks = dedup_tracks(&state.queue, filtered);
                     state.queue.extend(new_tracks);
                     state.queue.clone()
                 };
@@ -862,7 +1074,19 @@ impl PlayerManager {
 
     /// Запускает станцию Ротора (`track:ID`, `artist:ID`). Если задан `first`, он играет сразу,
     /// а треки станции дописываются в очередь следом.
-    fn start_station(&self, station_id: String, first: Option<Track>, label: String) {
+    pub fn start_station(&self, station_id: String, first: Option<Track>, label: String) {
+        let provider = self.providers.current();
+        if provider.provider_id() == ProviderId::YouTubeMusic
+            && first.is_none()
+            && (station_id == "user:onyourwave" || station_id.contains("onyourwave"))
+            && !provider.is_authenticated()
+        {
+            self.emit(PlayerUiEvent::StatusMessage(
+                "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
+            ));
+            return;
+        }
+
         {
             let mut state = self.state.lock().unwrap();
             state.crossfade_triggered = false;
@@ -900,24 +1124,64 @@ impl PlayerManager {
 
         let me = self.clone();
         tokio::spawn(async move {
-            let client = me.client.lock().unwrap().clone();
-            if !client.has_token() {
-                me.emit(PlayerUiEvent::AuthRequired);
-                return;
+            let provider = me.providers.current();
+            let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+
+            let mut result: Result<(Vec<Track>, Option<String>), String> = if is_yt {
+                match provider.get_station_tracks(&station_id, None).await {
+                    Ok(batch) => {
+                        let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                        Ok((batch.tracks, b_id))
+                    }
+                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
+                }
+            } else {
+                let client = me.client.lock().unwrap().clone();
+                if !client.has_token() {
+                    me.emit(PlayerUiEvent::AuthRequired);
+                    return;
+                }
+                match client.get_station_tracks(&station_id).await {
+                    Ok(station) => {
+                        let tracks: Vec<Track> = station.sequence.into_iter().map(|s| s.track).collect();
+                        Ok((tracks, station.batch_id))
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+
+            // Фолбэк для YouTube Music, если треки не вернулись
+            if is_yt {
+                if let Ok((ref tr, _)) = result {
+                    if tr.is_empty() {
+                        if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
+                            if !batch.tracks.is_empty() {
+                                let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                                result = Ok((batch.tracks, b_id));
+                            }
+                        }
+                    }
+                }
             }
-            let result = client.get_station_tracks(&station_id).await;
+
             if first.is_none() {
                 me.emit(PlayerUiEvent::LoadingState(false));
             }
             match result {
-                Ok(station) => {
-                    let mut tracks: Vec<Track> = station.sequence.into_iter().map(|s| s.track).collect();
-                    tracks = dedup_tracks(&[], tracks);
+                Ok((tracks, batch_id)) => {
+                    let filtered = me.wave_engine.lock().unwrap().filter_candidates(tracks);
+                    let tracks = dedup_tracks(&[], filtered);
+                    if tracks.is_empty() && first.is_none() {
+                        me.emit(PlayerUiEvent::StatusMessage(
+                            "Не удалось загрузить треки для выбранной станции. Попробуйте другой фильтр или трек.".to_string(),
+                        ));
+                        return;
+                    }
                     // за время загрузки пользователь мог запустить другую станцию
                     if me.state.lock().unwrap().station_id != station_id {
                         return;
                     }
-                    me.state.lock().unwrap().batch_id = station.batch_id;
+                    me.state.lock().unwrap().batch_id = batch_id;
                     match &first {
                         Some(seed) => {
                             let queue = {
@@ -1017,6 +1281,11 @@ impl PlayerManager {
         self.audio.set_volume(volume);
     }
 
+    /// Получение текущей громкости
+    pub fn get_volume(&self) -> f64 {
+        self.audio.volume()
+    }
+
     /// Текущие настройки плавного перехода: (включен, длительность в секундах)
     pub fn crossfade_settings(&self) -> (bool, u32) {
         self.crossfade.lock().map(|c| *c).unwrap_or((false, 3))
@@ -1061,8 +1330,42 @@ impl PlayerManager {
         });
 
         let client = self.client.clone();
+        let providers_clone = self.providers.clone();
+        let yt_client_clone = self.yt_client.clone();
+        let track_source = track.source;
         let track_id = track.id.clone();
+        let track_title = track.title.clone();
+        let track_artists = track.artists_string();
+        let is_yt = track_source == TrackSource::YouTubeMusic
+            || track_id.len() == 11
+            || providers_clone.active_id() == ProviderId::YouTubeMusic;
+
         tokio::spawn(async move {
+            if is_yt {
+                let yt_video_id = if track_id.len() == 11 {
+                    Some(track_id.clone())
+                } else {
+                    let q = format!("{} {}", track_title, track_artists);
+                    match yt_client_clone.search_songs(&q).await {
+                        Ok(results) => results.into_iter().next().map(|t| t.id),
+                        Err(e) => {
+                            eprintln!("[ytmusic] Ошибка поиска трека для лайка «{q}»: {e}");
+                            None
+                        }
+                    }
+                };
+
+                if let Some(vid) = yt_video_id {
+                    if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
+                        match yt.set_track_like(&vid, liked).await {
+                            Ok(_) => println!("[ytmusic] Лайк ({liked}) для {vid} успешно отправлен в Google YouTube Music"),
+                            Err(e) => eprintln!("[ytmusic] Ошибка отправки лайка ({liked}) для {vid}: {e}"),
+                        }
+                    }
+                }
+                return;
+            }
+
             let client_guard = client.lock().unwrap().clone();
             if client_guard.has_token() {
                 let uid_res = match user_uid {
@@ -1129,13 +1432,54 @@ impl PlayerManager {
                     liked: false,
                 });
             }
-            self.emit(PlayerUiEvent::StatusMessage("Исключено из потока 👎".into()));
+            self.emit(PlayerUiEvent::StatusMessage("Исключено из рекомендаций 👎".into()));
         }
 
         if let Some(t) = track {
             let client = self.client.clone();
+            let providers_clone = self.providers.clone();
+            let yt_client_clone = self.yt_client.clone();
+            let track_source = t.source;
             let track_id = t.id.clone();
+            let track_title = t.title.clone();
+            let track_artists = t.artists_string();
+            let is_yt = track_source == TrackSource::YouTubeMusic
+                || track_id.len() == 11
+                || providers_clone.active_id() == ProviderId::YouTubeMusic;
+
             tokio::spawn(async move {
+                if is_yt {
+                    let yt_video_id = if track_id.len() == 11 {
+                        Some(track_id.clone())
+                    } else {
+                        let q = format!("{} {}", track_title, track_artists);
+                        match yt_client_clone.search_songs(&q).await {
+                            Ok(results) => results.into_iter().next().map(|t| t.id),
+                            Err(e) => {
+                                eprintln!("[ytmusic] Ошибка поиска трека для дизлайка «{q}»: {e}");
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(vid) = yt_video_id {
+                        if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
+                            if was_liked {
+                                let _ = yt.set_track_like(&vid, false).await;
+                            }
+                            if new_dislike {
+                                match yt.set_track_dislike(&vid).await {
+                                    Ok(_) => println!("[ytmusic] Дизлайк для {vid} успешно отправлен в Google YouTube Music"),
+                                    Err(e) => eprintln!("[ytmusic] Ошибка отправки дизлайка для {vid}: {e}"),
+                                }
+                            } else {
+                                let _ = yt.set_track_like(&vid, false).await;
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 let client_guard = client.lock().unwrap().clone();
                 if client_guard.has_token() {
                     if new_dislike {
@@ -1153,6 +1497,10 @@ impl PlayerManager {
                     }
                 }
             });
+
+            if new_dislike {
+                self.next_track();
+            }
         }
     }
 
@@ -1183,12 +1531,14 @@ impl PlayerManager {
         let senders = self.event_senders.clone();
         let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let stale_gen = self.generation.clone();
-        let is_stale = move || stale_gen.load(Ordering::SeqCst) != epoch;
+        let stale_check = stale_gen.clone();
+        let is_stale = move || stale_check.load(Ordering::SeqCst) != epoch;
         eprintln!("[play] #{} {} — {} ({})", epoch, track.title, track.artists_string(), track.id);
 
         let client = self.client.lock().unwrap().clone();
         spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
         crate::api::history::save_last_track(track);
+        self.wave_engine.lock().unwrap().record_played(&track.id);
         {
             let mut state = self.state.lock().unwrap();
             state.restored = false;
@@ -1206,11 +1556,16 @@ impl PlayerManager {
         let fade_ms = (crossfade_dur as u64) * 1000;
         let was_playing = self.audio.is_playing();
 
-        // сохранённый офлайн трек играет с диска: без сети и без токена
-        if let Some(path) = crate::cache::offline_audio_path(&track_id) {
-            let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(path));
+        // СНАЧАЛА проверяем локальный диск: офлайн или кэш (0 мс задержки)
+        let cached_opt = crate::cache::offline_audio_path(&track_id)
+            .map(|p| (p, true))
+            .or_else(|| crate::cache::cached_audio_path(&track_id).map(|p| (p, false)));
+
+        if let Some((path, is_offline)) = cached_opt {
+            let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
             emit_all(&senders, PlayerUiEvent::LoadingState(false));
-            emit_all(&senders, PlayerUiEvent::StreamQuality("Офлайн".to_string()));
+            let label = if is_offline { "Офлайн" } else { "Диск (0 мс)" };
+            emit_all(&senders, PlayerUiEvent::StreamQuality(label.to_string()));
 
             if crossfade {
                 if was_playing {
@@ -1229,30 +1584,49 @@ impl PlayerManager {
             }
 
             emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
+            self.prefetch_next_track();
             return;
         }
 
-        // следующий трек очереди: после старта этого его ссылку получим заранее
-        let next_track = {
-            let state = self.state.lock().unwrap();
-            state.queue.get(state.current_index + 1).cloned().filter(|t| t.id != track.id)
-        };
         let prefetch = self.prefetch.clone();
-        let prefetch_client = client.clone();
+        let providers_clone = self.providers.clone();
+        let yt_client_clone = self.yt_client.clone();
+        let track_source = track.source;
+        let track_title = track.title.clone();
+        let track_artists = track.artists_string();
+        let orig_duration = track.duration_ms;
         let state_arc = self.state.clone();
+        let mgr_clone = self.clone();
 
         self.emit(PlayerUiEvent::Progress { current_sec: 0, total_sec: track.duration_ms.unwrap_or(0) / 1000 });
+        self.prefetch_next_track();
 
         tokio::spawn(async move {
-            if client.has_token() {
+            let is_yt = track_source == TrackSource::YouTubeMusic;
+            let can_play = is_yt || client.has_token();
+
+            if can_play {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
                 let started = std::time::Instant::now();
                 // ссылка могла быть получена заранее, пока играл прежний трек
                 let ready = prefetch.lock().unwrap().take().filter(|p| p.track_id == track_id && p.at.elapsed() < PREFETCH_TTL);
                 let hit = ready.is_some();
-                let result = match ready {
+                let result: Result<(String, String), String> = match ready {
                     Some(p) => Ok((p.url, p.label)),
-                    None => client.get_track_direct_url(&track_id).await,
+                    None => {
+                        if is_yt {
+                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
+                                match yt.get_stream_url(&track_id).await {
+                                    Ok(url) => Ok((url, "Opus 160".to_string())),
+                                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
+                                }
+                            } else {
+                                Err("Провайдер YouTube Music не найден".to_string())
+                            }
+                        } else {
+                            client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
+                        }
+                    }
                 };
                 eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "ошибка" });
                 if is_stale() {
@@ -1284,17 +1658,28 @@ impl PlayerManager {
                         }
 
                         emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-                        // следующий трек готовим заранее (офлайн-треки в этом не нуждаются)
-                        if let Some(next) = next_track.filter(|t| crate::cache::offline_audio_path(&t.id).is_none()) {
-                            tokio::spawn(async move {
-                                let started = std::time::Instant::now();
-                                if let Some((url, label)) = prefetch_client.prefetch_track(&next.id).await {
-                                    eprintln!("[prefetch] «{}» готов за {} мс", next.title, started.elapsed().as_millis());
-                                    *prefetch.lock().unwrap() = Some(Prefetched { track_id: next.id, url, label, at: std::time::Instant::now() });
-                                }
-                            });
+
+                        // Фоновое сохранение играющего трека в audio_cache
+                        let cache_tid = track_id.clone();
+                        let cache_url = url.clone();
+                        let cache_ext = if is_yt { "opus" } else { "mp3" };
+                        tokio::spawn(async move {
+                            download_audio_to_cache(&cache_url, &cache_tid, cache_ext).await;
+                        });
+
+                        // Предзагрузка следующего трека
+                        mgr_clone.prefetch_next_track();
+                        if is_yt {
+                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
+                                let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
+                                    track_id: track_id.clone(),
+                                    station_id: station_id.clone(),
+                                    batch_id: batch_id.clone(),
+                                }).await;
+                            }
+                        } else {
+                            let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
                         }
-                        let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
                     }
                     Err(e) => {
                         if let Ok(mut state) = state_arc.lock() {
@@ -1305,9 +1690,125 @@ impl PlayerManager {
                     }
                 }
             } else {
+                // Если track.source == TrackSource::Yandex и у клиента Яндекса нет токена,
+                // но активен провайдер ProviderId::YouTubeMusic или у YouTube Music есть кука:
+                let yt_opt = providers_clone.get(ProviderId::YouTubeMusic);
+                let yt_active = providers_clone.active_id() == ProviderId::YouTubeMusic;
+                let yt_has_cookie = crate::api::auth::load_ytmusic_cookie().is_some()
+                    || yt_opt.as_ref().map(|p| p.is_authenticated()).unwrap_or(false);
+
+                if (yt_active || yt_has_cookie) && yt_opt.is_some() {
+                    let yt = yt_opt.unwrap();
+                    let query = format!("{} {}", track_title, track_artists);
+                    emit_all(&senders, PlayerUiEvent::LoadingState(true));
+                    emit_all(&senders, PlayerUiEvent::StatusMessage(
+                        format!("Поиск студийного трека в YouTube Music: {}", query),
+                    ));
+
+                    let candidates = match yt_client_clone.search_songs(&query).await {
+                        Ok(songs) if !songs.is_empty() => songs,
+                        _ => yt
+                            .search(&query)
+                            .await
+                            .ok()
+                            .and_then(|r| r.tracks.map(|s| s.results))
+                            .unwrap_or_default(),
+                    };
+
+                    let chosen = pick_best_yt_track(&candidates, &track_title, orig_duration);
+
+                    if let Some(track_to_play) = chosen {
+                        eprintln!(
+                            "[play] #{} выбран студийный трек в YouTube Music: {} ({}) [dur: {:?}]",
+                            epoch, track_to_play.title, track_to_play.id, track_to_play.duration_ms
+                        );
+
+                        // Заменяем текущий трек в состоянии плеера и очереди на реальный трек YouTube Music
+                        let (current_idx, total_q) = {
+                            if let Ok(mut state) = state_arc.lock() {
+                                state.current_track = Some(track_to_play.clone());
+                                let idx = state.current_index;
+                                if let Some(q_track) = state.queue.get_mut(idx) {
+                                    *q_track = track_to_play.clone();
+                                }
+                                (idx, state.queue.len())
+                            } else {
+                                (0, 1)
+                            }
+                        };
+
+                        crate::api::history::save_last_track(&track_to_play);
+
+                        // Обновляем UI с новыми метаданными и обложкой YouTube Music
+                        emit_all(&senders, PlayerUiEvent::TrackStarted {
+                            track: track_to_play.clone(),
+                            index: current_idx,
+                            total_queue: total_q,
+                        });
+                        emit_all(&senders, PlayerUiEvent::Progress {
+                            current_sec: 0,
+                            total_sec: track_to_play.duration_ms.unwrap_or(0) / 1000,
+                        });
+
+                        // Загружаем обложку и текст выбранного трека
+                        spawn_cover_and_lyrics(&senders, client.clone(), &track_to_play, epoch, &stale_gen);
+
+                        match yt.get_stream_url(&track_to_play.id).await {
+                            Ok(url) => {
+                                if is_stale() {
+                                    eprintln!("[play] #{} устарел, поток YT не запускаем", epoch);
+                                    if let Ok(mut state) = state_arc.lock() {
+                                        state.is_transitioning = false;
+                                    }
+                                    return;
+                                }
+                                emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                                emit_all(&senders, PlayerUiEvent::StreamQuality("Opus 160 (YT)".to_string()));
+
+                                if crossfade {
+                                    if was_playing {
+                                        audio_clone.crossfade_to_url(&url, fade_ms);
+                                    } else {
+                                        audio_clone.stop();
+                                        audio_clone.play_url_fade_in(&url, fade_ms);
+                                    }
+                                } else {
+                                    audio_clone.stop();
+                                    audio_clone.play_url(&url);
+                                }
+
+                                if let Ok(mut state) = state_arc.lock() {
+                                    state.is_transitioning = false;
+                                }
+
+                                emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
+
+                                let cache_tid = track_to_play.id.clone();
+                                let cache_url = url.clone();
+                                tokio::spawn(async move {
+                                    download_audio_to_cache(&cache_url, &cache_tid, "opus").await;
+                                });
+                                mgr_clone.prefetch_next_track();
+
+                                let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
+                                    track_id: track_to_play.id.clone(),
+                                    station_id: station_id.clone(),
+                                    batch_id: batch_id.clone(),
+                                }).await;
+
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("[play] Ошибка получения потока YT: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 if let Ok(mut state) = state_arc.lock() {
                     state.is_transitioning = false;
                 }
+                emit_all(&senders, PlayerUiEvent::LoadingState(false));
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
                     "Требуется авторизация для воспроизведения".to_string(),
@@ -1340,10 +1841,31 @@ impl PlayerManager {
         language: Option<String>,
         character: Option<String>,
     ) {
+        let provider = self.providers.current();
+        if provider.provider_id() == ProviderId::YouTubeMusic && !provider.is_authenticated() {
+            self.emit(PlayerUiEvent::StatusMessage(
+                "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
+            ));
+            return;
+        }
+
+        let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+        let is_reset = mood.is_none() && language.is_none() && character.is_none();
+        let station_id = if is_yt && is_reset {
+            self.state
+                .lock()
+                .unwrap()
+                .current_track
+                .as_ref()
+                .map(|t| format!("track:{}", t.id))
+                .unwrap_or_else(|| "user:onyourwave".to_string())
+        } else {
+            "user:onyourwave".to_string()
+        };
+
         let client_clone = self.client.clone();
         let state_clone = self.state.clone();
         let senders = self.event_senders.clone();
-        let station_id = "user:onyourwave".to_string();
 
         {
             let mut state = self.state.lock().unwrap();
@@ -1355,19 +1877,31 @@ impl PlayerManager {
         }
         self.set_wave(true);
         // плашку с выбранным фильтром рисует сам интерфейс; для простой Волны плашка убирается
-        if mood.is_none() && language.is_none() && character.is_none() {
+        if is_reset {
             self.set_wave_label(None);
         } else {
             self.state.lock().unwrap().wave_label = None;
         }
 
         let audio_clone = self.audio.clone();
+        let providers_clone = self.providers.clone();
+        let wave_engine_clone = self.wave_engine.clone();
         let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let current_gen = self.generation.clone();
 
         tokio::spawn(async move {
+            let provider = providers_clone.current();
+            let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
             let client = client_clone.lock().unwrap().clone();
-            if !client.has_token() {
+
+            if is_yt {
+                if !provider.is_authenticated() {
+                    emit_all(&senders, PlayerUiEvent::StatusMessage(
+                        "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
+                    ));
+                    return;
+                }
+            } else if !client.has_token() {
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
                     "Войдите в Яндекс ID для запуска персональной Волны".to_string(),
@@ -1376,18 +1910,51 @@ impl PlayerManager {
             }
 
             emit_all(&senders, PlayerUiEvent::LoadingState(true));
-            match client.get_station_tracks_with_params(
-                &station_id,
-                mood.as_deref(),
-                language.as_deref(),
-                character.as_deref(),
-            ).await {
-                Ok(station_tracks) => {
-                    let tracks = dedup_tracks(&[], station_tracks.sequence.into_iter().map(|s| s.track).collect());
+            let mut fetch_res: Result<(Vec<Track>, Option<String>), String> = if is_yt {
+                match provider.get_station_tracks(&station_id, None).await {
+                    Ok(batch) => {
+                        let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                        Ok((batch.tracks, b_id))
+                    }
+                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
+                }
+            } else {
+                match client.get_station_tracks_with_params(
+                    &station_id,
+                    mood.as_deref(),
+                    language.as_deref(),
+                    character.as_deref(),
+                ).await {
+                    Ok(station_tracks) => {
+                        let tr: Vec<Track> = station_tracks.sequence.into_iter().map(|s| s.track).collect();
+                        Ok((tr, station_tracks.batch_id))
+                    }
+                    Err(e) => Err(format!("Ошибка загрузки Волны: {}", e)),
+                }
+            };
+
+            // Фолбэк для YouTube Music, если треки не вернулись
+            if is_yt {
+                if let Ok((ref tr, _)) = fetch_res {
+                    if tr.is_empty() {
+                        if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
+                            if !batch.tracks.is_empty() {
+                                let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                                fetch_res = Ok((batch.tracks, b_id));
+                            }
+                        }
+                    }
+                }
+            }
+
+            match fetch_res {
+                Ok((tracks, batch_id)) => {
+                    let filtered = wave_engine_clone.lock().unwrap().filter_candidates(tracks);
+                    let tracks = dedup_tracks(&[], filtered);
                     let first_track = tracks.first().cloned();
 
                     let first_is_liked = if let Ok(mut state) = state_clone.lock() {
-                        state.batch_id = station_tracks.batch_id.clone();
+                        state.batch_id = batch_id.clone();
                         if !tracks.is_empty() {
                             state.queue = tracks.clone();
                             state.current_index = 0;
@@ -1416,8 +1983,17 @@ impl PlayerManager {
 
                         // Сразу запускаем воспроизведение первого трека Волны
                         let track_id = track.id.clone();
-                        let batch_id = station_tracks.batch_id;
-                        let result = client.get_track_direct_url(&track_id).await;
+                        let b_id = batch_id.clone();
+                        let result: Result<(String, String), String> = if track.source == TrackSource::YouTubeMusic {
+                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
+                                yt.get_stream_url(&track_id).await.map(|u| (u, "Opus 160".to_string())).map_err(|e| e.to_string())
+                            } else {
+                                Err("YouTube Music недоступен".to_string())
+                            }
+                        } else {
+                            client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
+                        };
+
                         if current_gen.load(Ordering::SeqCst) != epoch {
                             return;
                         }
@@ -1432,7 +2008,17 @@ impl PlayerManager {
                                     audio_clone.set_volume(audio_clone.user_volume());
                                 }
                                 emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-                                let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
+                                if track.source == TrackSource::YouTubeMusic {
+                                    if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
+                                        let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
+                                            track_id: track_id.clone(),
+                                            station_id: station_id.clone(),
+                                            batch_id: b_id,
+                                        }).await;
+                                    }
+                                } else {
+                                    let _ = client.feedback_track_started(&station_id, &track_id, b_id).await;
+                                }
                             }
                             Err(e) => {
                                 emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка старта Волны: {}", e)));
@@ -1440,17 +2026,46 @@ impl PlayerManager {
                         }
                     } else {
                         emit_all(&senders, PlayerUiEvent::StatusMessage(
-                            "В станции ротора нет треков".to_string(),
+                            "Не удалось загрузить треки для выбранной станции. Попробуйте другой фильтр или трек.".to_string(),
                         ));
                     }
                 }
                 Err(e) => {
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
-                    emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка загрузки Волны: {}", e)));
+                    emit_all(&senders, PlayerUiEvent::Error(e));
                 }
             }
         });
     }
+}
+
+/// Скачивает аудиопоток в дисковый кэш (~/.cache/volna/audio/) и очищает старые треки по LRU
+async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option<std::path::PathBuf> {
+    let final_path = crate::cache::final_audio_cache_path(track_id, ext);
+    if final_path.exists() {
+        if let Ok(meta) = final_path.metadata() {
+            if meta.len() > 128 * 1024 {
+                return Some(final_path);
+            }
+        }
+    }
+    let tmp = crate::cache::temp_audio_cache_path(track_id, ext);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() <= 128 * 1024 {
+        return None;
+    }
+    std::fs::write(&tmp, &bytes).ok()?;
+    std::fs::rename(&tmp, &final_path).ok()?;
+    crate::cache::clean_audio_cache_lru(600 * 1024 * 1024);
+    Some(final_path)
 }
 
 /// Обложка и текст песни грузятся отдельными задачами, чтобы не задерживать воспроизведение.
@@ -1468,6 +2083,22 @@ fn spawn_cover_and_lyrics(
             if let Some(path) = crate::cache::fetch_cover_cached(&cover_url).await {
                 if generation.load(Ordering::SeqCst) == epoch {
                     emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
+                }
+            }
+        });
+    }
+
+    // Если это трек YouTube Music или обложка с i.ytimg.com — параллельно резолвим студийную обложку
+    let is_ytimg = track.cover_url(400).as_deref().map_or(true, |u| u.contains("ytimg.com"));
+    if is_ytimg {
+        let (senders, generation) = (senders.clone(), generation.clone());
+        let (artist, title) = (track.artists_string(), track.title.clone());
+        tokio::spawn(async move {
+            if let Some(studio_url) = crate::cache::resolve_studio_cover(&artist, &title).await {
+                if let Some(path) = crate::cache::fetch_cover_cached(&studio_url).await {
+                    if generation.load(Ordering::SeqCst) == epoch {
+                        emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
+                    }
                 }
             }
         });
@@ -1505,18 +2136,103 @@ fn spawn_cover_and_lyrics(
     let (senders, generation) = (senders.clone(), generation.clone());
     let (track_id, title, artist) = (track.id.clone(), track.title.clone(), track.artists_string());
     let duration = track.duration_ms.map(|d| d / 1000);
+    let track_source = track.source;
     tokio::spawn(async move {
-        if !client.has_token() {
-            return;
-        }
-        // без ограничения по времени зависший запрос навсегда оставлял бы экран текста пустым
-        let lookup = client.get_track_lyrics(&track_id, &artist, &title, duration);
-        let text = tokio::time::timeout(std::time::Duration::from_secs(12), lookup)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-            .unwrap_or_default();
+        let text = if track_source == crate::api::models::TrackSource::YouTubeMusic || track_id.len() == 11 {
+            static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+            let http = HTTP.get_or_init(|| {
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_default()
+            });
+
+            // 1. Проверяем кэш: если в кэше есть синхронизированное караоке с таймкодами — отдаем мгновенно!
+            let cache_path = crate::cache::lyrics_cache_path(&track_id);
+            let mut cached_plain = None;
+            if let Ok(cached) = std::fs::read_to_string(&cache_path) {
+                let trimmed = cached.trim();
+                if crate::api::lrclib::usable_synced(trimmed) {
+                    if generation.load(Ordering::SeqCst) == epoch {
+                        emit_all(&senders, PlayerUiEvent::LyricsUpdated(trimmed.to_string()));
+                    }
+                    return;
+                } else if !trimmed.is_empty() {
+                    cached_plain = Some(trimmed.to_string());
+                }
+            }
+
+            // 2. Сначала LRCLIB (синхронизированное караоке с таймкодами)
+            let lrclib_fut = crate::api::lrclib::fetch_lrclib_lyrics(http, &artist, &title, duration);
+            let lrclib_res = tokio::time::timeout(std::time::Duration::from_secs(8), lrclib_fut).await.ok().flatten();
+
+            let mut final_text = None;
+            if let Some(lr_text) = lrclib_res {
+                let trimmed = lr_text.trim();
+                if crate::api::lrclib::usable_synced(trimmed) {
+                    let _ = std::fs::write(&cache_path, trimmed);
+                    final_text = Some(trimmed.to_string());
+                } else if !trimmed.is_empty() {
+                    final_text = Some(trimmed.to_string());
+                }
+            }
+
+            // 3. Если в LRCLIB нет синхронизированных таймкодов (или сервис временно недоступен) —
+            // пробуем найти караоке в каталоге Яндекс Музыки!
+            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced(t)) {
+                let clean_title = crate::api::lrclib::clean_title_for_lyrics(&title);
+                let query = format!("{} {}", artist, clean_title);
+                if let Ok(search_res) = client.search(&query).await {
+                    if let Some(tracks) = search_res.tracks {
+                        if let Some(y_track) = tracks.results.into_iter().next() {
+                            if let Ok(Some(y_lyrics)) = client.get_track_lyrics(&y_track.id, &artist, &title, duration).await {
+                                let trimmed = y_lyrics.trim();
+                                if crate::api::lrclib::usable_synced(trimmed) {
+                                    let _ = std::fs::write(&cache_path, trimmed);
+                                    final_text = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. Если караоке с таймкодами не нашлось — фолбэк на официальный текст YouTube Music
+            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced(t)) {
+                let ytm = crate::api::ytmusic::YtMusicClient::new();
+                if let Some(yt_text) = ytm.get_yt_lyrics(&track_id).await {
+                    let trimmed = yt_text.trim();
+                    if !trimmed.is_empty() {
+                        let _ = std::fs::write(&cache_path, trimmed);
+                        final_text = Some(trimmed.to_string());
+                    }
+                }
+            }
+
+            final_text.or(cached_plain).unwrap_or_default()
+        } else {
+            // Трек из Яндекс Музыки
+            let lookup = async {
+                if client.has_token() {
+                    client.get_track_lyrics(&track_id, &artist, &title, duration).await.ok().flatten()
+                } else {
+                    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+                    let http = HTTP.get_or_init(|| {
+                        reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(10))
+                            .build()
+                            .unwrap_or_default()
+                    });
+                    crate::api::lrclib::get_cached_or_fetch_lrclib(http, &track_id, &artist, &title, duration).await
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(12), lookup)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        };
+
         if generation.load(Ordering::SeqCst) == epoch {
             emit_all(&senders, PlayerUiEvent::LyricsUpdated(text));
         }
@@ -1555,6 +2271,156 @@ fn emit_all(senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>, event: PlayerUiEve
         Err(e) => e.into_inner(),
     };
     senders.retain(|s| s.send_blocking(event.clone()).is_ok());
+}
+
+/// Выбирает лучший трек YouTube Music, соответствующий оригинальному треку:
+/// 1. Фильтрует кандидатов: исключает Live, Концерт, Concert, Remix, если их не было в исходном названии.
+/// 2. Ищет трек, длительность которого ближе всего к длительности исходного трека Яндекса (в пределах ±20 сек).
+/// 3. При отсутствии кандидатов в пределах 20 сек выбирает трек с минимальной дельтой длительности.
+pub fn pick_best_yt_track(
+    candidates: &[Track],
+    orig_title: &str,
+    orig_duration_ms: Option<u64>,
+) -> Option<Track> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Обязательная проверка на чистый музыкальный трек (отсечение подкастов, видео-мусора и звуков)
+    let clean: Vec<&Track> = candidates
+        .iter()
+        .filter(|c| crate::api::ytmusic::parser::is_clean_music_track(c))
+        .collect();
+
+    if clean.is_empty() {
+        return None;
+    }
+
+    let orig_lower = orig_title.to_lowercase();
+    let filter_live = !orig_lower.contains("live");
+    let filter_concert = !orig_lower.contains("концерт") && !orig_lower.contains("concert");
+    let filter_remix = !orig_lower.contains("remix");
+
+    let is_undesired = |title: &str| -> bool {
+        let t = title.to_lowercase();
+        (filter_live && t.contains("live"))
+            || (filter_concert && (t.contains("концерт") || t.contains("concert")))
+            || (filter_remix && t.contains("remix"))
+    };
+
+    let filtered: Vec<&Track> = clean
+        .iter()
+        .filter(|c| !is_undesired(&c.title))
+        .copied()
+        .collect();
+
+    let pool: &[&Track] = if !filtered.is_empty() {
+        &filtered
+    } else {
+        &clean
+    };
+
+    if let Some(target_ms) = orig_duration_ms {
+        // Кандидаты в пределах ±20 сек (20 000 мс)
+        let within_20s: Vec<&&Track> = pool
+            .iter()
+            .filter(|c| {
+                if let Some(d) = c.duration_ms {
+                    (d as i64 - target_ms as i64).abs() <= 20_000
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if !within_20s.is_empty() {
+            return within_20s
+                .into_iter()
+                .min_by_key(|c| (c.duration_ms.unwrap() as i64 - target_ms as i64).abs())
+                .map(|c| (*c).clone());
+        }
+
+        // Если в пределах 20 сек никого нет, выбираем с минимальной дельтой
+        if let Some(closest) = pool
+            .iter()
+            .filter(|c| c.duration_ms.is_some())
+            .min_by_key(|c| (c.duration_ms.unwrap() as i64 - target_ms as i64).abs())
+        {
+            return Some((*closest).clone());
+        }
+    }
+
+    pool.first().map(|c| (*c).clone())
+}
+
+#[cfg(test)]
+mod yt_track_selection_tests {
+    use super::*;
+
+    fn make_test_track(id: &str, title: &str, duration_ms: Option<u64>) -> Track {
+        Track {
+            id: id.to_string(),
+            title: title.to_string(),
+            version: None,
+            artists: Vec::new(),
+            albums: Vec::new(),
+            duration_ms,
+            cover_uri: None,
+            og_image: None,
+            available: Some(true),
+            content_warning: None,
+            derived_colors: None,
+            source: TrackSource::YouTubeMusic,
+        }
+    }
+
+    #[test]
+    fn test_filter_live_concert_remix_when_original_is_clean() {
+        let candidates = vec![
+            make_test_track("1", "Лесник (Live)", Some(195_000)),
+            make_test_track("2", "Лесник (Концерт в Олимпийском)", Some(192_000)),
+            make_test_track("3", "Лесник (Remix)", Some(190_000)),
+            make_test_track("4", "Лесник", Some(192_000)),
+        ];
+
+        let chosen = pick_best_yt_track(&candidates, "Лесник", Some(192_000)).expect("Track should be found");
+        assert_eq!(chosen.id, "4");
+    }
+
+    #[test]
+    fn test_keep_live_when_original_has_live() {
+        let candidates = vec![
+            make_test_track("1", "Лесник (Live)", Some(195_000)),
+            make_test_track("2", "Лесник", Some(192_000)),
+        ];
+
+        let chosen = pick_best_yt_track(&candidates, "Лесник (Live)", Some(195_000)).expect("Track should be found");
+        assert_eq!(chosen.id, "1");
+    }
+
+    #[test]
+    fn test_closest_duration_within_20_seconds() {
+        let candidates = vec![
+            make_test_track("1", "Песня", Some(230_000)), // +30s (вне 20s)
+            make_test_track("2", "Песня", Some(185_000)), // -15s (в пределах 20s)
+            make_test_track("3", "Песня", Some(205_000)), // +5s  (в пределах 20s, ближе всех)
+        ];
+
+        let chosen = pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
+        assert_eq!(chosen.id, "3");
+    }
+
+    #[test]
+    fn test_pick_best_yt_track_filters_podcasts() {
+        let candidates = vec![
+            make_test_track("1", "Песня (Подкаст выпуск #1)", Some(200_000)),
+            make_test_track("2", "Песня (Длинный разговор)", Some(5_000_000)), // 83 минуты
+            make_test_track("3", "Песня", Some(200_000)),
+        ];
+
+        let chosen = pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
+        assert_eq!(chosen.id, "3");
+    }
 }
 
 #[cfg(test)]
@@ -1700,5 +2566,46 @@ mod like_tests {
         client.set_cached_uid("user_999".to_string());
         let uid = client.get_uid().await.expect("cached uid must succeed");
         assert_eq!(uid, "user_999");
+    }
+
+    #[test]
+    fn test_toggle_play_launches_ytmusic_wave_when_paused_on_yandex_track_without_token() {
+        let client = YandexMusicClient::new(None);
+        let audio = Arc::new(AudioBackend::new().unwrap());
+        let client_mutex = Arc::new(Mutex::new(client.clone()));
+        let mut state = PlayerState::default();
+        let yandex_track = Track {
+            id: "ya_123".to_string(),
+            title: "Yandex Track".to_string(),
+            source: TrackSource::Yandex,
+            ..Default::default()
+        };
+        state.queue = vec![yandex_track.clone()];
+        state.current_track = Some(yandex_track);
+        let state_arc = Arc::new(Mutex::new(state));
+
+        let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = Arc::new(YtMusicClient::new()) as Arc<dyn MusicProvider>;
+        let provider_manager = ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+        provider_manager.switch_provider(ProviderId::YouTubeMusic);
+
+        let manager = PlayerManager {
+            audio,
+            client: client_mutex,
+            providers: Arc::new(provider_manager),
+            yt_client: Arc::new(YtMusicClient::new()),
+            state: state_arc.clone(),
+            wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
+            event_senders: Arc::new(Mutex::new(Vec::new())),
+            cast: Arc::default(),
+            prefetch: Arc::default(),
+            generation: Arc::new(AtomicU64::new(0)),
+            crossfade: Arc::new(Mutex::new((false, 3))),
+        };
+
+        manager.toggle_play();
+
+        let current_station = state_arc.lock().unwrap().station_id.clone();
+        assert_eq!(current_station, "user:onyourwave");
     }
 }
