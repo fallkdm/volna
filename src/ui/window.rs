@@ -440,10 +440,17 @@ impl VolnaWindow {
                 let ab = auth_name_box.clone();
                 let sb = settings_label_box.clone();
                 let items = nav_items.clone();
+                let sc = search_container.clone();
+                let lc = library_container.clone();
+                let is_sp = is_spotify_nav_state.clone();
 
                 let target = libadwaita::CallbackAnimationTarget::new(move |val| {
                     let w = val.round() as i32;
                     s.set_width_request(w);
+                    if *is_sp.borrow() {
+                        sc.set_margin_start(w);
+                        lc.set_margin_start(w);
+                    }
                     let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
                     if !next_collapsed {
                         bb.set_opacity(t);
