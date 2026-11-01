@@ -206,6 +206,53 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
             player.apply_rotor_filter(mood, language, character);
             serde_json::json!({ "ok": true })
         }
+        "clip" => {
+            let action = cmd_json
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("status");
+            match action {
+                "on" => {
+                    player.set_clips_enabled(true);
+                    serde_json::json!({ "ok": true, "enabled": true })
+                }
+                "off" => {
+                    player.set_clips_enabled(false);
+                    serde_json::json!({ "ok": true, "enabled": false })
+                }
+                "reset" => {
+                    let cleared = player.reset_clip_negative_cache();
+                    serde_json::json!({ "ok": true, "cleared": cleared })
+                }
+                "status" => {
+                    let status = player.clips.telemetry().snapshot();
+                    let audio_ms = player.audio.position_ms();
+                    let drift = match (status.position_ms, audio_ms) {
+                        (Some(clip), Some(audio)) => Some(clip as i64 - audio as i64),
+                        _ => None,
+                    };
+                    serde_json::json!({
+                        "ok": true,
+                        "enabled": status.enabled,
+                        "clip_source": status.source.as_deref().unwrap_or("none"),
+                        "clip_track_id": status.track_id,
+                        "clip_format": status.format,
+                        "attempt_id": status.attempt_id,
+                        "clip_position_ms": status.position_ms,
+                        "audio_position_ms": audio_ms,
+                        "clip_drift_ms": drift,
+                        "clip_sync_degraded": status.sync_degraded,
+                        "clip_error": status.error,
+                        "clip_download_ms": status.download_ms,
+                        "clip_bytes": status.bytes,
+                    })
+                }
+                other => serde_json::json!({
+                    "ok": false,
+                    "error": format!("unknown clip action: {other}"),
+                }),
+            }
+        }
         "search_and_play" => {
             if let Some(query) = cmd_json.get("query").and_then(|v| v.as_str()) {
                 let provider = player.providers.current();

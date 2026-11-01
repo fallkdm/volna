@@ -20,7 +20,7 @@ pub use parser::*;
 /// Windows Chrome 120 — базовые запросы к `youtubei/v1`.
 const UA_CHROME_120: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 /// macOS Safari 26 — `sw.js_data` и VisionOS-подобный `player`.
-const UA_SAFARI_26: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+pub(crate) const UA_SAFARI_26: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 /// Windows Chrome 124 — HTML-страницы библиотеки и запросы оценок.
 const UA_CHROME_124: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -44,6 +44,83 @@ fn store_track_duration(track_id: &str, secs: u64) {
         map.insert(track_id.to_string(), secs);
     }
 }
+
+/// TTL общего кэша `/player`: аудио, длительность и видео используют один и тот же JSON.
+const PLAYER_JSON_TTL: std::time::Duration = std::time::Duration::from_secs(12 * 60);
+/// Максимум записей: один ответ `/player` — около 76 КБ.
+const PLAYER_JSON_CAP: usize = 48;
+
+struct PlayerJsonEntry {
+    json: serde_json::Value,
+    fetched_at: tokio::time::Instant,
+    last_used: tokio::time::Instant,
+}
+
+static PLAYER_JSON: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, PlayerJsonEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Свежий (не старше TTL) JSON `/player`, если он уже запрашивался.
+fn player_json_cached(track_id: &str) -> Option<serde_json::Value> {
+    let mut map = PLAYER_JSON.lock().ok()?;
+    if map
+        .get(track_id)
+        .is_some_and(|e| e.fetched_at.elapsed() > PLAYER_JSON_TTL)
+    {
+        map.remove(track_id);
+        return None;
+    }
+    let entry = map.get_mut(track_id)?;
+    entry.last_used = tokio::time::Instant::now();
+    Some(entry.json.clone())
+}
+
+/// Кладёт успешный ответ в LRU на 48 записей. Ошибки и неуспешный playability не кэшируются.
+fn store_player_json(track_id: &str, json: &serde_json::Value) {
+    let Ok(mut map) = PLAYER_JSON.lock() else {
+        return;
+    };
+    let now = tokio::time::Instant::now();
+    if map.len() >= PLAYER_JSON_CAP
+        && !map.contains_key(track_id)
+        && let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(id, _)| id.clone())
+    {
+        map.remove(&oldest);
+    }
+    map.insert(
+        track_id.to_string(),
+        PlayerJsonEntry {
+            json: json.clone(),
+            fetched_at: now,
+            last_used: now,
+        },
+    );
+}
+
+/// Видео для фона: настоящий клип или арт-трек со статичной обложкой.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoClipResolution {
+    MusicVideo {
+        url: String,
+        duration_secs: Option<u64>,
+        format: Option<parser::VideoFormatInfo>,
+    },
+    ArtTrack,
+}
+
+/// Диагноз резолва клипа: «нет H.264» — не то же самое, что сетевой таймаут.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoClipError {
+    NoH264,
+    Player(String),
+    Resolve(String),
+}
+
+/// Ниже какого среднего битрейта видео считаем статичной обложкой (80 кбит/с = 10 КБ/с).
+pub const ART_TRACK_BITRATE_BPS: u64 = 80_000;
 
 /// Маркеры имён заблокированных в РФ кэшей GGC (`sn-...googlevideo.com`).
 /// Сравнение по подстроке — намеренно: имя ноды может содержать префикс региона.
@@ -355,6 +432,9 @@ impl YtMusicClient {
         &self,
         track_id: &str,
     ) -> Result<serde_json::Value, YtMusicError> {
+        if let Some(cached) = player_json_cached(track_id) {
+            return Ok(cached);
+        }
         let visitor_id = self.get_visitor_id().await;
         let body = serde_json::json!({
             "context": {
@@ -396,7 +476,80 @@ impl YtMusicClient {
             .error_for_status()?;
 
         let json = resp.json::<serde_json::Value>().await?;
+        // Кэшируем только успешный playability: 429 и ошибки не должны жить 12 минут
+        let playable = json
+            .get("playabilityStatus")
+            .and_then(|s| s.get("status"))
+            .and_then(|s| s.as_str())
+            .is_some_and(|status| status == "OK");
+        if playable {
+            store_player_json(track_id, &json);
+        }
         Ok(json)
+    }
+
+    /// Резолв фонового клипа: арт-трек отсекается до yt-dlp, скачивания и GGC-префлайта.
+    pub async fn resolve_video_clip(
+        &self,
+        track_id: &str,
+    ) -> Result<VideoClipResolution, VideoClipError> {
+        let json = self
+            .visionos_player_json(track_id)
+            .await
+            .map_err(|e| VideoClipError::Player(e.to_string()))?;
+
+        let details = json.get("videoDetails");
+        let author = details
+            .and_then(|d| d.get("author"))
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        if author.trim_end().ends_with("- Topic") {
+            return Ok(VideoClipResolution::ArtTrack);
+        }
+        if let Some(kind) = details
+            .and_then(|d| d.get("musicVideoType"))
+            .and_then(|k| k.as_str())
+            && matches!(kind, "MUSIC_VIDEO_TYPE_ATV" | "ATV")
+        {
+            return Ok(VideoClipResolution::ArtTrack);
+        }
+
+        let duration_secs = parser::parse_video_length_secs(&json);
+        let selection = match parser::select_video_stream(&json) {
+            Ok(selection) => selection,
+            Err(parser::VideoStreamError::Playability(reason)) => {
+                return Err(VideoClipError::Player(reason));
+            }
+            Err(parser::VideoStreamError::NoH264) => {
+                let (raw_url, format) = video_stream_url_ytdlp(track_id).await?;
+                let url = self.resolve_live_stream_url(&raw_url).await;
+                return Ok(VideoClipResolution::MusicVideo {
+                    url,
+                    duration_secs,
+                    format,
+                });
+            }
+        };
+
+        // Статичный ролик: средний битрейт ниже порога арт-трека
+        if selection
+            .best_known_bitrate_bps
+            .is_some_and(|bps| bps < ART_TRACK_BITRATE_BPS)
+        {
+            return Ok(VideoClipResolution::ArtTrack);
+        }
+
+        let (raw_url, format) = match selection.url {
+            Some(url) => (url, selection.format),
+            None => video_stream_url_ytdlp(track_id).await?,
+        };
+        // Любой видео-URL проходит через обход заблокированных GGC-нод
+        let url = self.resolve_live_stream_url(&raw_url).await;
+        Ok(VideoClipResolution::MusicVideo {
+            url,
+            duration_secs,
+            format,
+        })
     }
 
     /// Поиск студийных треков ("Songs" / "Песни") с официальным фильтром YouTube Music
@@ -1270,6 +1423,72 @@ async fn check_stream_connectivity(
         }
         _ => None,
     }
+}
+
+/// Видео-фолбэк через yt-dlp: один процесс отдаёт и медиа-URL, и фактический формат.
+///
+/// Отдельно от аудио-`resolve_yt_dlp()`: там `-g` и itag 251, здесь — video-only H.264
+/// и `--print`, чтобы остальные вызовы не разбирали новый формат вывода.
+async fn video_stream_url_ytdlp(
+    track_id: &str,
+) -> Result<(String, Option<parser::VideoFormatInfo>), VideoClipError> {
+    let binary = resolve_yt_dlp();
+    if binary == "yt-dlp" {
+        return Err(VideoClipError::Resolve(
+            "yt-dlp не найден: установите его или задайте путь в VOLNA_YTDLP".to_string(),
+        ));
+    }
+    let watch_url = format!("https://www.youtube.com/watch?v={track_id}");
+    let output = tokio::process::Command::new(&binary)
+        .args([
+            "--no-warnings",
+            "-f",
+            "135/134/worstvideo[ext=mp4][vcodec^=avc1][width<=480]/136",
+            "--print",
+            "%(format_id)s|%(width)s|%(height)s|%(url)s",
+            &watch_url,
+        ])
+        .output()
+        .await
+        .map_err(|e| VideoClipError::Resolve(format!("Ошибка запуска yt-dlp ({binary}): {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(VideoClipError::Resolve(format!(
+            "yt-dlp завершился с ошибкой: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or(VideoClipError::NoH264)?;
+    let mut parts = line.splitn(4, '|');
+    let format_id = parts.next().unwrap_or("").trim();
+    let width = parse_yt_dimension(parts.next());
+    let height = parse_yt_dimension(parts.next());
+    let url = parts
+        .next()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or(VideoClipError::NoH264)?;
+
+    let format = (!format_id.is_empty()).then(|| parser::VideoFormatInfo {
+        itag: format_id.to_string(),
+        width,
+        height,
+    });
+    Ok((url.to_string(), format))
+}
+
+fn parse_yt_dimension(value: Option<&str>) -> Option<u32> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && *v != "NA")
+        .and_then(|v| v.parse().ok())
 }
 
 /// Ищет `yt-dlp`: сначала явный путь из `VOLNA_YTDLP`, затем `PATH`.

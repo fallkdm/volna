@@ -279,6 +279,8 @@ pub struct PlayerManager {
     pub client: Arc<Mutex<YandexMusicClient>>,
     pub providers: Arc<ProviderManager>,
     pub yt_client: Arc<YtMusicClient>,
+    /// Фоновые клипы: резолв источника, загрузка в кэш и телеметрия для IPC
+    pub clips: super::clip::ClipBackground,
     pub state: Arc<Mutex<PlayerState>>,
     pub wave_engine: Arc<Mutex<WaveEngine>>,
     pub event_senders: Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
@@ -331,6 +333,9 @@ impl PlayerManager {
             YtMusicClient::new()
         };
         let yt_client_arc = Arc::new(yt_client.clone());
+        let clip_telemetry = Arc::new(super::clip_telemetry::ClipTelemetry::new());
+        clip_telemetry.set_enabled(crate::api::auth::load_clips());
+        let clips = super::clip::ClipBackground::new(yt_client_arc.clone(), clip_telemetry);
 
         let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
         let ytmusic_provider = Arc::new(yt_client) as Arc<dyn MusicProvider>;
@@ -344,6 +349,7 @@ impl PlayerManager {
             client: client_mutex,
             providers,
             yt_client: yt_client_arc,
+            clips,
             state,
             wave_engine,
             event_senders: Arc::new(Mutex::new(event_senders)),
@@ -454,7 +460,7 @@ impl PlayerManager {
                 self.emit(PlayerUiEvent::SourceContext(source));
                 self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index, total_queue: total });
                 let client = self.client.lock().unwrap().clone();
-                spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
+                spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation, &self.clips);
                 return;
             }
         }
@@ -469,7 +475,7 @@ impl PlayerManager {
         self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
         self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index: 0, total_queue: 1 });
         let client = self.client.lock().unwrap().clone();
-        spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
+        spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation, &self.clips);
     }
 
     /// Если на экране сохранённый трек, первое нажатие Play/вперёд/назад запускает его (с продолжением Волной по треку)
@@ -506,6 +512,31 @@ impl PlayerManager {
     /// Отправляет событие во все зарегистрированные каналы (UI, MPRIS)
     pub fn emit(&self, event: PlayerUiEvent) {
         emit_all(&self.event_senders, event);
+    }
+
+    /// Единая точка включения клипов: настройки и IPC используют её, а не две реализации.
+    pub fn set_clips_enabled(&self, enabled: bool) {
+        let _ = crate::api::auth::save_clips(enabled);
+        self.clips.set_enabled(enabled);
+        if enabled
+            && let Some(track) = self.state.lock().ok().and_then(|s| s.current_track.clone())
+        {
+            self.clips.spawn_clip_for_track(&track);
+        }
+    }
+
+    /// `clip reset`: чистит negative cache, не удаляя положительный MP4-кэш.
+    /// Если локального клипа нет — разрешает одну новую попытку без перезапуска звука.
+    pub fn reset_clip_negative_cache(&self) -> usize {
+        let removed = self.clips.reset_negative();
+        let status = self.clips.telemetry().snapshot();
+        if status.enabled
+            && !status.local_clip_active
+            && let Some(track) = self.state.lock().ok().and_then(|s| s.current_track.clone())
+        {
+            self.clips.spawn_clip_for_track(&track);
+        }
+        removed
     }
 
     /// Переключает активного музыкального провайдера
@@ -1998,7 +2029,7 @@ impl PlayerManager {
         eprintln!("[play] #{} {} — {} ({})", epoch, track.title, track.artists_string(), track.id);
 
         let client = self.client.lock().unwrap().clone();
-        spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
+        spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation, &self.clips);
         crate::api::history::save_last_track(track);
         crate::api::history::remember_played(&track.id);
         // Историю для пост-фильтра ведём только на стороне YouTube Music: у Яндекса
@@ -2220,7 +2251,7 @@ impl PlayerManager {
                         });
 
                         // Загружаем обложку и текст выбранного трека
-                        spawn_cover_and_lyrics(&senders, client.clone(), &track_to_play, epoch, &stale_gen);
+                        spawn_cover_and_lyrics(&senders, client.clone(), &track_to_play, epoch, &stale_gen, &mgr_clone.clips);
 
                         match yt.get_stream_url(&track_to_play.id).await {
                             Ok(url) => {
@@ -2686,6 +2717,7 @@ impl PlayerManager {
         let wave_engine_clone = self.wave_engine.clone();
         let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let current_gen = self.generation.clone();
+        let clips_clone = self.clips.clone();
 
         tokio::spawn(async move {
             let provider = providers_clone.current();
@@ -2783,7 +2815,7 @@ impl PlayerManager {
                         });
 
                         // Обложка и текст первого трека Волны (в остальных случаях их грузит play_track_stream)
-                        spawn_cover_and_lyrics(&senders, client.clone(), &track, epoch, &current_gen);
+                        spawn_cover_and_lyrics(&senders, client.clone(), &track, epoch, &current_gen, &clips_clone);
                         crate::api::history::save_last_track(&track);
 
                         // Сразу запускаем воспроизведение первого трека Волны
@@ -2882,7 +2914,10 @@ fn spawn_cover_and_lyrics(
     track: &Track,
     epoch: u64,
     generation: &Arc<AtomicU64>,
+    clips: &super::clip::ClipBackground,
 ) {
+    // Фоновый клип: резолв и загрузка не ждут звука и UI
+    clips.spawn_clip_for_track(track);
     if let Some(cover_url) = track.cover_url(400) {
         let (senders, generation) = (senders.clone(), generation.clone());
         tokio::spawn(async move {
@@ -4235,6 +4270,10 @@ mod like_tests {
             client: client_mutex,
             providers: Arc::new(provider_manager),
             yt_client: Arc::new(YtMusicClient::new()),
+            clips: crate::player::clip::ClipBackground::new(
+                Arc::new(YtMusicClient::new()),
+                Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+            ),
             state: state_arc.clone(),
             wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
             event_senders: Arc::new(Mutex::new(Vec::new())),
@@ -4278,6 +4317,10 @@ mod like_tests {
             client: client_mutex,
             providers: Arc::new(provider_manager),
             yt_client: Arc::new(YtMusicClient::new()),
+            clips: crate::player::clip::ClipBackground::new(
+                Arc::new(YtMusicClient::new()),
+                Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+            ),
             state: state_arc.clone(),
             wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
             event_senders: Arc::new(Mutex::new(Vec::new())),

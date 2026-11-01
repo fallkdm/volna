@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use md5::{Digest, Md5};
 
 pub mod cover_resolver;
+pub mod youtube_clips;
 pub use cover_resolver::{resolve_artist_avatar, resolve_studio_cover};
+pub use youtube_clips::*;
 
 /// Возвращает путь к директории кэша обложек (~/.cache/volna/covers/)
 pub fn covers_cache_dir() -> PathBuf {

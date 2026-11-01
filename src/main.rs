@@ -75,6 +75,11 @@ fn main() {
                 }
                 serde_json::Value::Object(cmd)
             }
+            "clip" => {
+                // волна cmd clip on|off|status|reset (по умолчанию status)
+                let action = args.get(3).map(|a| a.trim()).unwrap_or("status");
+                serde_json::json!({ "cmd": "clip", "action": action })
+            }
             "set_cookie" => {
                 let cookie = args.get(3).cloned().unwrap_or_default();
                 serde_json::json!({ "cmd": "set_cookie", "cookie": cookie })
