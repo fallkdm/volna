@@ -2425,12 +2425,13 @@ impl PlayerManager {
             };
 
             for (seed_idx, station) in stations.iter().enumerate() {
-                if accepted.len() >= TAIL_SWAP_QUOTA || Instant::now() >= deadline {
+                if accepted.len() >= TAIL_SWAP_TARGET || Instant::now() >= deadline {
                     break;
                 }
                 let mut continuation: Option<String> = None;
+                let mut taken_from_seed = 0usize;
                 for round in 0..2u32 {
-                    if accepted.len() >= TAIL_SWAP_QUOTA || Instant::now() >= deadline {
+                    if accepted.len() >= TAIL_SWAP_TARGET || Instant::now() >= deadline {
                         break;
                     }
                     let batch = match provider
@@ -2474,13 +2475,32 @@ impl PlayerManager {
                     )
                     .await;
 
-                    // Не больше N треков одного артиста на весь хвост
+                    // Перемешиваем: первые треки батча — ближайший круг сида
+                    // (тот же лейбл), а нам нужен микс
+                    let mut got = got;
+                    shuffle_tracks(&mut got);
+
+                    // Не больше N треков одного артиста и M треков с одного сида
                     for track in got {
-                        let artist = track.artists_string().to_lowercase();
+                        if taken_from_seed >= MAX_TRACKS_PER_SEED
+                            || accepted.len() >= TAIL_SWAP_TARGET
+                        {
+                            break;
+                        }
+                        // Лимит считаем по первому артисту: «Три дня дождя, MONA»
+                        // и «Три дня дождя» — один и тот же круг
+                        let artist = track
+                            .artists_string()
+                            .split(',')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_lowercase();
                         let count = per_artist.entry(artist).or_insert(0);
                         if *count < MAX_TRACKS_PER_ARTIST {
                             *count += 1;
                             accepted.push(track);
+                            taken_from_seed += 1;
                         }
                     }
                     last_station = station.clone();
@@ -3115,16 +3135,39 @@ fn wave_loading_text(
 }
 
 /// Целевой размер принятого хвоста после TailSwap
-const TAIL_SWAP_QUOTA: usize = 6;
+const TAIL_SWAP_TARGET: usize = 12;
 
 /// Сколько `Ambiguous`-кандидатов максимум опрашивается текстами за раунд
 const PHASE2_MAX_CANDIDATES: usize = 12;
 
 /// Сколько сидов максимум перебираем, чтобы хвост не был радио одного артиста
-const TAIL_SWAP_SEEDS: usize = 3;
+const TAIL_SWAP_SEEDS: usize = 4;
 
 /// Не больше стольких треков одного артиста в обновлённом хвосте
 const MAX_TRACKS_PER_ARTIST: usize = 2;
+
+/// Не больше стольких треков с одного сида: иначе один лейбл/артист
+/// заполняет весь хвост своим «радио-пузырём»
+const MAX_TRACKS_PER_SEED: usize = 4;
+
+/// Перемешивание без зависимости `rand` (xorshift на наносекундах).
+fn shuffle_tracks(items: &mut [Track]) {
+    if items.len() < 2 {
+        return;
+    }
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        | 1;
+    for i in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
 
 /// Сиды под выбранные фильтры.
 ///
@@ -3148,15 +3191,17 @@ fn select_wave_seeds(
 
     let mut seeds = select_wave_seeds_from_pool(state, &pool, language, character);
 
-    // Пул пуст или в нём нет треков под фильтр: берём сырые id недавних
-    // YT-треков — метаданных для отбора нет, но фильтр всё равно применится
+    // Пул вкуса бывает узким (два-три артиста). Добираем сырые id недавних
+    // YT-треков: метаданных для отбора нет, но фильтр всё равно применится
     // к кандидатам, а неудачный сид просто даст мало принятых.
-    if seeds.is_empty() && language.is_some() {
-        seeds = crate::api::history::load_recent_played()
+    if language.is_some() && seeds.len() < TAIL_SWAP_SEEDS {
+        let extra = crate::api::history::load_recent_played()
             .into_iter()
             .filter(|id| id.len() == 11 && !id.starts_with("UC"))
-            .take(TAIL_SWAP_SEEDS)
-            .collect();
+            .filter(|id| !seeds.contains(id))
+            .take(TAIL_SWAP_SEEDS - seeds.len())
+            .collect::<Vec<String>>();
+        seeds.extend(extra);
     }
     seeds
 }
