@@ -496,6 +496,115 @@ impl YtMusicClient {
         Ok(json)
     }
 
+    /// Все треки плейлиста «Мне нравится» (LM) через YouTube Data API v3.
+    ///
+    /// Дата-API отдаёт по 50 записей с `nextPageToken`, поэтому приходит весь список,
+    /// а не одна страница TV-клиента. Длительности добираются отдельным запросом.
+    async fn liked_tracks_data_api(&self) -> Result<Vec<Track>, YtMusicError> {
+        let Some(access_token) = self.get_valid_access_token().await else {
+            return Err(YtMusicError::Message("нет access token".into()));
+        };
+
+        let mut tracks: Vec<Track> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut total: Option<u32> = None;
+        loop {
+            let mut url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=LM&maxResults=50".to_string();
+            if let Some(token) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(&percent_encode(token));
+            }
+            let response = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .send()
+                .await
+                .map_err(YtMusicError::Network)?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(YtMusicError::Http { status, body });
+            }
+            let json: serde_json::Value =
+                response.json().await.map_err(YtMusicError::Network)?;
+
+            if total.is_none() {
+                total = json
+                    .get("pageInfo")
+                    .and_then(|p| p.get("totalResults"))
+                    .and_then(|t| t.as_u64())
+                    .map(|t| t as u32);
+            }
+
+            for item in json
+                .get("items")
+                .and_then(|items| items.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(track) = track_from_data_api_item(item) {
+                    tracks.push(track);
+                }
+            }
+
+            page_token = json
+                .get("nextPageToken")
+                .and_then(|t| t.as_str())
+                .map(str::to_string);
+            if page_token.is_none() || tracks.len() >= 1000 {
+                break;
+            }
+        }
+
+        // Длительности: Data API отдаёт их только в videos.list, по 50 id за раз
+        for chunk in tracks.chunks_mut(50) {
+            let ids: Vec<&str> = chunk.iter().map(|t| t.id.as_str()).collect();
+            let url = format!(
+                "https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id={}",
+                ids.join(",")
+            );
+            let Ok(response) = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {access_token}"))
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(json) = response.json::<serde_json::Value>().await else {
+                continue;
+            };
+            for item in json
+                .get("items")
+                .and_then(|items| items.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
+                    continue;
+                };
+                let Some(duration) = item
+                    .get("contentDetails")
+                    .and_then(|c| c.get("duration"))
+                    .and_then(|d| d.as_str())
+                    .and_then(parse_iso8601_duration_ms)
+                else {
+                    continue;
+                };
+                if let Some(track) = chunk.iter_mut().find(|t| t.id == id) {
+                    track.duration_ms = Some(duration);
+                }
+            }
+        }
+
+        if let Some(total) = total {
+            *self.liked_total_count.write().await = Some(total);
+        }
+        Ok(tracks)
+    }
+
     /// Резолв фонового клипа: арт-трек отсекается до yt-dlp, скачивания и GGC-префлайта.
     pub async fn resolve_video_clip(
         &self,
@@ -633,7 +742,20 @@ impl YtMusicClient {
 
     /// Загрузка понравившихся треков пользователя (через HTML LM или browse fallback)
     pub async fn get_liked_tracks(&self) -> Result<Vec<Track>, YtMusicError> {
-        // 0. Вход по OAuth: Google принимает Bearer-токен только у TV-клиента,
+        // 0. Вход по OAuth: официальный Data API отдаёт весь плейлист LM постранично
+        // (TV-клиент ограничен одной страницей в 200 плиток, WEB_REMIX токен не принимает).
+        if self.refresh_token.read().await.is_some()
+            && let Ok(tracks) = self.liked_tracks_data_api().await
+            && !tracks.is_empty()
+        {
+            println!(
+                "[ytmusic] Медиатека через Data API (OAuth): {} треков",
+                tracks.len()
+            );
+            return Ok(tracks);
+        }
+
+        // 1. Вход по OAuth: Google принимает Bearer-токен только у TV-клиента,
         // и медиатека приходит плитками — это не зависит от куки и её ротации.
         if self.refresh_token.read().await.is_some() {
             let body = serde_json::json!({ "browseId": "FEmusic_liked_videos" });
@@ -1516,6 +1638,107 @@ async fn video_stream_url_ytdlp(
         height,
     });
     Ok((url.to_string(), format))
+}
+
+/// Минимальное процент-кодирование для `pageToken` и подобных значений в query.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Трек из элемента `playlistItems` YouTube Data API.
+fn track_from_data_api_item(item: &serde_json::Value) -> Option<Track> {
+    let snippet = item.get("snippet")?;
+    let resource = item.get("contentDetails")?.get("videoId").or_else(|| snippet.get("resourceId").and_then(|r| r.get("videoId")));
+    let id = resource.and_then(|v| v.as_str())?.to_string();
+    if id.len() != 11 {
+        return None;
+    }
+    let raw_title = snippet.get("title").and_then(|t| t.as_str()).unwrap_or("");
+    if raw_title.is_empty() || raw_title == "Deleted video" || raw_title == "Private video" {
+        return None;
+    }
+    let channel = snippet
+        .get("videoOwnerChannelTitle")
+        .or_else(|| snippet.get("channelTitle"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    // Метаданные: «Artist - Track» в заголовке либо «Artist - Topic» в канале
+    let (artist, title) = if let Some(stripped) = channel.strip_suffix(" - Topic") {
+        (stripped.trim().to_string(), raw_title.trim().to_string())
+    } else if let Some((left, right)) = raw_title.split_once(" - ") {
+        (left.trim().to_string(), right.trim().to_string())
+    } else {
+        let cleaned = channel
+            .trim_end_matches("VEVO")
+            .trim_end_matches("Official")
+            .trim()
+            .to_string();
+        (cleaned, raw_title.trim().to_string())
+    };
+
+    let cover_uri = snippet
+        .get("thumbnails")
+        .and_then(|thumbs| {
+            ["maxres", "standard", "high", "medium"]
+                .iter()
+                .find_map(|key| thumbs.get(*key).and_then(|t| t.get("url")).and_then(|u| u.as_str()))
+        })
+        .map(str::to_string);
+
+    Some(Track {
+        id,
+        title,
+        version: None,
+        artists: if artist.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::api::models::Artist {
+                id: String::new(),
+                name: artist,
+                cover: None,
+            }]
+        },
+        albums: Vec::new(),
+        duration_ms: None,
+        cover_uri,
+        og_image: None,
+        available: Some(true),
+        content_warning: None,
+        derived_colors: None,
+        source: crate::api::models::TrackSource::YouTubeMusic,
+    })
+}
+
+/// ISO-8601 длительность YouTube (`PT2M46S`) в миллисекунды.
+fn parse_iso8601_duration_ms(value: &str) -> Option<u64> {
+    let rest = value.strip_prefix("PT")?;
+    let mut total = 0u64;
+    let mut number = String::new();
+    for ch in rest.chars() {
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        let value: u64 = number.parse().ok()?;
+        number.clear();
+        total += match ch {
+            'H' => value * 3600,
+            'M' => value * 60,
+            'S' => value,
+            _ => return None,
+        };
+    }
+    (total > 0).then_some(total * 1000)
 }
 
 fn parse_yt_dimension(value: Option<&str>) -> Option<u32> {
