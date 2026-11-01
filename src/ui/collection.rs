@@ -1528,6 +1528,58 @@ pub fn tile_row() -> (ScrolledWindow, GtkBox) {
     let scrolled = ScrolledWindow::new();
     scrolled.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Never);
     scrolled.set_child(Some(&row));
+
+    // Колесо мыши прокручивает ряд по горизонтали: у горизонтального
+    // ScrolledWindow без этого вертикальный скролл игнорируется вообще.
+    let hadj = scrolled.hadjustment();
+    let anim_holder: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
+    let target_value = Rc::new(std::cell::Cell::new(hadj.value()));
+    let wheel = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+    {
+        let scrolled_for_anim = scrolled.clone();
+        wheel.connect_scroll(move |_, _dx, dy| {
+            let page = hadj.page_size();
+            // шаг поменьше и с анимацией: колесо прокручивает ряд мягко, а не рывком
+            let step = if page > 1.0 { page * 0.16 } else { 64.0 };
+            let max = (hadj.upper() - page).max(hadj.lower());
+            let current = hadj.value();
+            let mut base = target_value.get();
+            // если значение увели далеко (протяжка скроллбара) — считаем от факта
+            if (current - base).abs() > step {
+                base = current;
+            }
+            let next = (base + dy * step).clamp(hadj.lower(), max);
+            target_value.set(next);
+            if (next - current).abs() < 0.5 {
+                if (dy < 0.0 && current <= hadj.lower() + 0.5)
+                    || (dy > 0.0 && current >= max - 0.5)
+                {
+                    // край ряда: отдаём событие странице
+                    return gtk4::glib::Propagation::Proceed;
+                }
+                return gtk4::glib::Propagation::Stop;
+            }
+            if let Some(previous) = anim_holder.borrow_mut().take() {
+                previous.pause();
+            }
+            let from = current;
+            let adjustment = hadj.clone();
+            let target = libadwaita::CallbackAnimationTarget::new(move |v| {
+                adjustment.set_value(from + (next - from) * v);
+            });
+            let animation =
+                libadwaita::TimedAnimation::new(&scrolled_for_anim, 0.0, 1.0, 170, target);
+            animation.set_easing(libadwaita::Easing::EaseOutCubic);
+            let holder = anim_holder.clone();
+            animation.connect_done(move |_| {
+                *holder.borrow_mut() = None;
+            });
+            animation.play();
+            *anim_holder.borrow_mut() = Some(animation);
+            gtk4::glib::Propagation::Stop
+        });
+    }
+    scrolled.add_controller(wheel);
     (scrolled, row)
 }
 
