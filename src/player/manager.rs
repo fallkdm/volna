@@ -2533,6 +2533,26 @@ impl PlayerManager {
                 return;
             }
 
+            // Текущий трек мог не подходить под фильтр (например, англоязычный
+            // под «На русском»): тогда после обновления хвоста переключаемся
+            // на первый принятый. Если подходит — продолжаем играть.
+            let (liked_now, history_now) = snapshots_for_filters(&me);
+            let current_track = me.state.lock().unwrap().current_track.clone();
+            let current_ok = match current_track {
+                Some(track) => !apply_filters(
+                    &me.yt_client,
+                    vec![track],
+                    language.as_deref(),
+                    character.as_deref(),
+                    &liked_now,
+                    &history_now,
+                    2500,
+                )
+                .await
+                .is_empty(),
+                None => true,
+            };
+
             let updated_queue = {
                 let mut state = me.state.lock().unwrap();
                 let new_tracks = dedup_tracks(&state.queue, accepted);
@@ -2545,6 +2565,10 @@ impl PlayerManager {
                 state.queue.clone()
             };
             me.emit(PlayerUiEvent::QueueUpdated(updated_queue));
+            if !current_ok {
+                eprintln!("[tail_swap] текущий трек не подходит под фильтр — включаем первый принятый");
+                me.next_track();
+            }
             me.emit(PlayerUiEvent::LoadingState(false));
             me.prefetch_next_track();
             eprintln!("[tail_swap] epoch={} хвост обновлён", epoch);
