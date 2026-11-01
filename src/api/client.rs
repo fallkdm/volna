@@ -8,8 +8,9 @@ use super::models::{
     AccountStatus, Album, AlbumWithTracks, ArtistBrief, DownloadInfo, LikedAlbumItem,
     LikedTracksResult, LrclibResponse, Playlist, PlaylistWithTracks, RotorFeedback,
     RotorFeedbackType, RotorStationTracks, SearchResult, SimilarTracks, Track, TrackSupplement,
-    YandexApiResponse, parse_lrc,
+    YandexApiResponse,
 };
+use super::lrclib::{DURATION_TOLERANCE_SECS, LrclibFetch, lrclib_get, usable_synced};
 
 const BASE_API_URL: &str = "https://api.music.yandex.net";
 const USER_AGENT_VALUE: &str = "Volna/0.1 (Linux; unofficial client)";
@@ -58,12 +59,6 @@ fn pick_download_info<'a>(infos: &'a [DownloadInfo], quality: &str) -> Option<&'
     }
 }
 
-/// Результат запроса к LRCLIB
-enum LrclibFetch {
-    Found(reqwest::Response),
-    NotFound,
-    Failed,
-}
 
 /// Клиент для работы с API Яндекс Музыки
 /// Устройство аккаунта из `quasar.yandex.net/glagol/device_list`
@@ -953,31 +948,6 @@ impl YandexMusicClient {
         Ok(full_tracks.result)
     }
 
-    /// GET к LRCLIB с повтором: сервис нередко отвечает 429 (лимит на общий IP) или 5xx, а 404 означает «текста нет»
-    async fn lrclib_get(&self, url: &str) -> LrclibFetch {
-        for attempt in 0..3u64 {
-            let sent = self
-                .client
-                .get(url)
-                .header(
-                    "User-Agent",
-                    "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
-                )
-                .send()
-                .await;
-            match sent {
-                Ok(r) if r.status().is_success() => return LrclibFetch::Found(r),
-                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                    return LrclibFetch::NotFound;
-                }
-                _ => {
-                    tokio::time::sleep(std::time::Duration::from_millis(700 * (attempt + 1))).await
-                }
-            }
-        }
-        LrclibFetch::Failed
-    }
-
     /// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net)
     pub async fn get_lrclib_lyrics(
         &self,
@@ -1009,10 +979,10 @@ impl YandexMusicClient {
         };
 
         let mut plain_fallback: Option<String> = None;
-        let mut resp = self.lrclib_get(&make_url(duration_secs)).await;
+        let mut resp = lrclib_get(&self.client, &make_url(duration_secs)).await;
         // Если запрос с точной длительностью вернул 404, повторяем поиск без ограничения длительности
         if matches!(resp, LrclibFetch::NotFound) && duration_secs.is_some() {
-            resp = self.lrclib_get(&make_url(None)).await;
+            resp = lrclib_get(&self.client, &make_url(None)).await;
         }
         let resp = match resp {
             LrclibFetch::Found(r) => Some(r),
@@ -1035,7 +1005,7 @@ impl YandexMusicClient {
                         .as_deref()
                         .is_none_or(|n| crate::api::lrclib::same_artist_name(n, clean_artist))
                     && match (data.duration, duration_secs) {
-                        (Some(got), Some(want)) => (got - want as f64).abs() <= 4.0,
+                        (Some(got), Some(want)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
                         _ => true,
                     }
                     && !crate::api::lrclib::looks_like_foreign_song(
@@ -1089,7 +1059,7 @@ impl YandexMusicClient {
             "https://lrclib.net/api/search?q={}",
             urlencoding_encode(&format!("{title} {artist}"))
         );
-        let LrclibFetch::Found(resp) = self.lrclib_get(&url).await else {
+        let LrclibFetch::Found(resp) = lrclib_get(&self.client, &url).await else {
             return None;
         };
         let items: Vec<serde_json::Value> = resp.json().await.ok()?;
@@ -1120,7 +1090,7 @@ impl YandexMusicClient {
             .iter()
             .filter(|v| names_match(v))
             .filter(|v| match (duration_secs, v["duration"].as_f64()) {
-                (Some(want), Some(got)) => (got - want as f64).abs() <= 3.0,
+                (Some(want), Some(got)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
                 _ => true,
             })
             .filter(|v| {
@@ -1350,12 +1320,6 @@ impl YandexMusicClient {
     }
 }
 
-/// Синхронизированный текст годится, только если в нём хотя бы несколько строк: в базах встречаются
-/// огрызки из одной строки (например, у Kavinsky — Nightcall), и тогда весь экран показывал одну фразу
-fn usable_synced(text: &str) -> bool {
-    parse_lrc(text).len() >= 4
-}
-
 /// Убирает таймкоды `[mm:ss.xx]` в начале строк, оставляя сам текст
 fn strip_lrc_tags(text: &str) -> String {
     text.lines()
@@ -1428,6 +1392,8 @@ fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::models::parse_lrc;
+
     /// Доля треков с таймингами среди выдачи по нескольким запросам: `cargo test lyrics_coverage_live -- --ignored --nocapture`
     #[tokio::test]
     #[ignore]

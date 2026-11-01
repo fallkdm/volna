@@ -10,11 +10,27 @@ pub enum ProviderId {
     Vk,
 }
 
+/// Чип выдачи станции: подпись и вариант сида, который она открывает
+///
+/// У Яндекс.Волны это фильтры Ротора в ответе станции, у YouTube Music —
+/// кнопки над очередью («Знакомое», «Редкие треки», «Металл»…). У YT такой чип
+/// задаёт не фильтр поверх текущего микса, а другой его сид-вариант: подстановка
+/// `playlistId` чипа в запрос `next` меняет саму выдачу.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationChip {
+    /// Подпись чипа как её отдаёт сервис
+    pub label: String,
+    /// Идентификатор варианта станции (`playlistId` вида `RDAT…` для YT Music)
+    pub playlist_id: String,
+}
+
 /// Порция треков станции (радио / волны)
 #[derive(Debug, Clone)]
 pub struct StationBatch {
     pub batch_id: String,
     pub tracks: Vec<Track>,
+    /// Чипы, которые сервис предлагает вместе с этой порцией (может быть пусто)
+    pub chips: Vec<StationChip>,
 }
 
 /// События обратной связи воспроизведения для радиостанции
@@ -174,6 +190,7 @@ impl MusicProvider for YandexMusicClient {
         Ok(StationBatch {
             batch_id: res.batch_id.unwrap_or_default(),
             tracks,
+            chips: Vec::new(),
         })
     }
 

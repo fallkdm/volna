@@ -135,6 +135,41 @@ pub(super) fn extract_field_value(chunk: &str, field: &str) -> Option<String> {
 
 /// Извлечение названия трека и исполнителя из строки accessibility label
 pub(super) fn extract_track_label(chunk: &str) -> Option<(String, String)> {
+    let label = extract_accessibility_label(chunk)?;
+    // Формат label: "Happy Song (Official Audio) - Bring Me The Horizon - 3 минуты 57 секунд – воспроизвести"
+    let text_before = if let Some(p) = label.find("– воспроизвести") {
+        &label[..p]
+    } else if let Some(p) = label.find("- воспроизвести") {
+        &label[..p]
+    } else if let Some(p) = label.find("– play") {
+        &label[..p]
+    } else if let Some(p) = label.find("- play") {
+        &label[..p]
+    } else {
+        &label
+    };
+
+    let parts: Vec<&str> = text_before.split(" - ").collect();
+    let (title, artist) = if parts.len() >= 2 {
+        (parts[0], parts[1])
+    } else {
+        let parts: Vec<&str> = text_before.split('-').collect();
+        if parts.len() >= 2 {
+            (parts[0], parts[1])
+        } else {
+            return None;
+        }
+    };
+    let title = title.trim();
+    let artist = artist.trim();
+    if title.is_empty() || artist.is_empty() {
+        return None;
+    }
+    Some((title.to_string(), artist.to_string()))
+}
+
+/// Текст accessibility label строки списка (сырой, без обрезки хвоста).
+pub(super) fn extract_accessibility_label(chunk: &str) -> Option<String> {
     for prefix in &[
         "\\x22label\\x22:\\x22",
         "\"label\":\"",
@@ -146,40 +181,63 @@ pub(super) fn extract_track_label(chunk: &str) -> Option<(String, String)> {
             let tail = &chunk[start..];
             let end = tail.find(['"', '\\', '\'']).unwrap_or(tail.len());
             let label = &tail[..end];
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
+        }
+    }
+    None
+}
 
-            // Формат label: "Happy Song (Official Audio) - Bring Me The Horizon - 3 минуты 57 секунд – воспроизвести"
-            let text_before = if let Some(p) = label.find("– воспроизвести") {
-                &label[..p]
-            } else if let Some(p) = label.find("- воспроизвести") {
-                &label[..p]
-            } else if let Some(p) = label.find("– play") {
-                &label[..p]
-            } else if let Some(p) = label.find("- play") {
-                &label[..p]
-            } else {
-                label
-            };
-
-            let parts: Vec<&str> = text_before.split(" - ").collect();
-            if parts.len() >= 2 {
-                let title = parts[0].trim().to_string();
-                let artist = parts[1].trim().to_string();
-                if !title.is_empty() && !artist.is_empty() {
-                    return Some((title, artist));
-                }
-            } else {
-                let parts: Vec<&str> = text_before.split('-').collect();
-                if parts.len() >= 2 {
-                    let title = parts[0].trim().to_string();
-                    let artist = parts[1].trim().to_string();
-                    if !title.is_empty() && !artist.is_empty() {
-                        return Some((title, artist));
+/// Длительность трека из HTML-фрагмента строки списка.
+///
+/// В разметке берём `lengthText` («3:45»); если его нет — читаем хвост
+/// accessibility label («… - 3 минуты 57 секунд – воспроизвести»).
+pub(super) fn extract_duration_from_chunk(chunk: &str) -> Option<u64> {
+    for needle in &["\\x22lengthText\\x22", "\"lengthText\""] {
+        if let Some(pos) = chunk.find(needle) {
+            let tail = &chunk[pos..];
+            for field in &["\\x22text\\x22:\\x22", "\"text\":\"", "\"text\": \""] {
+                if let Some(fpos) = tail.find(field) {
+                    let start = fpos + field.len();
+                    let rest = &tail[start..];
+                    let end = rest.find(['"', '\\']).unwrap_or(rest.len());
+                    if let Some(ms) = parse_duration_ms(&rest[..end]) {
+                        return Some(ms);
                     }
                 }
             }
         }
     }
-    None
+    extract_accessibility_label(chunk).and_then(|label| parse_duration_text(&label))
+}
+
+/// Понимает длительность словами: «3 минуты 57 секунд», «1 час 2 минуты»,
+/// «3 minutes 57 seconds» — встречается в accessibility label.
+pub fn parse_duration_text(text: &str) -> Option<u64> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let mut total: u64 = 0;
+    let mut found = false;
+    for pair in words.windows(2) {
+        let Ok(value) = pair[0].parse::<u64>() else { continue };
+        let unit = pair[1];
+        let secs = if unit.starts_with("час") || unit.starts_with("hour") {
+            value * 3600
+        } else if unit.starts_with("минут") || unit.starts_with("minute") {
+            value * 60
+        } else if unit.starts_with("секунд") || unit.starts_with("second") {
+            value
+        } else {
+            continue;
+        };
+        total = total.saturating_add(secs);
+        found = true;
+    }
+    if found && total > 0 { Some(total * 1000) } else { None }
 }
 
 /// Извлечение continuation токена из сырого HTML в качестве фолбэка
@@ -374,7 +432,7 @@ pub fn parse_tracks_and_continuation_from_html(html: &str) -> (Vec<Track>, Optio
                             cover: None,
                         }],
                         albums: Vec::new(),
-                        duration_ms: None,
+                        duration_ms: extract_duration_from_chunk(chunk),
                         cover_uri: Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")),
                         og_image: None,
                         available: Some(true),

@@ -1375,6 +1375,62 @@ impl MusicProvider for YtMusicClient {
             return Ok(StationBatch {
                 batch_id: cont.unwrap_or_default(),
                 tracks,
+                chips: parser::parse_station_chips(&json),
+            });
+        }
+
+        // 0. Вариант станции из чипа YouTube Music: `variant:<playlistId>` (`RDAT…`)
+        //
+        // Подпись чипа не фильтрует текущий микс, а открывает другой его сид-вариант,
+        // поэтому `playlistId` из чипа подставляется в запрос вместо `RDAMVM<seed>`.
+        if let Some(playlist_id) = station_id.strip_prefix("variant:") {
+            let playlist_id = playlist_id.trim();
+            if playlist_id.is_empty() {
+                return Err("пустой playlistId варианта станции".into());
+            }
+            let seed_video_id = self
+                .last_seed
+                .read()
+                .await
+                .clone()
+                .unwrap_or_else(|| "bgKxYnTEN5Y".to_string());
+            let json = self
+                .post_innertube(
+                    "next",
+                    "WEB_REMIX",
+                    "1.20240101.01.00",
+                    serde_json::json!({
+                        "videoId": seed_video_id,
+                        "playlistId": playlist_id,
+                    }),
+                )
+                .await?;
+            let (tracks, continuation) = parser::parse_radio_batch(&json);
+            let chips = parser::parse_station_chips(&json);
+            if tracks.is_empty() {
+                // Вариант не отдал треков — возвращаем базовый автомикс того же сида
+                let base_json = self
+                    .post_innertube(
+                        "next",
+                        "WEB_REMIX",
+                        "1.20240101.01.00",
+                        serde_json::json!({
+                            "videoId": seed_video_id,
+                            "playlistId": format!("RDAMVM{}", seed_video_id),
+                        }),
+                    )
+                    .await?;
+                let (base_tracks, base_cont) = parser::parse_radio_batch(&base_json);
+                return Ok(StationBatch {
+                    batch_id: base_cont.unwrap_or_default(),
+                    tracks: base_tracks,
+                    chips: parser::parse_station_chips(&base_json),
+                });
+            }
+            return Ok(StationBatch {
+                batch_id: continuation.unwrap_or_default(),
+                tracks,
+                chips,
             });
         }
 
@@ -1428,6 +1484,7 @@ impl MusicProvider for YtMusicClient {
             .post_innertube("next", "WEB_REMIX", "1.20240101.01.00", body)
             .await?;
         let (mut tracks, mut continuation) = parser::parse_radio_batch(&json);
+        let mut chips = parser::parse_station_chips(&json);
 
         // Фолбэк: если треки не вернулись, делаем аварийный запрос с проверенным seed
         if tracks.is_empty() && seed_video_id != "bgKxYnTEN5Y" {
@@ -1446,6 +1503,7 @@ impl MusicProvider for YtMusicClient {
                     *guard = Some(fb_seed.to_string());
                     tracks = fb_tracks;
                     continuation = fb_cont;
+                    chips = parser::parse_station_chips(&fb_json);
                 }
             }
         }
@@ -1453,6 +1511,7 @@ impl MusicProvider for YtMusicClient {
         Ok(StationBatch {
             batch_id: continuation.unwrap_or_default(),
             tracks,
+            chips,
         })
     }
 

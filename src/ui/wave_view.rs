@@ -117,6 +117,9 @@ pub struct WaveViewWidgets {
     /// Куда ведёт клик по плашке (источник очереди или станция)
     pub source_target: Rc<RefCell<Option<crate::player::SourceTarget>>>,
     option_buttons: Rc<RefCell<Vec<Button>>>,
+    /// Чипы станции от сервиса (у YT Music — «Знакомое», «Редкие треки»…); пусто — ряд скрыт
+    pub chips_row: gtk4::FlowBox,
+    player: PlayerManager,
 }
 
 impl WaveViewWidgets {
@@ -147,6 +150,27 @@ impl WaveViewWidgets {
             }
             None => self.filter_pill.set_visible(false),
         }
+    }
+
+    /// Чипы станции, которые сервис прислал вместе с очередью
+    ///
+    /// У YouTube Music это не фильтры поверх текущего микса, а варианты его сида:
+    /// клик открывает станцию с `playlistId` чипа. Пустой список прячет ряд.
+    pub fn set_chips(&self, chips: &[crate::api::provider::StationChip]) {
+        while let Some(child) = self.chips_row.first_child() {
+            self.chips_row.remove(&child);
+        }
+        for chip in chips {
+            let btn = Button::with_label(&chip.label);
+            btn.add_css_class("wave-chip");
+            btn.set_valign(Align::Center);
+            btn.set_tooltip_text(Some("Переключить волну на этот вариант"));
+            let player = self.player.clone();
+            let playlist_id = chip.playlist_id.clone();
+            btn.connect_clicked(move |_| player.apply_station_variant(playlist_id.clone()));
+            self.chips_row.insert(&btn, -1);
+        }
+        self.chips_row.set_visible(!chips.is_empty());
     }
 
     /// Обновляет целевые цвета шейдера при переключении трека из derivedColors
@@ -345,6 +369,34 @@ pub fn create_wave_view(
     card_header.append(&card_title);
     card_header.append(&close_btn);
     popover_box.append(&card_header);
+
+    // Чипы станции от сервиса (у YT Music — «Знакомое», «Редкие треки», «Металл»…):
+    // приходят вместе с очередью, поэтому ряд скрыт, пока сервис их не прислал
+    let chips_row = gtk4::FlowBox::new();
+    chips_row.add_css_class("wave-chips");
+    chips_row.set_selection_mode(gtk4::SelectionMode::None);
+    chips_row.set_max_children_per_line(6);
+    chips_row.set_column_spacing(8);
+    chips_row.set_row_spacing(8);
+    chips_row.set_halign(Align::Center);
+    chips_row.set_valign(Align::Center);
+    let initial_chips = player.wave_chips();
+    if !initial_chips.is_empty() {
+        for chip in &initial_chips {
+            let btn = Button::with_label(&chip.label);
+            btn.add_css_class("wave-chip");
+            btn.set_valign(Align::Center);
+            btn.set_tooltip_text(Some("Переключить волну на этот вариант"));
+            let p_chip = player.clone();
+            let playlist_id = chip.playlist_id.clone();
+            btn.connect_clicked(move |_| p_chip.apply_station_variant(playlist_id.clone()));
+            chips_row.insert(&btn, -1);
+        }
+        chips_row.set_visible(true);
+    } else {
+        chips_row.set_visible(false);
+    }
+    popover_box.append(&chips_row);
 
     struct RotorFilterOption {
         label: &'static str,
@@ -590,7 +642,11 @@ pub fn create_wave_view(
     // Открытие по кнопке; закрытие — крестиком или кликом по затемнению
     {
         let pop = popover.clone();
-        menu_button.connect_clicked(move |_| pop.set_visible(true));
+        let p_for_menu = player.clone();
+        menu_button.connect_clicked(move |_| {
+            pop.set_visible(true);
+            p_for_menu.ensure_wave_chips();
+        });
         let pop = popover.clone();
         close_btn.connect_clicked(move |_| pop.set_visible(false));
         let click = gtk4::GestureClick::new();
@@ -635,6 +691,8 @@ pub fn create_wave_view(
         pill_close: pill_close.clone(),
         source_target: source_target.clone(),
         option_buttons,
+        chips_row,
+        player: player.clone(),
     }
 }
 

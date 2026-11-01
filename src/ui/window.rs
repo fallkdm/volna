@@ -1357,6 +1357,8 @@ impl VolnaWindow {
             is_collapsed.clone(),
         );
 
+        player.ensure_wave_chips();
+
         Self { window }
     }
 
@@ -1745,6 +1747,8 @@ fn setup_event_listener(
                         island.total_time_label.set_text(&format_seconds(total_secs));
                         island.seek_scale.set_range(0.0, total_secs as f64);
                     }
+
+                    player.ensure_wave_chips();
                 }
                 PlayerUiEvent::PlaybackToggled(is_playing) => {
                     *is_playing_state.borrow_mut() = is_playing;
@@ -1787,6 +1791,7 @@ fn setup_event_listener(
                     *wave_view.source_target.borrow_mut() = source.and_then(|s| s.target);
                 }
                 PlayerUiEvent::StationTarget(target) => *wave_view.source_target.borrow_mut() = target,
+                PlayerUiEvent::WaveChips(chips) => wave_view.set_chips(&chips),
                 PlayerUiEvent::RepeatChanged(mode) => {
                     let tip = match mode {
                         RepeatMode::Off => "Повтор: выключен",

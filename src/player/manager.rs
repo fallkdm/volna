@@ -4,7 +4,7 @@ use async_channel::Sender;
 
 use crate::api::client::YandexMusicClient;
 use crate::api::models::{Album, Playlist, Track, TrackSource};
-use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId};
+use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId, StationChip};
 use crate::api::provider_manager::ProviderManager;
 use crate::api::ytmusic::YtMusicClient;
 use super::audio::AudioBackend;
@@ -85,6 +85,8 @@ pub enum PlayerUiEvent {
     SourceContext(Option<PlaySource>),
     /// Страница, куда ведёт плашка Волны («По треку», «По артисту»)
     StationTarget(Option<SourceTarget>),
+    /// Чипы станции от сервиса («Знакомое», «Редкие треки», «Металл»…); пусто — чипов нет
+    WaveChips(Vec<crate::api::provider::StationChip>),
     /// Изменились настройки Discord (включение, Application ID)
     DiscordSettingsChanged,
     /// Изменились настройки плавного перехода между треками
@@ -141,6 +143,8 @@ pub struct PlayerState {
     pub pending_advance: bool,
     /// Догрузка уже пыталась продлить Волну и не дала ни одного нового трека
     pub wave_dead: bool,
+    /// Чипы станции от сервиса (варианты станции в YouTube Music)
+    pub wave_chips: Vec<crate::api::provider::StationChip>,
 }
 
 impl PlayerState {
@@ -206,6 +210,7 @@ impl Default for PlayerState {
             is_transitioning: false,
             pending_advance: false,
             wave_dead: false,
+            wave_chips: Vec::new(),
         }
     }
 }
@@ -489,11 +494,13 @@ impl PlayerManager {
             let _ = crate::api::auth::save_active_provider(id);
             if let Ok(mut state) = self.state.lock() {
                 state.liked_loaded = false;
+                state.wave_chips.clear();
             }
             let me = self.clone();
             tokio::spawn(async move {
                 me.ensure_liked_loaded().await;
             });
+            self.emit(PlayerUiEvent::WaveChips(Vec::new()));
             self.emit(PlayerUiEvent::ProviderChanged(id));
         }
     }
@@ -1246,6 +1253,12 @@ impl PlayerManager {
                     // Выброшенный хвост тоже не должен вернуться в следующей порции
                     me.wave_engine.lock().unwrap().remember_dropped(&dropped);
                 }
+                if !station_batch.chips.is_empty() {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.wave_chips = station_batch.chips.clone();
+                    }
+                    emit_all(&senders, PlayerUiEvent::WaveChips(station_batch.chips.clone()));
+                }
                 emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
                 if grew {
                     me.finish_pending_advance();
@@ -1378,6 +1391,7 @@ impl PlayerManager {
             state.current_mood = None;
             state.current_language = None;
             state.current_character = None;
+            state.wave_chips.clear();
             if let Some(t) = &first {
                 state.queue = vec![t.clone()];
                 state.current_index = 0;
@@ -1411,9 +1425,11 @@ impl PlayerManager {
             let provider = me.providers.current();
             let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
 
+            let mut wave_chips: Vec<StationChip> = Vec::new();
             let mut result: Result<(Vec<Track>, Option<String>), String> = if is_yt {
                 match provider.get_station_tracks(&station_id, None).await {
                     Ok(batch) => {
+                        wave_chips = batch.chips.clone();
                         let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                         Ok((batch.tracks, b_id))
                     }
@@ -1440,6 +1456,7 @@ impl PlayerManager {
                     if tr.is_empty() {
                         if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
                             if !batch.tracks.is_empty() {
+                                wave_chips = batch.chips.clone();
                                 let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                                 result = Ok((batch.tracks, b_id));
                             }
@@ -1447,6 +1464,11 @@ impl PlayerManager {
                     }
                 }
             }
+
+            if let Ok(mut state) = me.state.lock() {
+                state.wave_chips = wave_chips.clone();
+            }
+            me.emit(PlayerUiEvent::WaveChips(wave_chips));
 
             if first.is_none() {
                 me.emit(PlayerUiEvent::LoadingState(false));
@@ -2151,7 +2173,88 @@ impl PlayerManager {
         } else {
             "user:onyourwave".to_string()
         };
+        self.apply_wave_station(station_id, mood, language, character);
+    }
 
+    /// Переключает Волну на вариант станции из чипа YouTube Music (`playlistId` вида `RDAT…`)
+    ///
+    /// Чип — не фильтр поверх текущего микса, а другой его сид-вариант, поэтому станция
+    /// получает префикс `variant:`, который разбирает провайдер.
+    pub fn apply_station_variant(&self, playlist_id: String) {
+        let playlist_id = playlist_id.trim().to_string();
+        if playlist_id.is_empty() {
+            return;
+        }
+        let provider = self.providers.current();
+        if provider.provider_id() == ProviderId::YouTubeMusic && !provider.is_authenticated() {
+            self.emit(PlayerUiEvent::StatusMessage(
+                "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
+            ));
+            return;
+        }
+        self.apply_wave_station(format!("variant:{}", playlist_id), None, None, None);
+    }
+
+    /// Возвращает сохранённые чипы вариантов волны
+    pub fn wave_chips(&self) -> Vec<crate::api::provider::StationChip> {
+        self.state.lock().map(|s| s.wave_chips.clone()).unwrap_or_default()
+    }
+
+    /// Гарантирует наличие чипов станции для текущего контекста YouTube Music:
+    /// если они уже в памяти — пересылает в UI, иначе запрашивает в фоне
+    pub fn ensure_wave_chips(&self) {
+        let provider = self.providers.current();
+        if provider.provider_id() != ProviderId::YouTubeMusic {
+            return;
+        }
+
+        let (cached_chips, station_id) = {
+            let state = match self.state.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let sid = if !state.station_id.is_empty() && state.station_id != "user:onyourwave" {
+                state.station_id.clone()
+            } else if let Some(ref t) = state.current_track {
+                format!("track:{}", t.id)
+            } else {
+                "user:onyourwave".to_string()
+            };
+            (state.wave_chips.clone(), sid)
+        };
+
+        if !cached_chips.is_empty() {
+            self.emit(PlayerUiEvent::WaveChips(cached_chips));
+            return;
+        }
+
+        if !provider.is_authenticated() {
+            return;
+        }
+
+        let me = self.clone();
+        tokio::spawn(async move {
+            let provider = me.providers.current();
+            if let Ok(batch) = provider.get_station_tracks(&station_id, None).await {
+                if !batch.chips.is_empty() {
+                    if let Ok(mut state) = me.state.lock() {
+                        state.wave_chips = batch.chips.clone();
+                    }
+                    me.emit(PlayerUiEvent::WaveChips(batch.chips));
+                }
+            }
+        });
+    }
+
+    /// Общая часть запуска Волны: состояние под новый автомикс и первая порция треков
+    fn apply_wave_station(
+        &self,
+        station_id: String,
+        mood: Option<String>,
+        language: Option<String>,
+        character: Option<String>,
+    ) {
+        let is_reset = mood.is_none() && language.is_none() && character.is_none();
         let client_clone = self.client.clone();
         let state_clone = self.state.clone();
         let senders = self.event_senders.clone();
@@ -2201,9 +2304,12 @@ impl PlayerManager {
             }
 
             emit_all(&senders, PlayerUiEvent::LoadingState(true));
+            // Чипы, которые сервис прислал вместе с этой порцией (для YT Music — кнопки над очередью)
+            let mut wave_chips: Vec<StationChip> = Vec::new();
             let mut fetch_res: Result<(Vec<Track>, Option<String>), String> = if is_yt {
                 match provider.get_station_tracks(&station_id, None).await {
                     Ok(batch) => {
+                        wave_chips = batch.chips.clone();
                         let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                         Ok((batch.tracks, b_id))
                     }
@@ -2230,6 +2336,7 @@ impl PlayerManager {
                     if tr.is_empty() {
                         if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
                             if !batch.tracks.is_empty() {
+                                wave_chips = batch.chips.clone();
                                 let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                                 fetch_res = Ok((batch.tracks, b_id));
                             }
@@ -2237,6 +2344,12 @@ impl PlayerManager {
                     }
                 }
             }
+
+            // Пустой список — тоже ответ: он прячет чипы прежней станции (например, у Яндекса их нет)
+            if let Ok(mut state) = state_clone.lock() {
+                state.wave_chips = wave_chips.clone();
+            }
+            emit_all(&senders, PlayerUiEvent::WaveChips(wave_chips));
 
             match fetch_res {
                 Ok((tracks, batch_id)) => {
@@ -3210,5 +3323,17 @@ mod like_tests {
 
         let current_station = state_arc.lock().unwrap().station_id.clone();
         assert_eq!(current_station, "user:onyourwave");
+    }
+
+    #[test]
+    fn test_player_state_wave_chips() {
+        let mut state = PlayerState::default();
+        assert!(state.wave_chips.is_empty());
+        state.wave_chips.push(crate::api::provider::StationChip {
+            label: "Редкие треки".to_string(),
+            playlist_id: "RDATabc".to_string(),
+        });
+        assert_eq!(state.wave_chips.len(), 1);
+        assert_eq!(state.wave_chips[0].label, "Редкие треки");
     }
 }

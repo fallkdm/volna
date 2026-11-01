@@ -1,5 +1,11 @@
 use crate::api::models::{LrclibResponse, parse_lrc};
 
+/// Допуск по длительности при сверке записи LRCLIB с треком (±4 с).
+///
+/// Один на все сравнения (`/api/get`, `/api/search` и запасной поиск), чтобы «±N с»
+/// в документации не разъезжалось с кодом.
+pub const DURATION_TOLERANCE_SECS: f64 = 4.0;
+
 /// Статус ответа LRCLIB
 pub enum LrclibFetch {
     Found(reqwest::Response),
@@ -285,7 +291,7 @@ pub async fn lrclib_search_synced(
         .iter()
         .filter(|v| names_match(v))
         .filter(|v| match (duration_secs, v["duration"].as_f64()) {
-            (Some(want), Some(got)) => (got - want as f64).abs() <= 4.0,
+            (Some(want), Some(got)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
             _ => true,
         })
         .find_map(|v| {
@@ -353,7 +359,7 @@ pub async fn fetch_lrclib_lyrics(
             .as_deref()
             .is_none_or(|n| same_artist_name(n, clean_artist));
         let duration_matches = match (data.duration, duration_secs) {
-            (Some(got), Some(want)) => (got - want as f64).abs() <= 4.0,
+            (Some(got), Some(want)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
             _ => true,
         };
         let record_matches = matches_request(&data.track_name)

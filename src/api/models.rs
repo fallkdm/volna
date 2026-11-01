@@ -642,27 +642,60 @@ pub fn fix_mojibake(text: &str) -> String {
 
 pub fn parse_lrc(lrc_text: &str) -> Vec<LrcLine> {
     let mut lines = Vec::new();
+    // [offset:±N] — сдвиг всей дорожки в миллисекундах, может стоять где угодно до строк
+    let mut offset_ms: i64 = 0;
     for raw_line in lrc_text.lines() {
         let trimmed = raw_line.trim();
         if !trimmed.starts_with('[') {
             continue;
         }
 
-        if let Some(close_bracket) = trimmed.find(']') {
-            let time_part = &trimmed[1..close_bracket];
-            let text = fix_mojibake(trimmed[close_bracket + 1..].trim());
-
-            // mm:ss.xx
-            if let Some((min_str, sec_str)) = time_part.split_once(':') {
-                if let (Ok(mins), Ok(secs_f)) = (min_str.parse::<u64>(), sec_str.parse::<f64>()) {
-                    let time_ms = (mins * 60 * 1000) + (secs_f * 1000.0) as u64;
-                    lines.push(LrcLine { time_ms, text });
+        // Ведущих меток может быть несколько: [00:12.30][00:45.10]текст
+        let mut rest = trimmed;
+        let mut stamps: Vec<u64> = Vec::new();
+        while let Some(stripped) = rest.strip_prefix('[') {
+            let Some(close_bracket) = stripped.find(']') else {
+                break;
+            };
+            let tag = &stripped[..close_bracket];
+            if let Some(off) = tag.trim_start().strip_prefix("offset:") {
+                if let Ok(v) = off.trim().parse::<i64>() {
+                    offset_ms = v;
                 }
+            } else if let Some(ts) = parse_lrc_timestamp(tag) {
+                stamps.push(ts);
+            } else {
+                // [ti:], [ar:], [by:] и прочие служебные теги — не текст и не время
+                break;
             }
+            rest = &stripped[close_bracket + 1..];
+        }
+        if stamps.is_empty() {
+            continue;
+        }
+
+        let text = fix_mojibake(rest.trim());
+        for ts in stamps {
+            let time_ms = (ts as i64 + offset_ms).max(0) as u64;
+            lines.push(LrcLine {
+                time_ms,
+                text: text.clone(),
+            });
         }
     }
     lines.sort_by_key(|l| l.time_ms);
     lines
+}
+
+/// Разбирает одну метку времени LRC: mm:ss, mm:ss.xx, mm:ss,xxx.
+fn parse_lrc_timestamp(tag: &str) -> Option<u64> {
+    let (min_str, sec_str) = tag.split_once(':')?;
+    let mins: u64 = min_str.trim().parse().ok()?;
+    let secs: f64 = sec_str.trim().replace(',', ".").parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some(mins.saturating_mul(60_000) + (secs * 1000.0) as u64)
 }
 
 #[cfg(test)]
@@ -738,6 +771,29 @@ mod tests {
         assert_eq!(parsed[0].text, "Waiting in a car");
         assert_eq!(parsed[1].time_ms, 8500);
         assert_eq!(parsed[2].time_ms, 15100);
+    }
+
+    #[test]
+    fn test_parse_lrc_multi_stamp_offset_and_tags() {
+        let sample = [
+            "[ti:Test]",
+            "[offset:-250]",
+            "[00:10.00][00:20.00] припев",
+            "[00:30,500] финал",
+            "[xx:yy] мусор",
+        ]
+        .join("\n");
+        let parsed = parse_lrc(&sample);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].time_ms, 9750);
+        assert_eq!(parsed[0].text, "припев");
+        assert_eq!(parsed[1].time_ms, 19750);
+        assert_eq!(parsed[1].text, "припев");
+        assert_eq!(parsed[2].time_ms, 30250);
+        assert_eq!(parsed[2].text, "финал");
+
+        // Отрицательный сдвиг не уводит время в минус
+        assert_eq!(parse_lrc("[offset:-5000]\n[00:01.00] раз")[0].time_ms, 0);
     }
 
     #[test]

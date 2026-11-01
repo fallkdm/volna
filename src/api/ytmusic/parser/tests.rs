@@ -397,6 +397,74 @@ fn test_parse_radio_batch() {
 }
 
 #[test]
+fn test_parse_station_chips() {
+    // Форма ответа next: chipCloudRenderer с чипами-вариантами сида (RDAT…)
+    let json = json!({
+        "contents": {
+            "chipCloudRenderer": {
+                "chips": [
+                    {
+                        "chipCloudChipRenderer": {
+                            "text": { "runs": [{ "text": "Знакомое" }] },
+                            "navigationEndpoint": {
+                                "watchEndpoint": { "playlistId": "RDATiYvJQt3MFzt8PE" }
+                            }
+                        }
+                    },
+                    {
+                        "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Редкие треки" },
+                            "navigationEndpoint": {
+                                "watchEndpoint": { "playlistId": "RDATrare1234567" }
+                            }
+                        }
+                    },
+                    {
+                        // «Все» ведёт в тот же базовый автомикс — без playlistId
+                        "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Все" },
+                            "navigationEndpoint": { "watchEndpoint": { "videoId": "seed" } }
+                        }
+                    },
+                    {
+                        // Дубликат по playlistId отбрасывается
+                        "chipCloudChipRenderer": {
+                            "text": { "simpleText": "Знакомое" },
+                            "navigationEndpoint": {
+                                "watchEndpoint": { "playlistId": "RDATiYvJQt3MFzt8PE" }
+                            }
+                        }
+                    },
+                    {
+                        // Живая форма ответа: playlistId спрятан глубже —
+                        // queueUpdateCommand → fetchContentsCommand → watchEndpoint
+                        "chipCloudChipRenderer": {
+                            "text": { "runs": [{ "text": "Популярное" }] },
+                            "navigationEndpoint": {
+                                "queueUpdateCommand": {
+                                    "fetchContentsCommand": {
+                                        "watchEndpoint": { "playlistId": "RDATpYvbgKxYnTEN5Y" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                ]
+            }
+        }
+    });
+
+    let chips = parse_station_chips(&json);
+    assert_eq!(chips.len(), 3);
+    assert_eq!(chips[0].label, "Знакомое");
+    assert_eq!(chips[0].playlist_id, "RDATiYvJQt3MFzt8PE");
+    assert_eq!(chips[1].label, "Редкие треки");
+    assert_eq!(chips[2].label, "Популярное");
+    assert_eq!(chips[2].playlist_id, "RDATpYvbgKxYnTEN5Y");
+    assert!(parse_station_chips(&json!({})).is_empty());
+}
+
+#[test]
 fn test_parse_search_results() {
     let json = json!({
         "contents": {
@@ -1541,6 +1609,43 @@ fn test_extract_track_label_splits_title_and_artist() {
 }
 
 #[test]
+fn test_extract_duration_from_chunk() {
+    // Обычная и экранированная форма lengthText
+    assert_eq!(
+        extract_duration_from_chunk(r#"{"lengthText":{"runs":[{"text":"3:45"}]}}"#),
+        Some(225_000)
+    );
+    assert_eq!(
+        extract_duration_from_chunk(r#"\x22lengthText\x22:{\x22runs\x22:[{\x22text\x22:\x2201:02:03\x22}]}"#),
+        Some(3_723_000)
+    );
+
+    // lengthText нет — длительность берём словами из accessibility label
+    assert_eq!(
+        extract_duration_from_chunk(
+            r#"{"label":"Sad Song - Tokio Hotel - 1 час 2 минуты 3 секунды – воспроизвести"}"#
+        ),
+        Some(3_723_000)
+    );
+    assert_eq!(
+        extract_duration_from_chunk(r#""label":"Song - Artist - 4 minutes 12 seconds - play""#),
+        Some(252_000)
+    );
+
+    // Ни времени, ни подписи — None (а не ноль)
+    assert_eq!(extract_duration_from_chunk("no duration here"), None);
+}
+
+#[test]
+fn test_parse_duration_text_units() {
+    assert_eq!(parse_duration_text("3 минуты 57 секунд"), Some(237_000));
+    assert_eq!(parse_duration_text("45 секунд"), Some(45_000));
+    assert_eq!(parse_duration_text("2 hours 5 minutes"), Some(7_500_000));
+    assert_eq!(parse_duration_text("no numbers here"), None);
+    assert_eq!(parse_duration_text("3 tracks"), None);
+}
+
+#[test]
 fn test_parse_tracks_and_continuation_from_html() {
     // Один проход отдаёт и треки из initialData, и токен продолжения
     let html = r#"<script>initialData.push({path: '/browse', params: JSON.parse('{}'), data: '{\x22musicPlaylistShelfRenderer\x22:{\x22contents\x22:[{\x22musicResponsiveListItemRenderer\x22:{\x22playlistItemData\x22:{\x22videoId\x22:\x22dQw4w9WgXcQ\x22},\x22flexColumns\x22:[{\x22musicResponsiveListItemFlexColumnRenderer\x22:{\x22text\x22:{\x22runs\x22:[{\x22text\x22:\x22Never Gonna Give You Up\x22}]}}},{\x22musicResponsiveListItemFlexColumnRenderer\x22:{\x22text\x22:{\x22runs\x22:[{\x22text\x22:\x22Rick Astley\x22}]}}}]}}],\x22continuations\x22:[{\x22nextContinuationData\x22:{\x22continuation\x22:\x22CBQSTOKEN_1234567890\x22}}]}}'});</script>"#;
@@ -1555,6 +1660,8 @@ fn test_parse_tracks_and_continuation_from_html() {
         tracks[0].cover_uri.as_deref(),
         Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
     );
+    // В этом фрагменте lengthText нет, а label с длительностью есть не всегда
+    assert_eq!(tracks[0].duration_ms, None);
 }
 
 // --- Поиск идентификаторов и текста в ответах InnerTube ---
