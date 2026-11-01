@@ -574,6 +574,17 @@ menubutton.fluid-pill > button {
     background: rgba(255, 255, 255, 0.16);
 }
 
+/* Активный вариант станции: подсветка как у выбранного фильтра Волны */
+.wave-chips button.selected {
+    background: #ff6b4a;
+    border-color: #ff6b4a;
+    color: #ffffff;
+}
+
+.wave-chips button.selected:hover {
+    background: #ff7d60;
+}
+
 /* Всплывающие уведомления (тосты) Libadwaita: поднимаем выше плавающего острова плеера */
 toast {
     margin-bottom: 115px;

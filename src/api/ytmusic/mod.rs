@@ -1383,17 +1383,21 @@ impl MusicProvider for YtMusicClient {
         //
         // Подпись чипа не фильтрует текущий микс, а открывает другой его сид-вариант,
         // поэтому `playlistId` из чипа подставляется в запрос вместо `RDAMVM<seed>`.
-        if let Some(playlist_id) = station_id.strip_prefix("variant:") {
-            let playlist_id = playlist_id.trim();
-            if playlist_id.is_empty() {
-                return Err("пустой playlistId варианта станции".into());
-            }
-            let seed_video_id = self
-                .last_seed
-                .read()
-                .await
-                .clone()
-                .unwrap_or_else(|| "bgKxYnTEN5Y".to_string());
+        // Третья часть (`variant:<playlistId>:<videoId>`) задаёт сид явно: так Seed Drift
+        // и догрузка очереди остаются внутри выбранного варианта, а не уходят в общий микс.
+        if station_id.starts_with("variant:") && parse_variant_station(station_id).is_none() {
+            return Err("пустой playlistId варианта станции".into());
+        }
+        if let Some((playlist_id, seed_override)) = parse_variant_station(station_id) {
+            let seed_video_id = match seed_override {
+                Some(seed) => seed.to_string(),
+                None => self
+                    .last_seed
+                    .read()
+                    .await
+                    .clone()
+                    .unwrap_or_else(|| "bgKxYnTEN5Y".to_string()),
+            };
             let json = self
                 .post_innertube(
                     "next",
@@ -1527,9 +1531,39 @@ impl MusicProvider for YtMusicClient {
     }
 }
 
+/// Разбор идентификатора варианта станции: `variant:<playlistId>[:<videoId>]`.
+///
+/// Чип из ответа `next` несёт только `playlistId`; сид по умолчанию берётся из
+/// `last_seed`. Явный сид нужен догрузке очереди и Seed Drift: без него вариант
+/// станции терялся бы при первом же переезде на новый сид.
+fn parse_variant_station(station_id: &str) -> Option<(&str, Option<&str>)> {
+    let rest = station_id.strip_prefix("variant:")?;
+    let (playlist_id, seed) = match rest.split_once(':') {
+        Some((id, seed)) => (id.trim(), Some(seed.trim()).filter(|s| !s.is_empty())),
+        None => (rest.trim(), None),
+    };
+    if playlist_id.is_empty() {
+        return None;
+    }
+    Some((playlist_id, seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_variant_station() {
+        assert_eq!(parse_variant_station("variant:RDATabc"), Some(("RDATabc", None)));
+        assert_eq!(
+            parse_variant_station("variant:RDATabc:vid123"),
+            Some(("RDATabc", Some("vid123")))
+        );
+        // Пустой сид — как отсутствующий, а не «сид из пустой строки»
+        assert_eq!(parse_variant_station("variant:RDATabc:"), Some(("RDATabc", None)));
+        assert_eq!(parse_variant_station("variant:   "), None);
+        assert_eq!(parse_variant_station("track:vid123"), None);
+    }
 
     #[test]
     fn test_resolve_yt_dlp() {

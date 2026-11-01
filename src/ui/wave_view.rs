@@ -3,6 +3,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{glib, Align, Box as GtkBox, Button, Label, Orientation, Overlay};
 
+use crate::api::provider::StationChip;
 use crate::player::PlayerManager;
 
 /// Состояние цветов и параметров живого рендерера «Плавающего нечто»
@@ -119,7 +120,28 @@ pub struct WaveViewWidgets {
     option_buttons: Rc<RefCell<Vec<Button>>>,
     /// Чипы станции от сервиса (у YT Music — «Знакомое», «Редкие треки»…); пусто — ряд скрыт
     pub chips_row: gtk4::FlowBox,
+    /// Последние отрисованные чипы и активный вариант: чтобы не перерисовывать ряд вхолостую
+    chips_cache: Rc<RefCell<(Vec<StationChip>, Option<String>)>>,
     player: PlayerManager,
+}
+
+/// Кнопка-чип варианта станции; активный вариант подсвечен
+fn chip_button(player: &PlayerManager, chip: &StationChip, selected: bool) -> Button {
+    let btn = Button::with_label(&chip.label);
+    btn.add_css_class("wave-chip");
+    if selected {
+        btn.add_css_class("selected");
+    }
+    btn.set_valign(Align::Center);
+    btn.set_tooltip_text(Some(if selected {
+        "Текущий вариант волны"
+    } else {
+        "Переключить волну на этот вариант"
+    }));
+    let player = player.clone();
+    let playlist_id = chip.playlist_id.clone();
+    btn.connect_clicked(move |_| player.apply_station_variant(playlist_id.clone()));
+    btn
 }
 
 impl WaveViewWidgets {
@@ -156,18 +178,24 @@ impl WaveViewWidgets {
     ///
     /// У YouTube Music это не фильтры поверх текущего микса, а варианты его сида:
     /// клик открывает станцию с `playlistId` чипа. Пустой список прячет ряд.
-    pub fn set_chips(&self, chips: &[crate::api::provider::StationChip]) {
+    pub fn set_chips(&self, chips: &[StationChip]) {
+        let active = self.player.wave_variant_id();
+        {
+            // Ряд обновляется на каждом треке: без этой проверки кнопки пересоздавались
+            // бы вхолостую вместе с их подсветкой и обработчиками
+            let mut last = self.chips_cache.borrow_mut();
+            if last.0 == chips && last.1 == active {
+                self.chips_row.set_visible(!chips.is_empty());
+                return;
+            }
+            *last = (chips.to_vec(), active.clone());
+        }
         while let Some(child) = self.chips_row.first_child() {
             self.chips_row.remove(&child);
         }
         for chip in chips {
-            let btn = Button::with_label(&chip.label);
-            btn.add_css_class("wave-chip");
-            btn.set_valign(Align::Center);
-            btn.set_tooltip_text(Some("Переключить волну на этот вариант"));
-            let player = self.player.clone();
-            let playlist_id = chip.playlist_id.clone();
-            btn.connect_clicked(move |_| player.apply_station_variant(playlist_id.clone()));
+            let selected = active.as_deref() == Some(chip.playlist_id.as_str());
+            let btn = chip_button(&self.player, chip, selected);
             self.chips_row.insert(&btn, -1);
         }
         self.chips_row.set_visible(!chips.is_empty());
@@ -381,21 +409,13 @@ pub fn create_wave_view(
     chips_row.set_halign(Align::Center);
     chips_row.set_valign(Align::Center);
     let initial_chips = player.wave_chips();
-    if !initial_chips.is_empty() {
-        for chip in &initial_chips {
-            let btn = Button::with_label(&chip.label);
-            btn.add_css_class("wave-chip");
-            btn.set_valign(Align::Center);
-            btn.set_tooltip_text(Some("Переключить волну на этот вариант"));
-            let p_chip = player.clone();
-            let playlist_id = chip.playlist_id.clone();
-            btn.connect_clicked(move |_| p_chip.apply_station_variant(playlist_id.clone()));
-            chips_row.insert(&btn, -1);
-        }
-        chips_row.set_visible(true);
-    } else {
-        chips_row.set_visible(false);
+    let initial_active = player.wave_variant_id();
+    for chip in &initial_chips {
+        let selected = initial_active.as_deref() == Some(chip.playlist_id.as_str());
+        let btn = chip_button(player, chip, selected);
+        chips_row.insert(&btn, -1);
     }
+    chips_row.set_visible(!initial_chips.is_empty());
     popover_box.append(&chips_row);
 
     struct RotorFilterOption {
@@ -692,6 +712,7 @@ pub fn create_wave_view(
         source_target: source_target.clone(),
         option_buttons,
         chips_row,
+        chips_cache: Rc::new(RefCell::new((initial_chips, initial_active))),
         player: player.clone(),
     }
 }

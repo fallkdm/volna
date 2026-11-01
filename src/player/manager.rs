@@ -145,6 +145,11 @@ pub struct PlayerState {
     pub wave_dead: bool,
     /// Чипы станции от сервиса (варианты станции в YouTube Music)
     pub wave_chips: Vec<crate::api::provider::StationChip>,
+    /// Ключ станции, к которой относятся `wave_chips`; пусто — чипы ещё не спрашивали.
+    /// Пустой `wave_chips` при заполненном ключе — кэш «у станции вариантов нет»
+    pub wave_chips_station: String,
+    /// Ключ станции, для которой запрос чипов уже в полёте (защита от дублей)
+    pub wave_chips_pending: String,
 }
 
 impl PlayerState {
@@ -211,6 +216,8 @@ impl Default for PlayerState {
             pending_advance: false,
             wave_dead: false,
             wave_chips: Vec::new(),
+            wave_chips_station: String::new(),
+            wave_chips_pending: String::new(),
         }
     }
 }
@@ -495,6 +502,9 @@ impl PlayerManager {
             if let Ok(mut state) = self.state.lock() {
                 state.liked_loaded = false;
                 state.wave_chips.clear();
+                // У другого сервиса своя станция и свои чипы — кэш ответов не переносим
+                state.wave_chips_station.clear();
+                state.wave_chips_pending.clear();
             }
             let me = self.clone();
             tokio::spawn(async move {
@@ -1256,6 +1266,7 @@ impl PlayerManager {
                 if !station_batch.chips.is_empty() {
                     if let Ok(mut state) = state_clone.lock() {
                         state.wave_chips = station_batch.chips.clone();
+                        state.wave_chips_station = wave_chips_key(&station_id);
                     }
                     emit_all(&senders, PlayerUiEvent::WaveChips(station_batch.chips.clone()));
                 }
@@ -2200,31 +2211,43 @@ impl PlayerManager {
         self.state.lock().map(|s| s.wave_chips.clone()).unwrap_or_default()
     }
 
+    /// `playlistId` активного варианта станции, если Волна идёт от чипа
+    pub fn wave_variant_id(&self) -> Option<String> {
+        let station_id = self.state.lock().ok()?.station_id.clone();
+        variant_playlist_id(&station_id).map(str::to_string)
+    }
+
     /// Гарантирует наличие чипов станции для текущего контекста YouTube Music:
     /// если они уже в памяти — пересылает в UI, иначе запрашивает в фоне
+    ///
+    /// Кэш привязан к станции, а не к треку: ответ «чипов нет» тоже запоминается,
+    /// иначе каждый переход трека стоил бы лишнего запроса `next`.
     pub fn ensure_wave_chips(&self) {
         let provider = self.providers.current();
         if provider.provider_id() != ProviderId::YouTubeMusic {
             return;
         }
 
-        let (cached_chips, station_id) = {
+        let (cached_chips, cached_station, pending, station_request, station_key) = {
             let state = match self.state.lock() {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let sid = if !state.station_id.is_empty() && state.station_id != "user:onyourwave" {
-                state.station_id.clone()
-            } else if let Some(ref t) = state.current_track {
-                format!("track:{}", t.id)
-            } else {
-                "user:onyourwave".to_string()
-            };
-            (state.wave_chips.clone(), sid)
+            (
+                state.wave_chips.clone(),
+                state.wave_chips_station.clone(),
+                state.wave_chips_pending.clone(),
+                wave_chips_request(&state),
+                wave_chips_key(&state.station_id),
+            )
         };
 
         if !cached_chips.is_empty() {
             self.emit(PlayerUiEvent::WaveChips(cached_chips));
+            return;
+        }
+        // Станция уже ответила «вариантов нет» либо запрос за ними ещё в полёте
+        if cached_station == station_key || pending == station_key {
             return;
         }
 
@@ -2232,17 +2255,30 @@ impl PlayerManager {
             return;
         }
 
+        if let Ok(mut state) = self.state.lock() {
+            state.wave_chips_pending = station_key.clone();
+        }
+
         let me = self.clone();
         tokio::spawn(async move {
             let provider = me.providers.current();
-            if let Ok(batch) = provider.get_station_tracks(&station_id, None).await {
-                if !batch.chips.is_empty() {
-                    if let Ok(mut state) = me.state.lock() {
-                        state.wave_chips = batch.chips.clone();
-                    }
-                    me.emit(PlayerUiEvent::WaveChips(batch.chips));
+            let chips = match provider.get_station_tracks(&station_request, None).await {
+                Ok(batch) => batch.chips,
+                Err(err) => {
+                    eprintln!("[wave] чипы станции «{}»: {}", station_request, err);
+                    Vec::new()
                 }
+            };
+            if let Ok(mut state) = me.state.lock() {
+                // Станцию сменили, пока шёл запрос: ответ уже не про неё
+                if state.wave_chips_pending != station_key {
+                    return;
+                }
+                state.wave_chips = chips.clone();
+                state.wave_chips_station = station_key;
+                state.wave_chips_pending.clear();
             }
+            me.emit(PlayerUiEvent::WaveChips(chips));
         });
     }
 
@@ -2258,6 +2294,9 @@ impl PlayerManager {
         let client_clone = self.client.clone();
         let state_clone = self.state.clone();
         let senders = self.event_senders.clone();
+        // Чипы придут вместе с первой порцией; станция сразу помечается «в полёте»,
+        // чтобы UI не сходил за теми же чипами вторым запросом на TrackStarted
+        let chips_station = wave_chips_key(&station_id);
 
         {
             let mut state = self.state.lock().unwrap();
@@ -2266,6 +2305,13 @@ impl PlayerManager {
             state.current_character = character.clone();
             state.station_id = station_id.clone();
             state.restored = false;
+            // У варианта станции чипы описывают ту же станцию: прежний набор оставляем,
+            // чтобы ряд не исчезал, если ответ нового варианта придёт без чипов
+            if !station_id.starts_with("variant:") {
+                state.wave_chips.clear();
+            }
+            state.wave_chips_station.clear();
+            state.wave_chips_pending = chips_station.clone();
         }
         // Смена фильтра Ротора = новый автомикс, отсчёт дрейфа начинается заново
         self.wave_engine.lock().unwrap().mark_seed_started();
@@ -2290,6 +2336,11 @@ impl PlayerManager {
 
             if is_yt {
                 if !provider.is_authenticated() {
+                    // Запрос не состоится: снимаем пометку «чипы в полёте», иначе после
+                    // входа в аккаунт набор чипов для этой станции уже не дозапросится
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.wave_chips_pending.clear();
+                    }
                     emit_all(&senders, PlayerUiEvent::StatusMessage(
                         "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
                     ));
@@ -2345,11 +2396,23 @@ impl PlayerManager {
                 }
             }
 
-            // Пустой список — тоже ответ: он прячет чипы прежней станции (например, у Яндекса их нет)
+            // Пустой список — тоже ответ: он прячет чипы прежней станции (например, у Яндекса их нет).
+            // Исключение — выбранный вариант станции: его чипы относятся к той же станции,
+            // поэтому без них ряд исчез бы и вернуться к другому варианту было бы нечем
+            let mut effective_chips = wave_chips.clone();
             if let Ok(mut state) = state_clone.lock() {
-                state.wave_chips = wave_chips.clone();
+                if wave_chips.is_empty()
+                    && station_id.starts_with("variant:")
+                    && !state.wave_chips.is_empty()
+                {
+                    effective_chips = state.wave_chips.clone();
+                } else {
+                    state.wave_chips = wave_chips.clone();
+                }
+                state.wave_chips_station = chips_station.clone();
+                state.wave_chips_pending.clear();
             }
-            emit_all(&senders, PlayerUiEvent::WaveChips(wave_chips));
+            emit_all(&senders, PlayerUiEvent::WaveChips(effective_chips));
 
             match fetch_res {
                 Ok((tracks, batch_id)) => {
@@ -2887,12 +2950,53 @@ mod yt_track_selection_tests {
 /// Решение о том, что именно запросить у YouTube Music при догрузке Волны.
 #[derive(Debug, PartialEq, Eq)]
 struct WaveFetchPlan {
-    /// Аргумент `station_id` для провайдера: `user:onyourwave` либо `track:<id>`
+    /// Аргумент `station_id` для провайдера: `user:onyourwave`, `track:<id>`
+    /// либо выбранный вариант станции `variant:<playlistId>[:<id>]`
     station: String,
     /// Токен продолжения текущего автомикса
     continuation: Option<String>,
     /// Запрос начинает новый автомикс (первый запрос, Seed Drift или пере-сидирование)
     new_seed: bool,
+}
+
+/// `playlistId` выбранного варианта станции (`variant:<playlistId>[:<videoId>]`).
+///
+/// Вариант — не фильтр, а другой сид того же микса, поэтому при пере-сидировании его
+/// нужно сохранять: иначе клик по чипу откатывался к общей Волне после первого дрейфа.
+fn variant_playlist_id(station_id: &str) -> Option<&str> {
+    let rest = station_id.strip_prefix("variant:")?;
+    let playlist_id = rest.split(':').next().map(str::trim)?;
+    if playlist_id.is_empty() {
+        None
+    } else {
+        Some(playlist_id)
+    }
+}
+
+/// Ключ станции для кэша чипов.
+///
+/// Чипы описывают станцию, а не текущий трек, поэтому у «обычной Волны» ключ стабилен:
+/// иначе каждый переход трека считался бы новой станцией и запрос `next` уходил бы заново.
+fn wave_chips_key(station_id: &str) -> String {
+    let station_id = station_id.trim();
+    if station_id.is_empty() {
+        "user:onyourwave".to_string()
+    } else {
+        station_id.to_string()
+    }
+}
+
+/// Запрос станции, которым добываются чипы: они описывают станцию, но у «обычной
+/// Волны» сид — текущий трек, поэтому станция всё равно нужна конкретная.
+fn wave_chips_request(state: &PlayerState) -> String {
+    let station_id = state.station_id.trim();
+    if !station_id.is_empty() && station_id != "user:onyourwave" {
+        return station_id.to_string();
+    }
+    match state.current_track.as_ref().map(|track| track.id.trim()) {
+        Some(id) if !id.is_empty() => format!("track:{}", id),
+        _ => "user:onyourwave".to_string(),
+    }
 }
 
 /// План догрузки Волны для YouTube Music.
@@ -2918,7 +3022,12 @@ fn plan_wave_fetch(
     }
     match anchor {
         Some(id) => WaveFetchPlan {
-            station: format!("track:{}", id),
+            // Выбранный вариант станции переживает дрейф: `variant:<playlistId>:<якорь>`.
+            // Иначе клик по чипу молча откатывался к общему автомиксу того же сида.
+            station: match variant_playlist_id(station_id) {
+                Some(playlist_id) => format!("variant:{}:{}", playlist_id, id),
+                None => format!("track:{}", id),
+            },
             continuation: None,
             new_seed: true,
         },
@@ -3135,6 +3244,33 @@ mod wave_fetch_tests {
         assert_eq!(plan.station, "user:onyourwave");
         assert_eq!(plan.continuation, None);
         assert!(plan.new_seed);
+    }
+
+    #[test]
+    fn test_drift_keeps_selected_station_variant() {
+        let plan = plan_wave_fetch("variant:RDAT123", None, true, Some("new_seed_id"));
+        assert_eq!(
+            plan.station, "variant:RDAT123:new_seed_id",
+            "дрейф должен остаться внутри выбранного варианта станции"
+        );
+        assert_eq!(plan.continuation, None);
+        assert!(plan.new_seed);
+    }
+
+    #[test]
+    fn test_drift_replaces_previous_variant_seed() {
+        let plan = plan_wave_fetch("variant:RDAT123:old_seed", None, true, Some("new_seed_id"));
+        assert_eq!(plan.station, "variant:RDAT123:new_seed_id");
+    }
+
+    #[test]
+    fn test_variant_playlist_id_parsing() {
+        assert_eq!(variant_playlist_id("variant:RDAT123"), Some("RDAT123"));
+        assert_eq!(variant_playlist_id("variant:RDAT123:vid"), Some("RDAT123"));
+        assert_eq!(variant_playlist_id("variant:  "), None);
+        assert_eq!(variant_playlist_id("track:vid"), None);
+        assert_eq!(wave_chips_key(""), "user:onyourwave");
+        assert_eq!(wave_chips_key(" track:abc "), "track:abc");
     }
 }
 
