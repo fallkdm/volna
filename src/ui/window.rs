@@ -630,6 +630,67 @@ impl VolnaWindow {
             });
         }
 
+        // Караоке: сайдбар плавно уезжает влево и гаснет, чтобы не перекрывать текст,
+        // и возвращается, когда текст закрыли. Ширину макета не меняем — контент не дёргается.
+        let karaoke_sidebar_anim: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
+        let set_karaoke_sidebar: Rc<dyn Fn(bool)> = {
+            let sidebar = sidebar.clone();
+            let is_spotify = is_spotify_nav_state.clone();
+            let anim_holder = karaoke_sidebar_anim.clone();
+            let hidden_width = Rc::new(std::cell::Cell::new(0i32));
+            Rc::new(move |hide: bool| {
+                if !*is_spotify.borrow() {
+                    return;
+                }
+                if let Some(prev) = anim_holder.borrow_mut().take() {
+                    prev.pause();
+                }
+                if hide {
+                    if !sidebar.is_visible() {
+                        return;
+                    }
+                    let width = sidebar.width().max(1);
+                    hidden_width.set(width);
+                    sidebar.set_margin_start(0);
+                    sidebar.set_opacity(1.0);
+                    let s = sidebar.clone();
+                    let target = libadwaita::CallbackAnimationTarget::new(move |v| {
+                        s.set_margin_start(-((width as f64) * v) as i32);
+                        s.set_opacity(1.0 - v);
+                    });
+                    let anim = libadwaita::TimedAnimation::new(&sidebar, 0.0, 1.0, 220, target);
+                    anim.set_easing(libadwaita::Easing::EaseOutCubic);
+                    let s_done = sidebar.clone();
+                    anim.connect_done(move |_| {
+                        s_done.set_visible(false);
+                        s_done.set_margin_start(0);
+                        s_done.set_opacity(1.0);
+                    });
+                    anim.play();
+                    *anim_holder.borrow_mut() = Some(anim);
+                } else {
+                    let width = hidden_width.get().max(1);
+                    sidebar.set_visible(true);
+                    sidebar.set_margin_start(-width);
+                    sidebar.set_opacity(0.0);
+                    let s = sidebar.clone();
+                    let target = libadwaita::CallbackAnimationTarget::new(move |v| {
+                        s.set_margin_start(-((width as f64) * (1.0 - v)) as i32);
+                        s.set_opacity(v);
+                    });
+                    let anim = libadwaita::TimedAnimation::new(&sidebar, 0.0, 1.0, 220, target);
+                    anim.set_easing(libadwaita::Easing::EaseOutCubic);
+                    let s_done = sidebar.clone();
+                    anim.connect_done(move |_| {
+                        s_done.set_margin_start(0);
+                        s_done.set_opacity(1.0);
+                    });
+                    anim.play();
+                    *anim_holder.borrow_mut() = Some(anim);
+                }
+            })
+        };
+
         sidebar.set_visible(is_spotify_nav);
         view_switcher.set_visible(!is_spotify_nav);
         header_brand_box.set_visible(!is_spotify_nav);
@@ -914,6 +975,10 @@ impl VolnaWindow {
             let sheet = karaoke_overlay.clone();
             let (content, pill) = (wave_view.content_box.clone(), wave_view.filter_pill.clone());
             let stack = view_stack.clone();
+            let hide_sidebar = set_karaoke_sidebar.clone();
+            let sidebar_widget = sidebar.clone();
+            // запоминаем, что сайдбар спрятали именно мы: тогда и вернём только мы
+            let sidebar_hidden_by_karaoke = Rc::new(std::cell::Cell::new(false));
             // одна анимация на всех: новая сменяет текущую с того места, где та остановилась
             let current: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
             let want_open = Rc::new(std::cell::Cell::new(false));
@@ -926,6 +991,10 @@ impl VolnaWindow {
                     prev.pause();
                 }
                 if open {
+                    if !sidebar_hidden_by_karaoke.get() && sidebar_widget.is_visible() {
+                        hide_sidebar(true);
+                        sidebar_hidden_by_karaoke.set(true);
+                    }
                     sheet.set_margin_top(0);
                     // полупрозрачная подложка рассчитана на фон Волны; поверх Поиска и Медиатеки — плотная
                     if stack.visible_child_name().as_deref() == Some("wave") {
@@ -937,6 +1006,9 @@ impl VolnaWindow {
                         sheet.set_opacity(0.0);
                         sheet.set_visible(true);
                     }
+                }
+                if !open && sidebar_hidden_by_karaoke.replace(false) {
+                    hide_sidebar(false);
                 }
                 let to = if open { 1.0 } else { 0.0 };
                 let (t_sheet, t_content, t_pill) = (sheet.clone(), content.clone(), pill.clone());
