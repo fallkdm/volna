@@ -2396,6 +2396,27 @@ impl PlayerManager {
                 (dropped_tracks, seeds)
             };
             me.set_wave(true);
+            // Узкий пул вкуса добираем поиском по истории Яндекса (там могут быть
+            // любимые иностранные треки, открытые только в Яндексе), и лишь
+            // затем — сырыми id недавних прослушиваний.
+            let mut seeds = seeds;
+            if language.is_some() {
+                add_seeds_from_history_search(
+                    &me.yt_client,
+                    &mut seeds,
+                    language.as_deref(),
+                )
+                .await;
+                if seeds.len() < TAIL_SWAP_SEEDS {
+                    let extra = crate::api::history::load_recent_played()
+                        .into_iter()
+                        .filter(|id| id.len() == 11 && !id.starts_with("UC"))
+                        .filter(|id| !seeds.contains(id))
+                        .take(TAIL_SWAP_SEEDS - seeds.len())
+                        .collect::<Vec<String>>();
+                    seeds.extend(extra);
+                }
+            }
             // Лок `state` отпущен: порядок локов state → wave_engine не создаём
             let dropped_ids: Vec<String> = dropped_tracks.iter().map(|t| t.id.clone()).collect();
             me.wave_engine.lock().unwrap().remember_dropped(&dropped_ids);
@@ -2407,7 +2428,7 @@ impl PlayerManager {
             // (разные артисты из лайков) и ограничиваем число треков одного артиста,
             // иначе весь хвост оказывается «радио по одному исполнителю».
             let provider = me.providers.current();
-            let deadline = Instant::now() + Duration::from_secs(12);
+            let deadline = Instant::now() + Duration::from_secs(20);
             let mut accepted: Vec<Track> = Vec::new();
             let mut provider_empty = true;
             let mut per_artist: std::collections::HashMap<String, usize> =
@@ -2424,13 +2445,13 @@ impl PlayerManager {
                 seeds.iter().map(|id| format!("seed:{}", id)).collect()
             };
 
-            for (seed_idx, station) in stations.iter().enumerate() {
+            for station in stations.iter() {
                 if accepted.len() >= TAIL_SWAP_TARGET || Instant::now() >= deadline {
                     break;
                 }
                 let mut continuation: Option<String> = None;
                 let mut taken_from_seed = 0usize;
-                for round in 0..2u32 {
+                for _ in 0..2u32 {
                     if accepted.len() >= TAIL_SWAP_TARGET || Instant::now() >= deadline {
                         break;
                     }
@@ -2463,7 +2484,9 @@ impl PlayerManager {
                         dedup_tracks(&state.queue, pre)
                     };
                     let (liked, history) = snapshots_for_filters(&me);
-                    let budget = if seed_idx == 0 && round == 0 { 4800 } else { 2500 };
+                    // 4.8 с на каждый сид: lrclib_get при 429/404 тратит ~2.1 с
+                    // на ретраи, и меньший бюджет отбрасывал бы весь батч как Failed
+                    let budget = 4800;
                     let got = apply_filters(
                         &me.yt_client,
                         pre,
@@ -3138,10 +3161,10 @@ fn wave_loading_text(
 const TAIL_SWAP_TARGET: usize = 12;
 
 /// Сколько `Ambiguous`-кандидатов максимум опрашивается текстами за раунд
-const PHASE2_MAX_CANDIDATES: usize = 12;
+const PHASE2_MAX_CANDIDATES: usize = 8;
 
 /// Сколько сидов максимум перебираем, чтобы хвост не был радио одного артиста
-const TAIL_SWAP_SEEDS: usize = 4;
+const TAIL_SWAP_SEEDS: usize = 3;
 
 /// Не больше стольких треков одного артиста в обновлённом хвосте
 const MAX_TRACKS_PER_ARTIST: usize = 2;
@@ -3149,6 +3172,55 @@ const MAX_TRACKS_PER_ARTIST: usize = 2;
 /// Не больше стольких треков с одного сида: иначе один лейбл/артист
 /// заполняет весь хвост своим «радио-пузырём»
 const MAX_TRACKS_PER_SEED: usize = 4;
+
+/// Добирает сиды поиском в YouTube Music по трекам из истории Яндекса.
+///
+/// Пул вкуса YouTube Music бывает узким: любимые иностранные треки могли быть
+/// открыты только в Яндексе. Без этого «Иностранный» зацикливается на одном
+/// жанре (например, ню-роке из двух-трёх любимых групп).
+async fn add_seeds_from_history_search(
+    yt: &YtMusicClient,
+    seeds: &mut Vec<String>,
+    language: Option<&str>,
+) {
+    use super::filters::language as lf;
+
+    let filter = language.and_then(lf::parse_filter);
+    let Some(filter) = filter else {
+        return;
+    };
+    for item in crate::api::history::load_history_for(ProviderId::Yandex) {
+        if seeds.len() >= TAIL_SWAP_SEEDS {
+            break;
+        }
+        let crate::api::history::HistoryItem::Track(track) = item else {
+            continue;
+        };
+        let text = format!("{} {}", track.title, track.artists_string());
+        let matches = match filter {
+            lf::LanguageFilter::Russian => lf::has_cyrillic(&text),
+            lf::LanguageFilter::NotRussian => !lf::has_cyrillic(&text),
+            lf::LanguageFilter::WithoutWords => lf::has_instrumental_marker(&text),
+        };
+        if !matches {
+            continue;
+        }
+        let query = format!("{} {}", track.artists_string(), track.title);
+        let Ok(found) = yt.search_songs(&query).await else {
+            continue;
+        };
+        let best = pick_best_yt_track(&found, &track.title, track.duration_ms).or_else(|| {
+            found
+                .into_iter()
+                .find(|t| !t.id.is_empty() && crate::api::ytmusic::parser::is_clean_music_track(t))
+        });
+        if let Some(best) = best
+            && !seeds.contains(&best.id)
+        {
+            seeds.push(best.id);
+        }
+    }
+}
 
 /// Перемешивание без зависимости `rand` (xorshift на наносекундах).
 fn shuffle_tracks(items: &mut [Track]) {
@@ -3189,21 +3261,7 @@ fn select_wave_seeds(
     let mut seen_ids = std::collections::HashSet::new();
     pool.retain(|t| !t.id.is_empty() && seen_ids.insert(t.id.clone()));
 
-    let mut seeds = select_wave_seeds_from_pool(state, &pool, language, character);
-
-    // Пул вкуса бывает узким (два-три артиста). Добираем сырые id недавних
-    // YT-треков: метаданных для отбора нет, но фильтр всё равно применится
-    // к кандидатам, а неудачный сид просто даст мало принятых.
-    if language.is_some() && seeds.len() < TAIL_SWAP_SEEDS {
-        let extra = crate::api::history::load_recent_played()
-            .into_iter()
-            .filter(|id| id.len() == 11 && !id.starts_with("UC"))
-            .filter(|id| !seeds.contains(id))
-            .take(TAIL_SWAP_SEEDS - seeds.len())
-            .collect::<Vec<String>>();
-        seeds.extend(extra);
-    }
-    seeds
+    select_wave_seeds_from_pool(state, &pool, language, character)
 }
 
 /// Чистая часть выбора сидов: работает по явно переданному пулу.
@@ -3445,7 +3503,7 @@ async fn apply_filters(
                 (track.id.clone(), verdict)
             }
         }))
-        .buffer_unordered(3)
+        .buffer_unordered(5)
         .collect()
         .await;
 

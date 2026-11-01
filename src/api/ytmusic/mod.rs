@@ -1036,7 +1036,7 @@ impl YtMusicClient {
 
     /// Проба текста для алгоритмических фильтров Волны.
     ///
-    /// Порядок: маркер `.no_lyrics` → `.lrc`-кэш → LRCLib → InnerTube.
+    /// Порядок: маркер `.no_lyrics` → `.lrc`-кэш → InnerTube (быстро) → LRCLib.
     /// Негативный маркер пишется только когда оба источника ответили терминально
     /// (`LyricsLookup::NotFound` + `YtLyrics::NoTab`).
     pub async fn probe_lyrics(&self, track: &Track) -> crate::api::lrclib::LyricsLookup {
@@ -1061,30 +1061,35 @@ impl YtMusicClient {
         let artist = track.artists_string();
         let title = track.title.clone();
 
-        // 3. LRCLib
-        match crate::api::lrclib::lookup_lyrics(&self.http, &artist, &title, duration_secs).await {
-            LyricsLookup::Found(text) => {
-                let _ = std::fs::write(&cache_path, &text);
-                crate::cache::clear_negative_lyrics_marker(&track.id);
-                return LyricsLookup::Found(text);
-            }
-            LyricsLookup::Failed => return LyricsLookup::Failed,
-            LyricsLookup::WrongTrack => return LyricsLookup::WrongTrack,
-            LyricsLookup::NotFound => {}
+        // 3. Официальный текст InnerTube: один быстрый запрос. Для фильтра важна
+        // скорость: LRCLib при 429/404 тратит ~2.1 с на ретраи, и бюджет Фазы 2
+        // на пачке кандидатов выгорал почти весь.
+        let yt_status = self.get_yt_lyrics_status(&track.id).await;
+        if let YtLyrics::Found(text) = &yt_status {
+            let _ = std::fs::write(&cache_path, text);
+            crate::cache::clear_negative_lyrics_marker(&track.id);
+            return LyricsLookup::Found(text.clone());
         }
 
-        // 4. Официальный текст InnerTube
-        match self.get_yt_lyrics_status(&track.id).await {
-            YtLyrics::Found(text) => {
+        // 4. LRCLib (синхронизированный текст и фолбэк)
+        let lr = crate::api::lrclib::lookup_lyrics(&self.http, &artist, &title, duration_secs).await;
+        match lr {
+            LyricsLookup::Found(text) => {
                 let _ = std::fs::write(&cache_path, &text);
                 crate::cache::clear_negative_lyrics_marker(&track.id);
                 LyricsLookup::Found(text)
             }
-            YtLyrics::Failed => LyricsLookup::Failed,
-            YtLyrics::NoTab => {
-                // Оба источника ответили терминально — можно запоминать навсегда
-                crate::cache::write_negative_lyrics_marker(&track.id);
-                LyricsLookup::NotFound
+            LyricsLookup::Failed => LyricsLookup::Failed,
+            LyricsLookup::WrongTrack => LyricsLookup::WrongTrack,
+            LyricsLookup::NotFound => {
+                // Терминально, только если оба источника ответили «текста нет»
+                if matches!(yt_status, YtLyrics::NoTab) {
+                    crate::cache::write_negative_lyrics_marker(&track.id);
+                    LyricsLookup::NotFound
+                } else {
+                    // InnerTube не ответил (сеть) — кэшировать нельзя
+                    LyricsLookup::Failed
+                }
             }
         }
     }
