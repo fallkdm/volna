@@ -137,6 +137,10 @@ pub struct PlayerState {
     pub user_uid: Option<String>,
     /// Идет ли переход на новый трек (загрузка URL потока)
     pub is_transitioning: bool,
+    /// Очередь кончилась на Волне: ждём догрузку, по её приходу перейдём на новый трек
+    pub pending_advance: bool,
+    /// Догрузка уже пыталась продлить Волну и не дала ни одного нового трека
+    pub wave_dead: bool,
 }
 
 impl PlayerState {
@@ -200,6 +204,8 @@ impl Default for PlayerState {
             liked_pending: std::collections::HashMap::new(),
             user_uid: None,
             is_transitioning: false,
+            pending_advance: false,
+            wave_dead: false,
         }
     }
 }
@@ -277,6 +283,19 @@ impl PlayerManager {
         let client_mutex = Arc::new(Mutex::new(client.clone()));
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let wave_engine = Arc::new(Mutex::new(WaveEngine::new()));
+        // Поднимаем историю прослушивания с прошлого запуска: Волна не должна
+        // начинать новый день с тех же треков (свежие — в конец очереди истории).
+        {
+            let recent = crate::api::history::load_recent_played();
+            if !recent.is_empty() {
+                let mut engine = wave_engine.lock().unwrap();
+                for id in recent.iter().rev() {
+                    engine.record_played(id);
+                }
+                // Счётчик дрейфа — про текущий сид, а не про вчерашние треки
+                engine.mark_seed_started();
+            }
+        }
         let (cf_enabled, cf_dur) = crate::api::auth::load_crossfade();
         let crossfade = Arc::new(Mutex::new((cf_enabled, cf_dur)));
 
@@ -679,7 +698,7 @@ impl PlayerManager {
                     return;
                 }
             }
-            self.next_track();
+            self.next_track_inner(true);
         }
     }
 
@@ -813,7 +832,7 @@ impl PlayerManager {
             }
             _ => {}
         }
-        self.next_track();
+        self.next_track_inner(true);
     }
 
     /// Переключает повтор по кругу: нет → один трек → вся очередь (кроме Волны) → нет
@@ -834,6 +853,10 @@ impl PlayerManager {
         let reset = {
             let mut state = self.state.lock().unwrap();
             state.wave = wave;
+            // Смена режима — смена ожиданий: ждать догрузку или считать Волну мёртвой
+            // имеет смысл только внутри одной и той же очереди.
+            state.pending_advance = false;
+            state.wave_dead = false;
             if !wave {
                 state.wave_label = None;
             }
@@ -859,9 +882,68 @@ impl PlayerManager {
 
     /// Запускает следующий трек
     pub fn next_track(&self) {
+        self.next_track_inner(false);
+    }
+
+    /// Переход на следующий трек.
+    ///
+    /// `automatic` — переход случился сам (конец трека, автосводка), а не по нажатию
+    /// пользователя: только в этом случае «мёртвую» Волну разрешено остановить, а не
+    /// молча крутить тот же микс.
+    fn next_track_inner(&self, automatic: bool) {
         if self.resume_restored() {
             return;
         }
+
+        let decision = {
+            let state = self.state.lock().unwrap();
+            if state.queue.is_empty() {
+                return;
+            }
+            tail_advance(
+                state.wave,
+                state.repeat == RepeatMode::One,
+                state.current_index + 1 >= state.queue.len(),
+                state.wave_dead,
+                automatic,
+            )
+        };
+
+        match decision {
+            TailAdvance::Advance => {}
+            TailAdvance::RequestRefill => {
+                // Очередь кончилась: не заворачиваем её в начало, а просим новую порцию.
+                // Переход сделает `finish_pending_advance`, когда догрузка вернётся
+                // (`load_more_wave_tracks` → очередь выросла → next_track).
+                let request = {
+                    let mut state = self.state.lock().unwrap();
+                    state.wave_dead = false;
+                    let request = !state.pending_advance;
+                    state.pending_advance = true;
+                    request
+                };
+                if request {
+                    // Пока догрузка в пути, повторные нажатия «Далее» не плодят запросы.
+                    self.load_more_wave_tracks();
+                }
+                return;
+            }
+            TailAdvance::GiveUp => {
+                let mut state = self.state.lock().unwrap();
+                // Флаг снимаем: следующее нажатие «Далее» попробует догрузку заново.
+                state.wave_dead = false;
+                state.pending_advance = false;
+                drop(state);
+                self.audio.pause();
+                self.emit(PlayerUiEvent::PlaybackToggled(false));
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Волна выдохлась: провайдер не дал новых треков. Нажмите «Далее», чтобы попробовать другой сид"
+                        .to_string(),
+                ));
+                return;
+            }
+        }
+
         let (next_track, idx, total, is_liked) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
@@ -901,6 +983,32 @@ impl PlayerManager {
 
         self.play_track_stream(&next_track);
         self.prefetch_next_track();
+    }
+
+    /// Догрузка вернулась: если мы ждали продления в конце очереди — самое время перейти.
+    fn finish_pending_advance(&self) {
+        let has_next = {
+            let mut state = self.state.lock().unwrap();
+            let waiting = std::mem::take(&mut state.pending_advance);
+            waiting && state.current_index + 1 < state.queue.len()
+        };
+        if has_next {
+            // Идём «автоматическим» путём: если хвост снова окажется последним треком,
+            // обработка даст честную остановку, а не ещё один запрос.
+            self.next_track_inner(true);
+        }
+    }
+
+    /// Ожидание в конце очереди не оправдалось: очередь не выросла.
+    ///
+    /// Ничего не останавливаем здесь — трек ещё может играть (пользователь нажал
+    /// «Далее» в середине песни). Остановку сделает `next_track_inner`, когда играть
+    /// будет уже нечего.
+    fn mark_wave_refill_dead(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.pending_advance {
+            state.wave_dead = true;
+        }
     }
 
     /// Предварительно подготавливает и буферизует следующий трек очереди (на диске и аппаратно в GStreamer)
@@ -1020,6 +1128,8 @@ impl PlayerManager {
         let state_clone = self.state.clone();
         let wave_engine_clone = self.wave_engine.clone();
         let senders = self.event_senders.clone();
+        // Нужен, чтобы после догрузки перейти на новый трек, если очередь кончилась
+        let me = self.clone();
 
         let (station_id, batch_id, mood, language, character) = {
             let state = self.state.lock().unwrap();
@@ -1087,6 +1197,7 @@ impl PlayerManager {
 
                 let Some(station_batch) = station_batch.filter(|b| !b.tracks.is_empty()) else {
                     eprintln!("[wave] волна выдохлась: станция «{}» не дала новых треков", station_id);
+                    me.mark_wave_refill_dead();
                     return;
                 };
 
@@ -1096,20 +1207,34 @@ impl PlayerManager {
                 }
 
                 let filtered = wave_engine_clone.lock().unwrap().filter_candidates(station_batch.tracks);
-                let updated_queue = {
+                let updated = {
                     let mut state = state_clone.lock().unwrap();
                     state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
                     let new_tracks = dedup_tracks(&state.queue, filtered);
+                    let mut dropped: Vec<String> = Vec::new();
                     if drift_due && !new_tracks.is_empty() {
                         // Свежий сид заменяет ещё не сыгранный хвост старого микса:
                         // иначе очередь растёт бесконечно и в ней копятся треки чужого сида.
-                        let keep = state.current_index + 1;
+                        let keep = (state.current_index + 1).min(state.queue.len());
+                        dropped = state.queue[keep..].iter().map(|t| t.id.clone()).collect();
                         state.queue.truncate(keep);
                     }
+                    let before = state.queue.len();
                     state.queue.extend(new_tracks);
-                    state.queue.clone()
+                    (state.queue.clone(), state.queue.len() > before, dropped)
                 };
+                let (updated_queue, grew, dropped) = updated;
+                if !dropped.is_empty() {
+                    // Выброшенный хвост тоже не должен вернуться в следующей порции
+                    me.wave_engine.lock().unwrap().remember_dropped(&dropped);
+                }
                 emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                if grew {
+                    me.finish_pending_advance();
+                } else {
+                    // Батч пришёл, но всё в нём уже есть в очереди.
+                    me.mark_wave_refill_dead();
+                }
                 return;
             }
 
@@ -1130,19 +1255,26 @@ impl PlayerManager {
                 let new_tracks: Vec<Track> =
                     station_tracks.sequence.into_iter().map(|s| s.track).collect();
                 if new_tracks.is_empty() {
+                    me.mark_wave_refill_dead();
                     return;
                 }
                 let filtered = wave_engine_clone.lock().unwrap().filter_candidates(new_tracks);
 
-                let updated_queue = {
+                let (updated_queue, grew) = {
                     let mut state = state_clone.lock().unwrap();
                     state.batch_id = station_tracks.batch_id;
                     let new_tracks = dedup_tracks(&state.queue, filtered);
+                    let before = state.queue.len();
                     state.queue.extend(new_tracks);
-                    state.queue.clone()
+                    (state.queue.clone(), state.queue.len() > before)
                 };
 
                 emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                if grew {
+                    me.finish_pending_advance();
+                } else {
+                    me.mark_wave_refill_dead();
+                }
             }
         });
     }
@@ -1219,6 +1351,10 @@ impl PlayerManager {
             let mut state = self.state.lock().unwrap();
             state.crossfade_triggered = false;
             state.is_transitioning = true;
+            // Новая станция — новый цикл: прежние «очередь кончилась» и «волна мертва»
+            // относятся к прошлой подборке.
+            state.pending_advance = false;
+            state.wave_dead = false;
             state.station_id = station_id.clone();
             state.batch_id = None;
             state.current_mood = None;
@@ -1352,6 +1488,8 @@ impl PlayerManager {
             let mut state = self.state.lock().unwrap();
             state.crossfade_triggered = false;
             state.is_transitioning = true;
+            state.pending_advance = false;
+            state.wave_dead = false;
             state.queue = tracks.clone();
             state.current_index = index;
             state.current_track = Some(track.clone());
@@ -1668,6 +1806,7 @@ impl PlayerManager {
         let client = self.client.lock().unwrap().clone();
         spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
         crate::api::history::save_last_track(track);
+        crate::api::history::remember_played(&track.id);
         self.wave_engine.lock().unwrap().record_played(&track.id);
         {
             let mut state = self.state.lock().unwrap();
@@ -2657,6 +2796,96 @@ fn plan_wave_fetch(
             continuation: None,
             new_seed: true,
         },
+    }
+}
+
+/// Что делать, когда текущий трек — последний в очереди.
+#[derive(Debug, PartialEq, Eq)]
+enum TailAdvance {
+    /// Обычный переход на следующий трек (`current_index + 1`), в том числе заворот
+    /// очереди в начало при повторе.
+    Advance,
+    /// Волна кончилась: просим у провайдера новую порцию и ждём её, вместо того чтобы
+    /// начинать тот же микс по второму кругу.
+    RequestRefill,
+    /// Догрузка уже не дала ничего нового — честно останавливаемся.
+    GiveUp,
+}
+
+/// Решение о переходе с последнего трека очереди.
+///
+/// Раньше `next_track` заворачивал индекс `(current_index + 1) % queue.len()` при любом
+/// режиме. Для обычной очереди это ожидаемый повтор, а для Волны — тихая деградация:
+/// если догрузка не принесла треков (истощение continuation, сеть, фильтры), слушатель
+/// вместо новой подборки получал тот же микс с начала, без единого сообщения.
+fn tail_advance(
+    wave: bool,
+    repeat_one: bool,
+    at_tail: bool,
+    dead: bool,
+    automatic: bool,
+) -> TailAdvance {
+    if !at_tail || !wave || repeat_one {
+        return TailAdvance::Advance;
+    }
+    if dead && automatic {
+        return TailAdvance::GiveUp;
+    }
+    TailAdvance::RequestRefill
+}
+
+#[cfg(test)]
+mod tail_advance_tests {
+    use super::*;
+
+    #[test]
+    fn test_plain_queue_at_tail_wraps_as_before() {
+        assert_eq!(
+            tail_advance(false, false, true, false, true),
+            TailAdvance::Advance
+        );
+        // даже «мёртвая» волна не влияет на обычную очередь
+        assert_eq!(
+            tail_advance(false, false, true, true, true),
+            TailAdvance::Advance
+        );
+    }
+
+    #[test]
+    fn test_wave_mid_queue_advances_without_extra_request() {
+        assert_eq!(
+            tail_advance(true, false, false, false, true),
+            TailAdvance::Advance
+        );
+    }
+
+    #[test]
+    fn test_wave_at_tail_requests_refill_instead_of_wrapping() {
+        assert_eq!(
+            tail_advance(true, false, true, false, true),
+            TailAdvance::RequestRefill
+        );
+        // ручное «Далее» тоже просит новую порцию, даже если автопопытка уже провалилась
+        assert_eq!(
+            tail_advance(true, false, true, true, false),
+            TailAdvance::RequestRefill
+        );
+    }
+
+    #[test]
+    fn test_wave_at_tail_gives_up_only_on_automatic_advance() {
+        assert_eq!(
+            tail_advance(true, false, true, true, true),
+            TailAdvance::GiveUp
+        );
+    }
+
+    #[test]
+    fn test_repeat_one_keeps_replaying_even_on_wave() {
+        assert_eq!(
+            tail_advance(true, true, true, true, true),
+            TailAdvance::Advance
+        );
     }
 }
 

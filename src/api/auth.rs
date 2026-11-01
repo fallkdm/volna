@@ -76,6 +76,9 @@ pub struct AppConfig {
     /// История поиска YouTube Music
     #[serde(default)]
     pub ytmusic_history_items: Vec<serde_json::Value>,
+    /// Недавно проигранное (свежие первыми): Волна не должна повторять это после перезапуска
+    #[serde(default)]
+    pub recent_played: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -101,6 +104,7 @@ impl Default for AppConfig {
             active_provider: None,
             ytmusic_refresh_token: None,
             ytmusic_cookie: None,
+            recent_played: Vec::new(),
         }
     }
 }

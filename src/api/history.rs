@@ -173,6 +173,30 @@ pub fn clear_history_for(provider: ProviderId) {
     let _ = save_config(&config);
 }
 
+/// Сколько последних проигранных треков помнить между запусками
+const RECENT_PLAYED_LIMIT: usize = 50;
+
+/// Недавно проигранное, свежие первыми — чтобы Волна не повторяла вчерашнее после перезапуска
+pub fn load_recent_played() -> Vec<String> {
+    let config = load_config().unwrap_or_default();
+    let mut list = config.recent_played;
+    list.truncate(RECENT_PLAYED_LIMIT);
+    list
+}
+
+/// Запоминает проигранный трек (без дублей, свежее — первым)
+pub fn remember_played(track_id: &str) {
+    let id = track_id.trim();
+    if id.is_empty() {
+        return;
+    }
+    let mut config = load_config().unwrap_or_default();
+    config.recent_played.retain(|x| x != id);
+    config.recent_played.insert(0, id.to_string());
+    config.recent_played.truncate(RECENT_PLAYED_LIMIT);
+    let _ = save_config(&config);
+}
+
 /// Запоминает последний проигранный трек
 pub fn save_last_track(track: &Track) {
     let mut config = load_config().unwrap_or_default();

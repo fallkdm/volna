@@ -85,6 +85,24 @@ impl WaveEngine {
         self.played_since_seed = self.played_since_seed.saturating_add(1);
     }
 
+    /// Треки, которые Волна выбросила из хвоста очереди (Seed Drift), тоже не должны
+    /// вернуться в следующей порции — но счётчик сыгранного они не увеличивают.
+    pub fn remember_dropped<T: AsRef<str>>(&mut self, ids: &[T]) {
+        for id in ids {
+            let id = id.as_ref().trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(pos) = self.recent_history.iter().position(|x| x == id) {
+                self.recent_history.remove(pos);
+            }
+            self.recent_history.push_back(id.to_string());
+            while self.recent_history.len() > MAX_RECENT_HISTORY {
+                self.recent_history.pop_front();
+            }
+        }
+    }
+
     /// Пора ли переезжать на свежий сид (Seed Drift)
     pub fn seed_drift_due(&self) -> bool {
         self.played_since_seed >= SEED_DRIFT_AFTER_TRACKS
@@ -230,5 +248,20 @@ mod tests {
         assert_eq!(engine.played_since_seed, 0);
         // История сыгранного при смене сида не сбрасывается — иначе вернутся те же треки
         assert_eq!(engine.recent_history.len(), SEED_DRIFT_AFTER_TRACKS + 5);
+    }
+
+    #[test]
+    fn test_remember_dropped_does_not_count_as_played() {
+        let mut engine = WaveEngine::new();
+        engine.remember_dropped(&["dropped_a", "dropped_b", "dropped_a", "  "]);
+
+        // Выброшенный хвост уходит в историю (без дублей) ...
+        assert_eq!(
+            engine.recent_history.iter().cloned().collect::<Vec<_>>(),
+            vec!["dropped_b".to_string(), "dropped_a".to_string()]
+        );
+        // ... но сыгранными эти треки не считаются
+        assert_eq!(engine.played_since_seed, 0);
+        assert!(!engine.seed_drift_due());
     }
 }
