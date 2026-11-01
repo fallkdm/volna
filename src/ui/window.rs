@@ -769,8 +769,11 @@ impl VolnaWindow {
         // Нижний плеер (парящий остров или прижатый док)
         let island = create_floating_island(&player);
         super::floating_island::apply_player_layout(&island, &player_layout);
+        // Фон панели должен доходить до низа окна, а футер (сервис, настройки) —
+        // подниматься над плеером. Поэтому отступ живёт на футере, не на сайдбаре.
         let sb_bottom = if player_layout == "dock" { 96 } else { 108 };
-        sidebar.set_margin_bottom(sb_bottom);
+        sidebar.set_margin_bottom(0);
+        sidebar_footer.set_margin_bottom(SIDEBAR_FOOTER_MARGIN + sb_bottom);
 
         root_overlay.set_child(Some(&app_body_overlay));
         root_overlay.add_overlay(&island.container);
@@ -1453,6 +1456,26 @@ impl VolnaWindow {
 
 /// Появление цифры отсчёта: плавное проявление, лёгкий «наплыв» сверху вниз и затухание к концу секунды.
 /// Меняются только прозрачность и верхний отступ одной метки, поэтому это дёшево.
+/// Базовый отступ футера сайдбара; сверху добавляется место под плеер.
+const SIDEBAR_FOOTER_MARGIN: i32 = 16;
+
+/// Первый потомок с CSS-классом — нужен, чтобы обновлять футер из обработчика событий.
+fn find_child_by_css<T: IsA<gtk4::Widget>>(root: &impl IsA<gtk4::Widget>, class: &str) -> Option<T> {
+    let mut child = root.as_ref().first_child();
+    while let Some(widget) = child {
+        if widget.has_css_class(class)
+            && let Ok(found) = widget.clone().downcast::<T>()
+        {
+            return Some(found);
+        }
+        if let Some(found) = find_child_by_css::<T>(&widget, class) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
 fn animate_countdown_digit(label: &Label) {
     const BASE_MARGIN: i32 = 90;
     let target_label = label.clone();
@@ -2116,7 +2139,11 @@ fn setup_event_listener(
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
                     let sb_margin = if layout == "dock" { 96 } else { 108 };
-                    sidebar.set_margin_bottom(sb_margin);
+                    if let Some(footer) =
+                        find_child_by_css::<GtkBox>(&sidebar, "sidebar-footer")
+                    {
+                        footer.set_margin_bottom(SIDEBAR_FOOTER_MARGIN + sb_margin);
+                    }
                     main_content_box.set_margin_bottom(if layout == "dock" { 92 } else { 0 });
                 }
                 PlayerUiEvent::ThemeAccentChanged(accent) => {
