@@ -2345,7 +2345,7 @@ impl PlayerManager {
             me.ensure_liked_loaded().await;
 
             // 1. Короткий лок: фильтры, обрезка хвоста, выбор сида
-            let (dropped, station_id) = {
+            let (dropped_tracks, station_id) = {
                 let mut state = me.state.lock().unwrap();
                 state.current_language = language.clone();
                 state.current_character = character.clone();
@@ -2355,13 +2355,11 @@ impl PlayerManager {
                 state.refill_failures = 0;
 
                 let keep = (state.current_index + 1).min(state.queue.len());
-                let ids: Vec<String> = state
+                let dropped_tracks: Vec<Track> = state
                     .queue
                     .get(keep..)
                     .unwrap_or(&[])
-                    .iter()
-                    .map(|t| t.id.clone())
-                    .collect();
+                    .to_vec();
                 state.queue.truncate(keep);
 
                 let station_id = match select_wave_seed(
@@ -2374,11 +2372,12 @@ impl PlayerManager {
                 };
                 state.station_id = station_id.clone();
                 state.restored = false;
-                (ids, station_id)
+                (dropped_tracks, station_id)
             };
             me.set_wave(true);
             // Лок `state` отпущен: порядок локов state → wave_engine не создаём
-            me.wave_engine.lock().unwrap().remember_dropped(&dropped);
+            let dropped_ids: Vec<String> = dropped_tracks.iter().map(|t| t.id.clone()).collect();
+            me.wave_engine.lock().unwrap().remember_dropped(&dropped_ids);
             me.wave_engine.lock().unwrap().mark_seed_started();
 
             // 2. Сеть и фильтрация
@@ -2463,16 +2462,33 @@ impl PlayerManager {
                 return;
             }
 
+            eprintln!(
+                "[filter] сид {} -> принято {}: {}",
+                station_id,
+                accepted.len(),
+                accepted
+                    .iter()
+                    .map(|t| format!("{} ({})", t.title, t.artists_string()))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
             if accepted.is_empty() {
                 if provider_empty {
                     eprintln!("[filter] provider empty batch");
                 } else {
                     eprintln!("[filter] rejected all candidates");
                 }
-                let mut state = me.state.lock().unwrap();
-                state.wave_dead = true;
-                state.pending_advance = false;
-                drop(state);
+                let restored_queue = {
+                    let mut state = me.state.lock().unwrap();
+                    state.wave_dead = true;
+                    state.pending_advance = false;
+                    // Ничего не подошло — возвращаем прежний хвост, чтобы не оставить
+                    // пользователя с одной песней в очереди
+                    let restored = dedup_tracks(&state.queue, dropped_tracks);
+                    state.queue.extend(restored);
+                    state.queue.clone()
+                };
+                me.emit(PlayerUiEvent::QueueUpdated(restored_queue));
                 me.emit(PlayerUiEvent::StatusMessage(
                     "Не удалось найти треки под выбранный фильтр".to_string(),
                 ));
@@ -2987,9 +3003,12 @@ fn select_wave_seed(
 ) -> Option<String> {
     use super::filters::language as lf;
 
+    // Сид YouTube Music может быть только из YT-трека: яндексовый id для
+    // `RDAMVM<seed>` бессмыслен (после переключения провайдера текущий трек чужой).
     let current = state
         .current_track
         .as_ref()
+        .filter(|t| t.source == TrackSource::YouTubeMusic)
         .map(|t| t.id.clone())
         .filter(|id| !id.is_empty());
 
@@ -3890,7 +3909,12 @@ mod filter_pipeline_tests {
     fn state_with(tracks: Vec<Track>, current: Option<&str>) -> PlayerState {
         let mut state = PlayerState::default();
         state.liked_tracks_cache = tracks;
-        state.current_track = current.map(|id| track(id, "Current", "Artist", None));
+        state.current_track = current.map(|id| {
+            let mut t = track(id, "Current", "Artist", None);
+            // Сид YouTube Music берётся только из YT-трека
+            t.source = TrackSource::YouTubeMusic;
+            t
+        });
         state
     }
 
