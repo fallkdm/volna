@@ -8,7 +8,7 @@ use libadwaita::{
 
 use crate::api::auth::{
     load_clips, load_crossfade, load_discord, load_genius_token, load_lastfm_key, load_nav_style,
-    load_player_layout, load_quality, load_theme_accent, load_token, save_clips, save_crossfade,
+    load_player_layout, load_quality, load_theme_accent, load_token, save_crossfade,
     save_discord_client_id, save_discord_rpc, save_genius_token, save_lastfm_key, save_nav_style,
     save_player_layout, save_quality, save_theme_accent, save_token,
 };
@@ -226,16 +226,13 @@ pub fn show_preferences_dialog(
     let clips_group = PreferencesGroup::new();
     let clips_row = libadwaita::SwitchRow::builder()
         .title("Клипы на фоне")
-        .subtitle("Если у трека есть клип в Яндексе, его короткое превью (4–10 с) зациклено и полупрозрачно играет на фоне Волны. Скачивается несколько МБ на трек. Применится со следующего трека")
+        .subtitle("Полные клипы для настоящих музыкальных видео YouTube и короткие зацикленные превью Яндекс Музыки. Арт-треки со статичной обложкой пропускаются")
         .active(load_clips())
         .build();
     {
         let p = player.clone();
         clips_row.connect_active_notify(move |row| {
-            let _ = save_clips(row.is_active());
-            if !row.is_active() {
-                p.emit(crate::player::PlayerUiEvent::ClipUpdated(None));
-            }
+            p.set_clips_enabled(row.is_active());
         });
     }
     clips_group.add(&clips_row);

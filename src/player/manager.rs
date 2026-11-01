@@ -45,6 +45,34 @@ impl PlaySource {
     }
 }
 
+/// Какой клип показывать: от этого зависят зацикливание, кроп и прозрачность слоя.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipKind {
+    /// Короткое зацикленное превью Яндекса: поля обрезаются яркостной эвристикой
+    YandexPreview,
+    /// Свой клип альбома из `custom_clips`
+    Custom,
+    /// Полноценный клип YouTube: без зацикливания, без кропа, выше прозрачность
+    YouTubeFull,
+}
+
+/// Запрос на показ локального клипа.
+#[derive(Debug, Clone)]
+pub struct ClipRequest {
+    pub track_id: String,
+    pub epoch: u64,
+    pub attempt_id: u64,
+    pub kind: ClipKind,
+    pub path: String,
+}
+
+/// Показ или снятие клипа; оба варианта несут идентификаторы для проверки актуальности.
+#[derive(Debug, Clone)]
+pub enum ClipUpdate {
+    Show(ClipRequest),
+    Clear { track_id: String, epoch: u64 },
+}
+
 /// События плеера для обновления интерфейса
 #[derive(Debug, Clone)]
 pub enum PlayerUiEvent {
@@ -67,8 +95,8 @@ pub enum PlayerUiEvent {
     QueueUpdated(Vec<Track>),
     CoverUpdated(String),
     LyricsUpdated(String),
-    /// Путь к скачанному превью-клипу трека для фона Волны; `None` — клипа нет или он выключен
-    ClipUpdated(Option<String>),
+    /// Клип на фоне Волны: показать локальный файл или погасить слой
+    ClipUpdated(ClipUpdate),
     RepeatChanged(RepeatMode),
     /// Тип включённой Волны для плашки сверху: «По артисту: …», «По треку: …»; `None` — простая Волна или не Волна
     WaveContext(Option<String>),
@@ -335,7 +363,12 @@ impl PlayerManager {
         let yt_client_arc = Arc::new(yt_client.clone());
         let clip_telemetry = Arc::new(super::clip_telemetry::ClipTelemetry::new());
         clip_telemetry.set_enabled(crate::api::auth::load_clips());
-        let clips = super::clip::ClipBackground::new(yt_client_arc.clone(), clip_telemetry);
+        let clip_events = Arc::new(Mutex::new(event_senders.clone()));
+        let clips = super::clip::ClipBackground::new(
+            yt_client_arc.clone(),
+            clip_telemetry,
+            clip_events,
+        );
 
         let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
         let ytmusic_provider = Arc::new(yt_client) as Arc<dyn MusicProvider>;
@@ -433,7 +466,14 @@ impl PlayerManager {
             self.emit(PlayerUiEvent::CoverUpdated(path));
         }
         if let Ok(path) = std::env::var("VOLNA_DEMO_CLIP") {
-            self.emit(PlayerUiEvent::ClipUpdated(Some(path)));
+            let track_id = std::env::var("VOLNA_DEMO_CLIP_TRACK").unwrap_or_else(|_| "demo".to_string());
+            self.emit(PlayerUiEvent::ClipUpdated(ClipUpdate::Show(ClipRequest {
+                track_id,
+                epoch: 0,
+                attempt_id: 0,
+                kind: ClipKind::Custom,
+                path,
+            })));
         }
         self.emit(PlayerUiEvent::StreamQuality("MP3 192".into()));
         self.emit(PlayerUiEvent::LyricsUpdated(lrc));
@@ -521,7 +561,8 @@ impl PlayerManager {
         if enabled
             && let Some(track) = self.state.lock().ok().and_then(|s| s.current_track.clone())
         {
-            self.clips.spawn_clip_for_track(&track);
+            let epoch = self.generation.load(Ordering::SeqCst);
+            self.clips.spawn_clip_for_track(&track, epoch);
         }
     }
 
@@ -534,7 +575,8 @@ impl PlayerManager {
             && !status.local_clip_active
             && let Some(track) = self.state.lock().ok().and_then(|s| s.current_track.clone())
         {
-            self.clips.spawn_clip_for_track(&track);
+            let epoch = self.generation.load(Ordering::SeqCst);
+            self.clips.spawn_clip_for_track(&track, epoch);
         }
         removed
     }
@@ -2917,7 +2959,7 @@ fn spawn_cover_and_lyrics(
     clips: &super::clip::ClipBackground,
 ) {
     // Фоновый клип: резолв и загрузка не ждут звука и UI
-    clips.spawn_clip_for_track(track);
+    clips.spawn_clip_for_track(track, epoch);
     if let Some(cover_url) = track.cover_url(400) {
         let (senders, generation) = (senders.clone(), generation.clone());
         tokio::spawn(async move {
@@ -2951,8 +2993,18 @@ fn spawn_cover_and_lyrics(
             // свои клипы альбома важнее клипов Яндекса
             if let Some(path) = crate::cache::custom_clip_for(&clip_track) {
                 if generation.load(Ordering::SeqCst) == epoch {
-                    emit_all(&senders, PlayerUiEvent::ClipUpdated(Some(path.to_string_lossy().to_string())));
+                    emit_all(&senders, PlayerUiEvent::ClipUpdated(ClipUpdate::Show(ClipRequest {
+                        track_id: clip_track.id.clone(),
+                        epoch,
+                        attempt_id: 0,
+                        kind: ClipKind::Custom,
+                        path: path.to_string_lossy().to_string(),
+                    })));
                 }
+                return;
+            }
+            // клипом YouTube Music занимается ClipBackground: резолв, кэш и арт-треки
+            if clip_track.source == TrackSource::YouTubeMusic {
                 return;
             }
             let path = match client.get_clip_url_for_track(&clip_track).await {
@@ -2969,7 +3021,17 @@ fn spawn_cover_and_lyrics(
                 None => None,
             };
             if generation.load(Ordering::SeqCst) == epoch {
-                emit_all(&senders, PlayerUiEvent::ClipUpdated(path.map(|p| p.to_string_lossy().to_string())));
+                let update = match path {
+                    Some(p) => ClipUpdate::Show(ClipRequest {
+                        track_id: clip_track.id.clone(),
+                        epoch,
+                        attempt_id: 0,
+                        kind: ClipKind::YandexPreview,
+                        path: p.to_string_lossy().to_string(),
+                    }),
+                    None => ClipUpdate::Clear { track_id: clip_track.id.clone(), epoch },
+                };
+                emit_all(&senders, PlayerUiEvent::ClipUpdated(update));
             }
         });
     }
@@ -4273,6 +4335,7 @@ mod like_tests {
             clips: crate::player::clip::ClipBackground::new(
                 Arc::new(YtMusicClient::new()),
                 Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+                Arc::new(Mutex::new(Vec::new())),
             ),
             state: state_arc.clone(),
             wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
@@ -4320,6 +4383,7 @@ mod like_tests {
             clips: crate::player::clip::ClipBackground::new(
                 Arc::new(YtMusicClient::new()),
                 Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+                Arc::new(Mutex::new(Vec::new())),
             ),
             state: state_arc.clone(),
             wave_engine: Arc::new(Mutex::new(WaveEngine::new())),

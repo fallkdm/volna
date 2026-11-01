@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::clip_telemetry::{ClipSource, ClipTelemetry};
+use super::manager::{ClipKind, ClipRequest, ClipUpdate, PlayerUiEvent};
 use crate::api::models::{Track, TrackSource};
 use crate::api::ytmusic::{VideoClipError, VideoClipResolution, YtMusicClient};
 use crate::cache::{self, ClipDownloadError, YoutubeClipDownload};
@@ -102,6 +103,8 @@ pub struct ClipBackground {
     yt: Arc<YtMusicClient>,
     negative: Arc<Mutex<HashMap<String, NegativeEntry>>>,
     attempt: Arc<AtomicU64>,
+    /// Канал событий в UI: показ/снятие клипа
+    events: Arc<Mutex<Vec<async_channel::Sender<PlayerUiEvent>>>>,
     /// Поколение запросов: защищает от повторного запуска той же задачи на тот же трек
     generation: Arc<AtomicU64>,
     /// Треки, для которых задача уже запускалась в текущем поколении:
@@ -110,10 +113,15 @@ pub struct ClipBackground {
 }
 
 impl ClipBackground {
-    pub fn new(yt: Arc<YtMusicClient>, telemetry: Arc<ClipTelemetry>) -> Self {
+    pub fn new(
+        yt: Arc<YtMusicClient>,
+        telemetry: Arc<ClipTelemetry>,
+        events: Arc<Mutex<Vec<async_channel::Sender<PlayerUiEvent>>>>,
+    ) -> Self {
         Self {
             telemetry,
             yt,
+            events,
             negative: Arc::default(),
             attempt: Arc::new(AtomicU64::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
@@ -188,7 +196,31 @@ impl ClipBackground {
     }
 
     /// Решает судьбу клипа трека в фоне. Сеть не блокирует звук и UI.
-    pub fn spawn_clip_for_track(&self, track: &Track) {
+    fn emit(&self, event: PlayerUiEvent) {
+        let Ok(mut senders) = self.events.lock() else {
+            return;
+        };
+        senders.retain(|sender| sender.send_blocking(event.clone()).is_ok());
+    }
+
+    fn show(&self, track_id: &str, epoch: u64, attempt_id: u64, kind: ClipKind, path: &std::path::Path) {
+        self.emit(PlayerUiEvent::ClipUpdated(ClipUpdate::Show(ClipRequest {
+            track_id: track_id.to_string(),
+            epoch,
+            attempt_id,
+            kind,
+            path: path.to_string_lossy().to_string(),
+        })));
+    }
+
+    fn clear(&self, track_id: &str, epoch: u64) {
+        self.emit(PlayerUiEvent::ClipUpdated(ClipUpdate::Clear {
+            track_id: track_id.to_string(),
+            epoch,
+        }));
+    }
+
+    pub fn spawn_clip_for_track(&self, track: &Track, epoch: u64) {
         // Один трек — одна задача: трек стартует из нескольких мест, и второй
         // заход затирал бы метрики реальной загрузки кэш-хитом.
         let generation = self.generation.load(Ordering::SeqCst);
@@ -208,43 +240,48 @@ impl ClipBackground {
         let this = self.clone();
         let track = track.clone();
         tokio::spawn(async move {
-            this.run(track).await;
+            this.run(track, epoch).await;
         });
     }
 
-    async fn run(&self, track: Track) {
+    async fn run(&self, track: Track, epoch: u64) {
         let track_id = track.id.clone();
         let attempt_id = self.attempt.fetch_add(1, Ordering::SeqCst) + 1;
 
-        if !crate::api::auth::load_clips() {
+        // Состояние включённости берём из телеметрии, а не с диска: настройку
+        // меняет менеджер, и лишнее чтение конфига в фоне не нужно.
+        if !self.telemetry.snapshot().enabled {
             self.telemetry.begin_track(&track_id, attempt_id);
             self.telemetry.no_clip();
+            self.clear(&track_id, epoch);
             return;
         }
 
         self.telemetry.begin_track(&track_id, attempt_id);
 
         // Свои клипы альбома важнее любого сервисного
-        if crate::cache::custom_clip_for(&track).is_some() {
+        if let Some(path) = crate::cache::custom_clip_for(&track) {
             self.telemetry.set_source(ClipSource::Custom);
+            self.show(&track_id, epoch, attempt_id, ClipKind::Custom, &path);
             return;
         }
 
         if track.source != TrackSource::YouTubeMusic {
-            // Ветка Яндекса не меняется в этом этапе: там работают превью-клипы
+            // Превью Яндекса и свои клипы приходят своим путём из spawn_cover_and_lyrics
             self.telemetry.no_clip();
             return;
         }
 
-        if crate::cache::cached_youtube_clip(&track_id).is_some() {
+        if let Some(path) = crate::cache::cached_youtube_clip(&track_id) {
             crate::cache::touch_youtube_clip(&track_id);
             self.telemetry.set_source(ClipSource::Mv);
             self.telemetry.set_download(Some(0), Some(0));
+            self.show(&track_id, epoch, attempt_id, ClipKind::YouTubeFull, &path);
             return;
         }
 
         if let Some(result) = self.negative_result(&track_id) {
-            self.apply_negative(&track_id, result);
+            self.apply_negative(&track_id, epoch, result);
             return;
         }
 
@@ -253,7 +290,7 @@ impl ClipBackground {
             Err(error) => {
                 let negative = ClipNegative::from_resolve(&error);
                 self.record_negative(&track_id, negative.clone());
-                self.apply_negative(&track_id, negative);
+                self.apply_negative(&track_id, epoch, negative);
                 return;
             }
         };
@@ -261,7 +298,7 @@ impl ClipBackground {
         let (url, duration_secs, format) = match resolved {
             VideoClipResolution::ArtTrack => {
                 self.record_negative(&track_id, ClipNegative::ArtTrack);
-                self.apply_negative(&track_id, ClipNegative::ArtTrack);
+                self.apply_negative(&track_id, epoch, ClipNegative::ArtTrack);
                 return;
             }
             VideoClipResolution::MusicVideo {
@@ -299,6 +336,7 @@ impl ClipBackground {
                 self.telemetry.set_source(ClipSource::Mv);
                 self.telemetry.set_error(None);
                 crate::cache::clean_youtube_clips_lru(Some(&track_id));
+                self.show(&track_id, epoch, attempt_id, ClipKind::YouTubeFull, &path);
                 println!(
                     "[clip] {track_id}: клип готов за {elapsed_ms} мс, {} байт",
                     bytes
@@ -307,7 +345,7 @@ impl ClipBackground {
             Ok(YoutubeClipDownload::ArtTrack) => {
                 self.telemetry.set_download(Some(elapsed_ms), Some(written));
                 self.record_negative(&track_id, ClipNegative::ArtTrack);
-                self.apply_negative(&track_id, ClipNegative::ArtTrack);
+                self.apply_negative(&track_id, epoch, ClipNegative::ArtTrack);
             }
             Err(ClipDownloadError::Cancelled) => {
                 // устаревшая или выключенная попытка: не ошибка трека
@@ -316,7 +354,7 @@ impl ClipBackground {
                 let negative = ClipNegative::from_download(&error);
                 self.telemetry.set_download(Some(elapsed_ms), Some(written));
                 self.record_negative(&track_id, negative.clone());
-                self.apply_negative(&track_id, negative);
+                self.apply_negative(&track_id, epoch, negative);
                 if let ClipDownloadError::Io(details) = &error {
                     println!("[clip] {track_id}: {details}");
                 }
@@ -324,7 +362,8 @@ impl ClipBackground {
         }
     }
 
-    fn apply_negative(&self, track_id: &str, negative: ClipNegative) {
+    fn apply_negative(&self, track_id: &str, epoch: u64, negative: ClipNegative) {
+        self.clear(track_id, epoch);
         if negative == ClipNegative::ArtTrack {
             self.telemetry.art_track();
             self.telemetry.set_format(None);
@@ -372,7 +411,7 @@ mod tests {
     fn negative_cache_suppresses_then_expires() {
         let yt = Arc::new(YtMusicClient::new());
         let telemetry = Arc::new(ClipTelemetry::new());
-        let clips = ClipBackground::new(yt, telemetry);
+        let clips = ClipBackground::new(yt, telemetry, Arc::new(Mutex::new(Vec::new())));
 
         clips.record_negative("a", ClipNegative::DownloadTimeout);
         assert_eq!(clips.negative_result("a"), Some(ClipNegative::DownloadTimeout));

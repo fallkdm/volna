@@ -242,6 +242,15 @@ pub fn create_wave_view(
     // Клип на фоне: декодер пишет кадры в общую ячейку, шейдер их показывает
     let clip_shared = std::sync::Arc::new(super::wave_clip::ClipShared::default());
     let clip = Rc::new(super::wave_clip::ClipController::new(clip_shared.clone()));
+    {
+        // Свежая позиция звука нужна ровно перед стартовым seek клипа
+        let audio_for_clip = player.audio.clone();
+        clip.set_audio_provider(Rc::new(move || {
+            audio_for_clip
+                .position_ms()
+                .map(|ms| (ms, audio_for_clip.is_playing()))
+        }));
+    }
     // Запасной фон под GLArea: статичный градиент темы; показывается, только если OpenGL недоступен
     let fallback = GtkBox::new(Orientation::Vertical, 0);
     fallback.add_css_class("ambient-backdrop");
@@ -272,6 +281,10 @@ pub fn create_wave_view(
         let play_btn_ref = play_btn.clone();
         let tick_n = std::cell::Cell::new(0u32);
         let clip_for_tick = clip_shared.clone();
+        let clip_for_sync = clip.clone();
+        let audio_for_sync = audio.clone();
+        let telemetry_for_tick = player.clips.telemetry().clone();
+        let last_sync = Rc::new(RefCell::new(std::time::Instant::now()));
 
         drawing_area.add_tick_callback(move |area, frame_clock| {
             let now = frame_clock.frame_time(); // время в микросекундах
@@ -287,6 +300,31 @@ pub fn create_wave_view(
                 let mut state = state_ref.borrow_mut();
                 state.is_playing = *is_playing_clone.borrow();
                 state.tick(dt, audio.bass_level() as f64);
+            }
+
+            // Позиционная коррекция — основной механизм синхронизации (не чаще 500 мс)
+            let now_instant = std::time::Instant::now();
+            if now_instant.duration_since(*last_sync.borrow())
+                >= std::time::Duration::from_millis(500)
+            {
+                *last_sync.borrow_mut() = now_instant;
+                if clip_for_tick.active() {
+                    let position = clip_for_sync.position_ms();
+                    telemetry_for_tick.set_position(position);
+                    // Клип мог прероллиться в паузе (звук ещё не начался): догоняем
+                    if audio_for_sync.is_playing() && !clip_for_sync.is_playing() {
+                        clip_for_sync.resume();
+                    }
+                    if audio_for_sync.is_playing()
+                        && let (Some(audio_ms), Some(clip_ms)) =
+                            (audio_for_sync.position_ms(), position)
+                        && audio_ms.abs_diff(clip_ms) > 300
+                    {
+                        clip_for_sync.seek_ms(audio_ms);
+                    }
+                } else {
+                    telemetry_for_tick.set_position(None);
+                }
             }
 
             // На паузе плазма еле дрейфует: бас затух — кадр каждый 4-й тик (≈15 FPS)

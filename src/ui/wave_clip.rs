@@ -81,6 +81,10 @@ pub struct ClipShared {
     frame: Mutex<Option<ClipFrame>>,
     fresh: AtomicBool,
     active: AtomicBool,
+    /// Обрезать зашитые поля яркостной эвристикой (только превью и свои клипы)
+    crop: AtomicBool,
+    /// Полноценный клип: выше прозрачность слоя
+    full: AtomicBool,
 }
 
 impl ClipShared {
@@ -97,19 +101,62 @@ impl ClipShared {
             None
         }
     }
+
+    /// Нужен ли кроп полей у этого клипа
+    pub fn crop(&self) -> bool {
+        self.crop.load(Ordering::Relaxed)
+    }
+
+    /// Полноценный клип (другая прозрачность слоя)
+    pub fn full(&self) -> bool {
+        self.full.load(Ordering::Relaxed)
+    }
+
+    fn set_kind(&self, kind: crate::player::ClipKind) {
+        self.crop.store(kind != crate::player::ClipKind::YouTubeFull, Ordering::Relaxed);
+        self.full.store(kind == crate::player::ClipKind::YouTubeFull, Ordering::Relaxed);
+    }
+}
+
+/// Позиция звука для стартового seek: (миллисекунды, играет ли звук)
+pub type AudioPositionProvider = std::rc::Rc<dyn Fn() -> Option<(u64, bool)>>;
+
+/// Этап запуска: преролл → стартовый seek → играем
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Startup {
+    Preroll,
+    Seeking,
+    Running,
 }
 
 /// Запускает и останавливает воспроизведение клипа
 pub struct ClipController {
     shared: Arc<ClipShared>,
     pipeline: std::cell::RefCell<Option<gstreamer::Pipeline>>,
-    /// Наблюдатель шины: пока он жив, на конец ролика приходит перемотка в начало (при удалении наблюдатель снимается)
+    /// Наблюдатель шины: пока он жив, приходят EOS/ASYNC_DONE (при удалении снимается)
     watch: std::cell::RefCell<Option<gstreamer::bus::BusWatchGuard>>,
+    provider: std::cell::RefCell<Option<AudioPositionProvider>>,
+    /// Какой клип играет: от этого зависит EOS
+    kind: std::cell::Cell<crate::player::ClipKind>,
+    /// Видео реально в Playing (нужно, чтобы догонять звук после преролла)
+    playing: std::cell::Cell<bool>,
 }
 
 impl ClipController {
     pub fn new(shared: Arc<ClipShared>) -> Self {
-        Self { shared, pipeline: Default::default(), watch: Default::default() }
+        Self {
+            shared,
+            pipeline: Default::default(),
+            watch: Default::default(),
+            provider: Default::default(),
+            kind: std::cell::Cell::new(crate::player::ClipKind::YouTubeFull),
+            playing: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Источник позиции звука: вызывается после преролла, чтобы стартовый seek был свежим.
+    pub fn set_audio_provider(&self, provider: AudioPositionProvider) {
+        *self.provider.borrow_mut() = Some(provider);
     }
 
     /// Останавливает клип; слой плавно гаснет в шейдере
@@ -121,40 +168,183 @@ impl ClipController {
         self.shared.active.store(false, Ordering::Relaxed);
     }
 
-    /// Запускает зацикленное воспроизведение файла без звука
-    pub fn play(&self, path: &str) {
+    /// Показывает локальный клип: преролл в Paused, точный seek к позиции звука, затем Playing.
+    ///
+    /// Блокирующих ожиданий нет: готовность приходит событиями шины, UI не замирает.
+    pub fn play_request(&self, request: &crate::player::ClipRequest) {
         self.stop();
+        self.kind.set(request.kind);
+        self.shared.set_kind(request.kind);
+        self.playing.set(false);
+
         let desc = format!(
-            "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale ! \
-             video/x-raw,format=RGBA,width=640,pixel-aspect-ratio=1/1 ! appsink name=sink sync=true max-buffers=2 drop=true",
-            path.replace('\\', "\\\\").replace('"', "\\\"")
+            "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale add-borders=false ! \
+             video/x-raw,format=RGBA,pixel-aspect-ratio=1/1,width=[16,640],height=[16,640] ! \
+             appsink name=sink sync=true max-buffers=2 drop=true",
+            request.path.replace('\\', "\\\\").replace('"', "\\\"")
         );
-        let Ok(element) = gstreamer::parse::launch(&desc) else { return };
+        let Ok(element) = gstreamer::parse::launch(&desc) else {
+            eprintln!("[clip] не удалось собрать пайплайн клипа");
+            return;
+        };
         let Ok(pipeline) = element.downcast::<gstreamer::Pipeline>() else { return };
-        let Some(sink) = pipeline.by_name("sink").and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok()) else { return };
+        let Some(sink) = pipeline
+            .by_name("sink")
+            .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())
+        else {
+            eprintln!("[clip] нет appsink в пайплайне клипа");
+            return;
+        };
 
         let shared = self.shared.clone();
         sink.set_callbacks(
             gstreamer_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
-                    let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) else { return Ok(gstreamer::FlowSuccess::Ok) };
-                    let Some(s) = caps.structure(0) else { return Ok(gstreamer::FlowSuccess::Ok) };
-                    let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) else { return Ok(gstreamer::FlowSuccess::Ok) };
-                    let Ok(map) = buffer.map_readable() else { return Ok(gstreamer::FlowSuccess::Ok) };
-                    // RGBA без выравнивания строк: ширина кратна 4 после videoscale, но проверим размер
-                    if map.len() == (w * h * 4) as usize {
-                        if let Ok(mut slot) = shared.frame.lock() {
-                            *slot = Some(ClipFrame { width: w, height: h, data: map.to_vec() });
-                            shared.fresh.store(true, Ordering::Release);
-                        }
+                    let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    let Some(s) = caps.structure(0) else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    let Ok(map) = buffer.map_readable() else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    if map.len() == (w * h * 4) as usize
+                        && let Ok(mut slot) = shared.frame.lock()
+                    {
+                        *slot = Some(ClipFrame { width: w, height: h, data: map.to_vec() });
+                        shared.fresh.store(true, Ordering::Release);
                     }
                     Ok(gstreamer::FlowSuccess::Ok)
                 })
                 .build(),
         );
 
-        // конец ролика: перемотка в начало (петля)
+        // машина состояний запуска: AsyncDone приходит и на преролл, и на seek
+        let startup = std::rc::Rc::new(std::cell::Cell::new(Startup::Preroll));
+        let kind = self.kind.get();
+        if let Some(bus) = pipeline.bus() {
+            let weak = pipeline.downgrade();
+            let shared = self.shared.clone();
+            let provider = self.provider.borrow().clone();
+            let playing_out = std::rc::Rc::new(std::cell::Cell::new(false));
+            let guard = bus.add_watch_local(move |_, msg| {
+                use gstreamer::MessageView;
+                let Some(pipeline) = weak.upgrade() else {
+                    return glib::ControlFlow::Continue;
+                };
+                match msg.view() {
+                    MessageView::AsyncDone(_) => match startup.get() {
+                        // диагностика двухстадийного старта
+                        Startup::Preroll => {
+                            let position = provider.as_ref().and_then(|f| f());
+                            let (start_ms, playing) = position.unwrap_or((0, false));
+                            playing_out.set(playing);
+                            if start_ms > 100 {
+                                let _ = pipeline.seek_simple(
+                                    gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::ACCURATE,
+                                    gstreamer::ClockTime::from_mseconds(start_ms),
+                                );
+                                startup.set(Startup::Seeking);
+                            } else {
+                                startup.set(Startup::Running);
+                                shared.active.store(true, Ordering::Relaxed);
+                                if playing {
+                                    let _ = pipeline.set_state(gstreamer::State::Playing);
+                                    playing_out.set(true);
+                                }
+                            }
+                        }
+                        Startup::Seeking => {
+                            startup.set(Startup::Running);
+                            shared.active.store(true, Ordering::Relaxed);
+                            if playing_out.get() {
+                                let _ = pipeline.set_state(gstreamer::State::Playing);
+                            }
+                        }
+                        Startup::Running => {}
+                    },
+                    MessageView::Eos(_) => match kind {
+                        // превью и свои клипы зациклены, полный клип держит последний кадр
+                        crate::player::ClipKind::YouTubeFull => {}
+                        _ => {
+                            let _ = pipeline.seek_simple(
+                                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+                                gstreamer::ClockTime::ZERO,
+                            );
+                        }
+                    },
+                    MessageView::Error(e) => {
+                        eprintln!("[clip] ошибка воспроизведения: {}", e.error());
+                        shared.active.store(false, Ordering::Relaxed);
+                        return glib::ControlFlow::Break;
+                    }
+                    _ => {}
+                }
+                glib::ControlFlow::Continue
+            });
+            *self.watch.borrow_mut() = guard.ok();
+        }
+
+        // Пауза видео до преролла: первый кадр не должен мелькать раньше времени
+        if pipeline.set_state(gstreamer::State::Paused).is_ok() {
+            *self.pipeline.borrow_mut() = Some(pipeline);
+        }
+        self.playing.set(false);
+    }
+
+    /// Зацикленное беззвучное превью без синхронизации (фон страницы артиста/альбома)
+    pub fn play(&self, path: &str) {
+        self.stop();
+        self.kind.set(crate::player::ClipKind::YandexPreview);
+        self.shared.set_kind(crate::player::ClipKind::YandexPreview);
+        let desc = format!(
+            "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale add-borders=false ! \
+             video/x-raw,format=RGBA,pixel-aspect-ratio=1/1,width=[16,640],height=[16,640] ! \
+             appsink name=sink sync=true max-buffers=2 drop=true",
+            path.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let Ok(element) = gstreamer::parse::launch(&desc) else { return };
+        let Ok(pipeline) = element.downcast::<gstreamer::Pipeline>() else { return };
+        let Some(sink) = pipeline
+            .by_name("sink")
+            .and_then(|e| e.downcast::<gstreamer_app::AppSink>().ok())
+        else {
+            return;
+        };
+
+        let shared = self.shared.clone();
+        sink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
+                    let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps()) else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    let Some(s) = caps.structure(0) else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    let Ok(map) = buffer.map_readable() else {
+                        return Ok(gstreamer::FlowSuccess::Ok);
+                    };
+                    if map.len() == (w * h * 4) as usize
+                        && let Ok(mut slot) = shared.frame.lock()
+                    {
+                        *slot = Some(ClipFrame { width: w, height: h, data: map.to_vec() });
+                        shared.fresh.store(true, Ordering::Release);
+                    }
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
         if let Some(bus) = pipeline.bus() {
             let weak = pipeline.downgrade();
             let guard = bus.add_watch_local(move |_, msg| {
@@ -162,16 +352,19 @@ impl ClipController {
                 match msg.view() {
                     MessageView::Eos(_) => {
                         if let Some(p) = weak.upgrade() {
-                            let _ = p.seek_simple(gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT, gstreamer::ClockTime::ZERO);
+                            let _ = p.seek_simple(
+                                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
+                                gstreamer::ClockTime::ZERO,
+                            );
                         }
-                        glib::ControlFlow::Continue
                     }
                     MessageView::Error(e) => {
                         eprintln!("[clip] ошибка воспроизведения: {}", e.error());
-                        glib::ControlFlow::Break
+                        return glib::ControlFlow::Break;
                     }
-                    _ => glib::ControlFlow::Continue,
+                    _ => {}
                 }
+                glib::ControlFlow::Continue
             });
             *self.watch.borrow_mut() = guard.ok();
         }
@@ -180,6 +373,48 @@ impl ClipController {
             self.shared.active.store(true, Ordering::Relaxed);
             *self.pipeline.borrow_mut() = Some(pipeline);
         }
+    }
+
+    /// Пауза: меняет состояние существующего пайплайна, файл не перезапускается
+    pub fn is_playing(&self) -> bool {
+        let guard = self.pipeline.borrow();
+        guard
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.current_state() == gstreamer::State::Playing)
+    }
+
+    pub fn pause(&self) {
+        self.playing.set(false);
+        if let Some(pipeline) = self.pipeline.borrow().as_ref() {
+            let _ = pipeline.set_state(gstreamer::State::Paused);
+        }
+    }
+
+    /// Продолжение с текущего кадра
+    pub fn resume(&self) {
+        self.playing.set(true);
+        if let Some(pipeline) = self.pipeline.borrow().as_ref() {
+            let _ = pipeline.set_state(gstreamer::State::Playing);
+        }
+    }
+
+    /// Точная перемотка (караоке, слайдер)
+    pub fn seek_ms(&self, ms: u64) {
+        if let Some(pipeline) = self.pipeline.borrow().as_ref() {
+            let _ = pipeline.seek_simple(
+                gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::ACCURATE,
+                gstreamer::ClockTime::from_mseconds(ms),
+            );
+        }
+    }
+
+    /// Текущая позиция видео
+    pub fn position_ms(&self) -> Option<u64> {
+        let guard = self.pipeline.borrow();
+        let pipeline = guard.as_ref()?;
+        pipeline
+            .query_position::<gstreamer::ClockTime>()
+            .map(|time| time.mseconds())
     }
 }
 

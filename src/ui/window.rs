@@ -473,7 +473,6 @@ impl VolnaWindow {
         settings_btn.set_child(Some(&settings_overlay));
 
         sidebar_footer.append(&source_btn);
-        sidebar_footer.append(&auth_btn);
         sidebar_footer.append(&settings_btn);
         sidebar_panel.append(&sidebar_footer);
 
@@ -1060,8 +1059,18 @@ impl VolnaWindow {
         };
 
         {
+            // Аккаунт живёт в том же поповере, что и выбор сервиса: в сайдбаре одна карточка
+            let profile_item = Button::with_label("👤  Аккаунт");
+            profile_item.add_css_class("flat");
+            profile_item.set_halign(Align::Fill);
             let on_auth = handle_auth_click.clone();
-            auth_btn.connect_clicked(move |_| on_auth());
+            let pop = source_popover.clone();
+            profile_item.connect_clicked(move |_| {
+                on_auth();
+                pop.popdown();
+            });
+            source_pop_box.prepend(&profile_item);
+            source_pop_box.prepend(&gtk4::Separator::new(Orientation::Horizontal));
         }
         {
             let on_auth = handle_auth_click;
@@ -1683,6 +1692,8 @@ fn setup_event_listener(
     is_collapsed: Rc<RefCell<bool>>,
 ) {
     let yandex_login_state: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Трек, к которому относится фон: запоздалый клип чужого трека не должен перебить текущий
+    let current_clip_track: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     update_auth_ui(
         &auth_btn,
         &auth_icon,
@@ -1697,8 +1708,15 @@ fn setup_event_listener(
             match event {
                 PlayerUiEvent::TrackStarted { track, .. } => {
                     awaiting_start.set(std::env::var_os("VOLNA_DEMO_POS_MS").is_none());
-                    // клип прошлого трека гаснет; клип нового придёт отдельным событием, если он есть и включён
-                    wave_view.clip.stop();
+                    // повторный TrackStarted того же трека (замена на студийную версию)
+                    // не должен гасить уже показанный клип
+                    let track_changed =
+                        current_clip_track.borrow().as_deref() != Some(track.id.as_str());
+                    *current_clip_track.borrow_mut() = Some(track.id.clone());
+                    if track_changed {
+                        wave_view.clip.stop();
+                        player.clips.telemetry().set_local_active(false);
+                    }
                     let artists = track.artists_string();
                     let album = track.albums.first().and_then(|a| a.title.as_ref()).map(|s| s.as_str()).unwrap_or("");
                     let subtitle = if album.is_empty() {
@@ -1753,6 +1771,11 @@ fn setup_event_listener(
                 }
                 PlayerUiEvent::PlaybackToggled(is_playing) => {
                     *is_playing_state.borrow_mut() = is_playing;
+                    if is_playing {
+                        wave_view.clip.resume();
+                    } else {
+                        wave_view.clip.pause();
+                    }
                     let icon_name = if is_playing {
                         "media-playback-pause-symbolic"
                     } else {
@@ -1830,10 +1853,24 @@ fn setup_event_listener(
                         update_dynamic_accent_css(&dynamic_provider, c[0], c[1], c[2]);
                     }
                 }
-                PlayerUiEvent::ClipUpdated(path) => match path {
-                    Some(p) => wave_view.clip.play(&p),
-                    None => wave_view.clip.stop(),
-                },
+                PlayerUiEvent::ClipUpdated(update) => {
+                    let current = current_clip_track.borrow().clone();
+                    match update {
+                        crate::player::ClipUpdate::Show(request) => {
+                            // клип другого трека (поздний ответ) фон не меняет
+                            if current.as_deref() == Some(request.track_id.as_str()) {
+                                wave_view.clip.play_request(&request);
+                                player.clips.telemetry().set_local_active(true);
+                            }
+                        }
+                        crate::player::ClipUpdate::Clear { track_id, .. } => {
+                            if current.as_deref() == Some(track_id.as_str()) {
+                                wave_view.clip.stop();
+                                player.clips.telemetry().set_local_active(false);
+                            }
+                        }
+                    }
+                }
                 PlayerUiEvent::LyricsUpdated(lrc_text) => {
                     while let Some(child) = lyrics_container.first_child() {
                         lyrics_container.remove(&child);
@@ -1861,8 +1898,11 @@ fn setup_event_listener(
                             lbl.set_can_target(true);
                             let click = gtk4::GestureClick::new();
                             let (p, at) = (player.clone(), line.time_ms);
+                            let clip_for_seek = wave_view.clip.clone();
                             click.connect_pressed(move |_, _, _, _| {
                                 p.seek_ms(at);
+                                // видео перематываем тем же событием, иначе ждать тик коррекции
+                                clip_for_seek.seek_ms(at.saturating_mul(1000));
                                 if !p.audio.is_playing() {
                                     p.resume();
                                 }

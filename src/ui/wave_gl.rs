@@ -265,17 +265,24 @@ pub fn attach(area: &GLArea, state: Rc<RefCell<WaveShaderState>>, center: Rc<Cel
             }
             if g.clip_size != (f.width, f.height) {
                 g.clip_size = (f.width, f.height);
-                g.clip_rect = Some((0, 0, f.width, f.height));
+                g.clip_rect = None;
             }
             if g.clip_rect.is_none() {
-                g.clip_rect = Some((0, 0, f.width, f.height));
+                // Превью и свои клипы обрезаем от зашитых полей; полноценный клип
+                // не трогаем: яркостная эвристика на монтаже даёт ложные срезы.
+                g.clip_rect = Some(if clip.crop() {
+                    super::wave_clip::content_bounds(&f).unwrap_or((0, 0, f.width, f.height))
+                } else {
+                    (0, 0, f.width, f.height)
+                });
             }
         }
         if !clip.active() {
             g.clip_rect = None; // следующий клип измеряется заново
         }
         // слой клипа проявляется и гаснет плавно (около полусекунды)
-        let target = if clip.active() && g.clip_tex.is_some() { 0.30 } else { 0.0 };
+        let layer_alpha = if clip.full() { 0.45 } else { 0.30 };
+        let target = if clip.active() && g.clip_tex.is_some() { layer_alpha } else { 0.0 };
         let a = clip_alpha.get();
         clip_alpha.set(a + (target - a).clamp(-0.02, 0.02));
         let st = state.borrow();
