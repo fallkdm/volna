@@ -769,15 +769,48 @@ impl VolnaWindow {
         // Нижний плеер (парящий остров или прижатый док)
         let island = create_floating_island(&player);
         super::floating_island::apply_player_layout(&island, &player_layout);
-        // Фон панели должен доходить до низа окна, а футер (сервис, настройки) —
-        // подниматься над плеером. Поэтому отступ живёт на футере, не на сайдбаре.
-        let sb_bottom = if player_layout == "dock" { 96 } else { 108 };
+        // Фон панели доходит до низа окна; футер поднимается над плеером только
+        // когда тот реально наезжает на колонку (узкое окно). В полноэкранном
+        // режиме остров панель не перекрывает, и футер остаётся внизу.
         sidebar.set_margin_bottom(0);
-        sidebar_footer.set_margin_bottom(SIDEBAR_FOOTER_MARGIN + sb_bottom);
 
         root_overlay.set_child(Some(&app_body_overlay));
         root_overlay.add_overlay(&island.container);
         root_overlay.set_measure_overlay(&island.container, false);
+
+        // Отслеживаем геометрию: окно/остров меняются при ресайзе и фуллскрине
+        {
+            let sidebar = sidebar.clone();
+            let island_container = island.container.clone();
+            let last_margin = Rc::new(std::cell::Cell::new(i32::MIN));
+            gtk4::glib::timeout_add_local(Duration::from_millis(150), move || {
+                let Some(window) = sidebar
+                    .root()
+                    .and_then(|root| root.downcast::<gtk4::Window>().ok())
+                else {
+                    return glib::ControlFlow::Continue;
+                };
+                let window_width = window.width();
+                let island_width = island_container.width();
+                let island_height = island_container.height();
+                if window_width <= 0 || island_width <= 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                // остров по центру: наезжает ли его левый край на полосу сайдбара
+                let overlaps =
+                    (window_width - island_width) / 2 < sidebar.width() + 8;
+                let margin = SIDEBAR_FOOTER_MARGIN
+                    + if overlaps { island_height + 12 } else { 0 };
+                if last_margin.get() != margin
+                    && let Some(footer) =
+                        find_child_by_css::<GtkBox>(&sidebar, "sidebar-footer")
+                {
+                    last_margin.set(margin);
+                    footer.set_margin_bottom(margin);
+                }
+                glib::ControlFlow::Continue
+            });
+        }
 
         if let Some((core, deep, ridge)) = get_accent_palette(&theme_accent) {
             wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
@@ -2138,12 +2171,7 @@ fn setup_event_listener(
                 }
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
-                    let sb_margin = if layout == "dock" { 96 } else { 108 };
-                    if let Some(footer) =
-                        find_child_by_css::<GtkBox>(&sidebar, "sidebar-footer")
-                    {
-                        footer.set_margin_bottom(SIDEBAR_FOOTER_MARGIN + sb_margin);
-                    }
+                    // отступ футера пересчитает наблюдатель геометрии
                     main_content_box.set_margin_bottom(if layout == "dock" { 92 } else { 0 });
                 }
                 PlayerUiEvent::ThemeAccentChanged(accent) => {
