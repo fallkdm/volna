@@ -353,10 +353,17 @@ impl PlayerManager {
         let (cf_enabled, cf_dur) = crate::api::auth::load_crossfade();
         let crossfade = Arc::new(Mutex::new((cf_enabled, cf_dur)));
 
-        let yt_client = if let Some(cookie) = crate::api::auth::load_ytmusic_cookie() {
-            YtMusicClient::with_cookie(cookie)
-        } else if let Some(token) = crate::api::auth::load_ytmusic_refresh_token() {
+        // Порядок: refresh-токен (долговечный) → свежая сессия из браузера →
+        // сохранённая кука → гость. Свежая кука важнее сохранённой: браузер
+        // обновляет её сам, а скопированная когда-то давно уже мертва.
+        let yt_client = if let Some(token) = crate::api::auth::load_ytmusic_refresh_token() {
             YtMusicClient::with_refresh_token(token)
+        } else if let Some(imported) = crate::api::browser_cookies::import_youtube_cookie() {
+            println!("[ytmusic] сессия взята из браузера: {}", imported.source);
+            let _ = crate::api::auth::save_ytmusic_cookie(&imported.cookie);
+            YtMusicClient::with_cookie(imported.cookie)
+        } else if let Some(cookie) = crate::api::auth::load_ytmusic_cookie() {
+            YtMusicClient::with_cookie(cookie)
         } else {
             YtMusicClient::new()
         };

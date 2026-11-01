@@ -7,6 +7,9 @@ repository = "https://github.com/fallkdm/volna"
 edition = "2024"
 
 [dependencies]
+aes = "0.8"
+cbc = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 gtk4 = { version = "0.11", features = ["v4_24"] }
 libadwaita = { version = "0.9", features = ["v1_10"] }
 glib = "0.22"

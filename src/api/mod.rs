@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod browser_cookies;
 pub mod client;
 pub mod genius;
 pub mod lastfm;

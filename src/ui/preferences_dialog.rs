@@ -634,6 +634,71 @@ pub fn show_ytmusic_auth_dialog(
     step2_row.set_subtitle_lines(0);
     group.add(&step2_row);
 
+    // Импорт сессии из локального браузера: без DevTools и без OAuth-клиента
+    let browser_row = ActionRow::builder()
+        .title("Или взять сессию из браузера")
+        .subtitle(
+            "Найдёт залогиненную сессию YouTube Music в Firefox или Chrome/Chromium (если система отдаёт ключ шифрования)",
+        )
+        .build();
+    let browser_btn = Button::with_label("Импортировать");
+    browser_btn.add_css_class("pill");
+    browser_btn.set_valign(gtk4::Align::Center);
+    browser_btn.add_css_class("suggested-action");
+    browser_row.add_suffix(&browser_btn);
+    group.add(&browser_row);
+    {
+        let player = player.clone();
+        let dialog_weak = dialog.downgrade();
+        let on_success = on_success.clone();
+        let browser_row_weak = browser_row.downgrade();
+        browser_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            let player = player.clone();
+            let dialog_weak = dialog_weak.clone();
+            let on_success = on_success.clone();
+            let browser_row_weak = browser_row_weak.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let imported = tokio::task::spawn_blocking(
+                    crate::api::browser_cookies::import_youtube_cookie,
+                )
+                .await
+                .ok()
+                .flatten();
+                let Some(imported) = imported else {
+                    if let Some(row) = browser_row_weak.upgrade() {
+                        row.set_subtitle("Сессия не найдена: залогиньтесь в music.youtube.com в Firefox или Chrome и повторите");
+                    }
+                    return;
+                };
+                if let Err(e) = crate::api::auth::save_ytmusic_cookie(&imported.cookie) {
+                    eprintln!("[ytmusic] не удалось сохранить импортированную куку: {e}");
+                }
+                let yt_client =
+                    crate::api::ytmusic::YtMusicClient::with_cookie(imported.cookie.clone());
+                player.providers.register(
+                    std::sync::Arc::new(yt_client)
+                        as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                );
+                on_success();
+                player.emit(crate::player::PlayerUiEvent::StatusMessage(format!(
+                    "Сессия YouTube Music взята из браузера: {}",
+                    imported.source
+                )));
+                if player.providers.active_id()
+                    == crate::api::provider::ProviderId::YouTubeMusic
+                {
+                    player.emit(crate::player::PlayerUiEvent::ProviderChanged(
+                        crate::api::provider::ProviderId::YouTubeMusic,
+                    ));
+                }
+                if let Some(d) = dialog_weak.upgrade() {
+                    d.close();
+                }
+            });
+        });
+    }
+
     // Шаг 3: Поле ввода с кнопкой вставки из буфера
     let cookie_row = PasswordEntryRow::builder()
         .title("Шаг 3: Заголовок Cookie")
