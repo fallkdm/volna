@@ -141,12 +141,25 @@ impl YandexMusicClient {
         headers
     }
 
+    /// URL треков станции Ротора.
+    ///
+    /// `queue` — идентификаторы недавно сыгранных треков (через запятую): сервер учтёт их
+    /// и не предложит их повторно в новой порции. Идентификаторы Яндекса всегда числовые,
+    /// поэтому экранирование не нужно.
+    fn rotor_tracks_url(base_url: &str, station_id: &str, queue: Option<&[String]>) -> String {
+        let url = format!("{}/rotor/station/{}/tracks", base_url, station_id);
+        match queue {
+            Some(ids) if !ids.is_empty() => format!("{}?queue={}", url, ids.join(",")),
+            _ => url,
+        }
+    }
+
     /// Получает треки станции Ротора (по умолчанию «Волна» - "user:onyourwave")
     pub async fn get_station_tracks(
         &self,
         station_id: &str,
     ) -> Result<RotorStationTracks, ApiError> {
-        self.get_station_tracks_with_params(station_id, None, None, None)
+        self.get_station_tracks_with_params(station_id, None, None, None, None)
             .await
     }
 
@@ -157,6 +170,7 @@ impl YandexMusicClient {
         mood: Option<&str>,
         language: Option<&str>,
         character: Option<&str>,
+        queue: Option<&[String]>,
     ) -> Result<RotorStationTracks, ApiError> {
         // фильтры Ротор принимает отдельным запросом настроек, а не параметрами /tracks
         if station_id == "user:onyourwave" {
@@ -177,7 +191,7 @@ impl YandexMusicClient {
                 eprintln!("rotor settings2: HTTP {}", r.status());
             }
         }
-        let url = format!("{}/rotor/station/{}/tracks", self.base_url, station_id);
+        let url = Self::rotor_tracks_url(&self.base_url, station_id, queue);
 
         let resp = self.client.get(&url).headers(self.headers()).send().await?;
 
@@ -1671,5 +1685,32 @@ mod stream_speed_tests {
                 marks
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod rotor_url_tests {
+    use super::YandexMusicClient;
+
+    #[test]
+    fn url_without_queue_has_no_query() {
+        assert_eq!(
+            YandexMusicClient::rotor_tracks_url("https://api.music.yandex.net", "user:onyourwave", None),
+            "https://api.music.yandex.net/rotor/station/user:onyourwave/tracks"
+        );
+        // Пустой список — то же, что его отсутствие: не отправляем «queue=» без значений
+        assert_eq!(
+            YandexMusicClient::rotor_tracks_url("https://api.music.yandex.net", "user:onyourwave", Some(&[])),
+            "https://api.music.yandex.net/rotor/station/user:onyourwave/tracks"
+        );
+    }
+
+    #[test]
+    fn url_with_queue_lists_recent_ids() {
+        let queue = vec!["107350639".to_string(), "58042199".to_string()];
+        assert_eq!(
+            YandexMusicClient::rotor_tracks_url("https://api.music.yandex.net", "user:onyourwave", Some(&queue)),
+            "https://api.music.yandex.net/rotor/station/user:onyourwave/tracks?queue=107350639,58042199"
+        );
     }
 }

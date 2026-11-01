@@ -143,6 +143,8 @@ pub struct PlayerState {
     pub pending_advance: bool,
     /// Догрузка уже пыталась продлить Волну и не дала ни одного нового трека
     pub wave_dead: bool,
+    /// Сколько догрузок Волны подряд не дали новых треков (сбрасывается при удаче)
+    pub refill_failures: usize,
     /// Чипы станции от сервиса (варианты станции в YouTube Music)
     pub wave_chips: Vec<crate::api::provider::StationChip>,
     /// Ключ станции, к которой относятся `wave_chips`; пусто — чипы ещё не спрашивали.
@@ -215,6 +217,7 @@ impl Default for PlayerState {
             is_transitioning: false,
             pending_advance: false,
             wave_dead: false,
+            refill_failures: 0,
             wave_chips: Vec::new(),
             wave_chips_station: String::new(),
             wave_chips_pending: String::new(),
@@ -262,6 +265,17 @@ fn url_expire_unix(url: &str) -> Option<u64> {
 /// Ссылки на поток живут недолго (через несколько минут отвечают 410): заранее полученной верим 90 секунд
 /// Максимальный возраст prefetch-ссылки без явного срока жизни (локальные файлы, прямые URL).
 const PREFETCH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Сколько идентификаторов сыгранного отправляем Ротору в `?queue=`: сервер учтёт их
+/// и не предложит повторно в новой порции.
+const ROTOR_QUEUE_IDS: usize = 5;
+
+/// Сколько раз подряд пробуем продлить Волну, прежде чем считать её исчерпанной.
+/// Ротор иногда отдаёт порцию из одних повторов — одиночный пустой ответ ещё не приговор.
+const WAVE_REFILL_ATTEMPTS: usize = 3;
+
+/// Пауза между попытками продления Волны, чтобы не долбить API в один момент.
+const WAVE_REFILL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Менеджер плеера
 #[derive(Clone)]
@@ -874,6 +888,7 @@ impl PlayerManager {
             // имеет смысл только внутри одной и той же очереди.
             state.pending_advance = false;
             state.wave_dead = false;
+            state.refill_failures = 0;
             if !wave {
                 state.wave_label = None;
             }
@@ -936,11 +951,19 @@ impl PlayerManager {
                     let mut state = self.state.lock().unwrap();
                     state.wave_dead = false;
                     let request = !state.pending_advance;
+                    if request {
+                        // Новый цикл догрузки — новый счёт провалов: иначе «Далее»,
+                        // нажатое после исчерпанной Волны, получило бы одну попытку
+                        // вместо трёх и сдалось бы сразу.
+                        state.refill_failures = 0;
+                    }
                     state.pending_advance = true;
                     request
                 };
                 if request {
                     // Пока догрузка в пути, повторные нажатия «Далее» не плодят запросы.
+                    // Спиннер снимет `load_more_wave_tracks` на любом выходе.
+                    self.emit(PlayerUiEvent::LoadingState(true));
                     self.load_more_wave_tracks();
                 }
                 return;
@@ -1021,9 +1044,18 @@ impl PlayerManager {
     /// Ничего не останавливаем здесь — трек ещё может играть (пользователь нажал
     /// «Далее» в середине песни). Остановку сделает `next_track_inner`, когда играть
     /// будет уже нечего.
+    ///
+    /// `pending_advance` снимаем всегда: иначе после неудачи он остаётся взведённым,
+    /// повторное «Далее» упирается в `request = false` и не делает уже ничего —
+    /// Волна замолкает навсегда без единого сообщения.
+    ///
+    /// А вот «мёртвой» Волну объявляем только если ждали продления в самом конце очереди:
+    /// неудачная фоновая догрузка за три трека до конца ничего не значит, к хвосту
+    /// можно спросить заново.
     fn mark_wave_refill_dead(&self) {
         let mut state = self.state.lock().unwrap();
-        if state.pending_advance {
+        let waiting = std::mem::take(&mut state.pending_advance);
+        if waiting {
             state.wave_dead = true;
         }
     }
@@ -1163,6 +1195,7 @@ impl PlayerManager {
             let provider = providers_clone.current();
             if provider.provider_id() == ProviderId::YouTubeMusic {
                 if !provider.is_authenticated() {
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     return;
                 }
 
@@ -1232,6 +1265,7 @@ impl PlayerManager {
 
                 let Some(station_batch) = station_batch.filter(|b| !b.tracks.is_empty()) else {
                     eprintln!("[wave] волна выдохлась: станция «{}» не дала новых треков", station_id);
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     me.mark_wave_refill_dead();
                     return;
                 };
@@ -1241,7 +1275,8 @@ impl PlayerManager {
                     wave_engine_clone.lock().unwrap().mark_seed_started();
                 }
 
-                let filtered = wave_engine_clone.lock().unwrap().filter_candidates(station_batch.tracks);
+                let raw = station_batch.tracks.len();
+                let filtered = pick_candidates(true, &wave_engine_clone, station_batch.tracks);
                 let updated = {
                     let mut state = state_clone.lock().unwrap();
                     state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
@@ -1255,10 +1290,11 @@ impl PlayerManager {
                         state.queue.truncate(keep);
                     }
                     let before = state.queue.len();
+                    let added = new_tracks.len();
                     state.queue.extend(new_tracks);
-                    (state.queue.clone(), state.queue.len() > before, dropped)
+                    (state.queue.clone(), state.queue.len() > before, dropped, added)
                 };
-                let (updated_queue, grew, dropped) = updated;
+                let (updated_queue, grew, dropped, added) = updated;
                 if !dropped.is_empty() {
                     // Выброшенный хвост тоже не должен вернуться в следующей порции
                     me.wave_engine.lock().unwrap().remember_dropped(&dropped);
@@ -1270,11 +1306,19 @@ impl PlayerManager {
                     }
                     emit_all(&senders, PlayerUiEvent::WaveChips(station_batch.chips.clone()));
                 }
+                eprintln!("[wave] raw={} added={} queue={}", raw, added, updated_queue.len());
                 emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                emit_all(&senders, PlayerUiEvent::LoadingState(false));
                 if grew {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.refill_failures = 0;
+                    }
                     me.finish_pending_advance();
                 } else {
                     // Батч пришёл, но всё в нём уже есть в очереди.
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.refill_failures += 1;
+                    }
                     me.mark_wave_refill_dead();
                 }
                 return;
@@ -1282,42 +1326,95 @@ impl PlayerManager {
 
             let client = client_clone.lock().unwrap().clone();
             if !client.has_token() {
+                emit_all(&senders, PlayerUiEvent::LoadingState(false));
                 return;
             }
 
-            if let Ok(station_tracks) = client
-                .get_station_tracks_with_params(
-                    &station_id,
-                    mood.as_deref(),
-                    language.as_deref(),
-                    character.as_deref(),
-                )
-                .await
-            {
-                let new_tracks: Vec<Track> =
-                    station_tracks.sequence.into_iter().map(|s| s.track).collect();
-                if new_tracks.is_empty() {
-                    me.mark_wave_refill_dead();
+            // Что уже сыграно — Ротору, чтобы он не повторял это в новой порции.
+            let queue_ids: Vec<String> = {
+                let state = state_clone.lock().unwrap();
+                let end = (state.current_index + 1).min(state.queue.len());
+                state.queue[..end]
+                    .iter()
+                    .rev()
+                    .take(ROTOR_QUEUE_IDS)
+                    .map(|t| t.id.clone())
+                    .collect()
+            };
+
+            // Пустая порция — ещё не приговор: Ротор иногда отдаёт одни повторы.
+            // Три попытки подряд, между ними секунда паузы.
+            for attempt in 1..=WAVE_REFILL_ATTEMPTS {
+                let fetched = client
+                    .get_station_tracks_with_params(
+                        &station_id,
+                        mood.as_deref(),
+                        language.as_deref(),
+                        character.as_deref(),
+                        Some(&queue_ids),
+                    )
+                    .await;
+
+                let mut raw = 0usize;
+                let mut added = 0usize;
+                match fetched {
+                    Ok(station_tracks) => {
+                        raw = station_tracks.sequence.len();
+                        let new_tracks: Vec<Track> =
+                            station_tracks.sequence.into_iter().map(|s| s.track).collect();
+                        let mut state = state_clone.lock().unwrap();
+                        state.batch_id = station_tracks.batch_id;
+                        // Пост-фильтра здесь нет намеренно: станцию считает сервер,
+                        // а локальная история прослушиваний выбрасывала бы валидные треки.
+                        let new_tracks = dedup_tracks(&state.queue, new_tracks);
+                        added = new_tracks.len();
+                        state.queue.extend(new_tracks);
+                    }
+                    Err(e) => eprintln!("[rotor] попытка {}: запрос не удался: {}", attempt, e),
+                }
+
+                let (queue_len, cur_idx, failures, updated_queue) = {
+                    let mut state = state_clone.lock().unwrap();
+                    if added > 0 {
+                        state.refill_failures = 0;
+                    } else {
+                        state.refill_failures += 1;
+                    }
+                    (
+                        state.queue.len(),
+                        state.current_index,
+                        state.refill_failures,
+                        state.queue.clone(),
+                    )
+                };
+                let hist = wave_engine_clone.lock().unwrap().recent_history.len();
+                eprintln!(
+                    "[rotor] attempt={} raw={} added={} queue={} cur_idx={} hist={} failures={} q_param={}",
+                    attempt,
+                    raw,
+                    added,
+                    queue_len,
+                    cur_idx,
+                    hist,
+                    failures,
+                    queue_ids.len()
+                );
+
+                if added > 0 {
+                    emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    me.finish_pending_advance();
                     return;
                 }
-                let filtered = wave_engine_clone.lock().unwrap().filter_candidates(new_tracks);
-
-                let (updated_queue, grew) = {
-                    let mut state = state_clone.lock().unwrap();
-                    state.batch_id = station_tracks.batch_id;
-                    let new_tracks = dedup_tracks(&state.queue, filtered);
-                    let before = state.queue.len();
-                    state.queue.extend(new_tracks);
-                    (state.queue.clone(), state.queue.len() > before)
-                };
-
-                emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
-                if grew {
-                    me.finish_pending_advance();
-                } else {
-                    me.mark_wave_refill_dead();
+                if failures >= WAVE_REFILL_ATTEMPTS {
+                    break;
                 }
+                tokio::time::sleep(WAVE_REFILL_RETRY_DELAY).await;
             }
+
+            // Все попытки пустые: продлевать нечем.
+            emit_all(&senders, PlayerUiEvent::LoadingState(false));
+            me.mark_wave_refill_dead();
         });
     }
 
@@ -1397,6 +1494,7 @@ impl PlayerManager {
             // относятся к прошлой подборке.
             state.pending_advance = false;
             state.wave_dead = false;
+            state.refill_failures = 0;
             state.station_id = station_id.clone();
             state.batch_id = None;
             state.current_mood = None;
@@ -1486,8 +1584,8 @@ impl PlayerManager {
             }
             match result {
                 Ok((tracks, batch_id)) => {
-                    let filtered = me.wave_engine.lock().unwrap().filter_candidates(tracks);
-                    let tracks = dedup_tracks(&[], filtered);
+                    let tracks = pick_candidates(is_yt, &me.wave_engine, tracks);
+                    let tracks = dedup_tracks(&[], tracks);
                     if tracks.is_empty() && first.is_none() {
                         me.emit(PlayerUiEvent::StatusMessage(
                             "Не удалось загрузить треки для выбранной станции. Попробуйте другой фильтр или трек.".to_string(),
@@ -1858,7 +1956,11 @@ impl PlayerManager {
         spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
         crate::api::history::save_last_track(track);
         crate::api::history::remember_played(&track.id);
-        self.wave_engine.lock().unwrap().record_played(&track.id);
+        // Историю для пост-фильтра ведём только на стороне YouTube Music: у Яндекса
+        // станцию считает сервер, и локальная «память прослушиваний» там только мешает.
+        if track.source == TrackSource::YouTubeMusic {
+            self.wave_engine.lock().unwrap().record_played(&track.id);
+        }
         {
             let mut state = self.state.lock().unwrap();
             state.restored = false;
@@ -2372,6 +2474,7 @@ impl PlayerManager {
                     mood.as_deref(),
                     language.as_deref(),
                     character.as_deref(),
+                    None,
                 ).await {
                     Ok(station_tracks) => {
                         let tr: Vec<Track> = station_tracks.sequence.into_iter().map(|s| s.track).collect();
@@ -2416,12 +2519,15 @@ impl PlayerManager {
 
             match fetch_res {
                 Ok((tracks, batch_id)) => {
-                    let filtered = wave_engine_clone.lock().unwrap().filter_candidates(tracks);
-                    let tracks = dedup_tracks(&[], filtered);
+                    let tracks = pick_candidates(is_yt, &wave_engine_clone, tracks);
+                    let tracks = dedup_tracks(&[], tracks);
                     let first_track = tracks.first().cloned();
 
                     let first_is_liked = if let Ok(mut state) = state_clone.lock() {
                         state.batch_id = batch_id.clone();
+                        state.wave_dead = false;
+                        state.pending_advance = false;
+                        state.refill_failures = 0;
                         if !tracks.is_empty() {
                             state.queue = tracks.clone();
                             state.current_index = 0;
@@ -2777,6 +2883,20 @@ fn next_repeat(mode: RepeatMode, wave: bool) -> RepeatMode {
 fn track_key(t: &Track) -> String {
     let artists: Vec<String> = t.artists.iter().map(|a| a.name.trim().to_lowercase()).collect();
     format!("{}|{}|{}", t.title.trim().to_lowercase(), t.version.as_deref().unwrap_or("").trim().to_lowercase(), artists.join(","))
+}
+
+/// Пост-фильтр «Моей Волны» — только для YouTube Music.
+///
+/// Там подборку собирает `WaveEngine` локально, и историю прослушиваний нужно гасить
+/// самому. У Яндекса станцию считает сервер: он и так не присылает сыгранное, а фильтр
+/// лишь выбрасывал пришедшие треки (плюс гасил те, что пользователь слушал до Волны),
+/// из-за чего очередь не росла и догрузка считалась проваленной.
+fn pick_candidates(is_yt: bool, engine: &Mutex<WaveEngine>, tracks: Vec<Track>) -> Vec<Track> {
+    if is_yt {
+        engine.lock().unwrap().filter_candidates(tracks)
+    } else {
+        tracks
+    }
 }
 
 /// Оставляет в `new` только треки, которых ещё нет в `existing` и среди самих `new`
@@ -3290,6 +3410,58 @@ mod dedup_tests {
         let new = vec![track("2", "Firework ", "katy perry"), track("3", "Roar", "Katy Perry"), track("4", "Roar", "Katy Perry")];
         let kept: Vec<_> = dedup_tracks(&queue, new).into_iter().map(|t| t.id).collect();
         assert_eq!(kept, ["3"]);
+    }
+}
+
+#[cfg(test)]
+mod pick_candidates_tests {
+    use super::*;
+
+    fn track(id: &str, title: &str, artist: &str) -> Track {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "title": title, "artists": [{"id": "1", "name": artist}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn yandex_branch_keeps_tracks_already_in_local_history() {
+        // У Яндекса станцию считает сервер: пост-фильтр не должен выбрасывать треки,
+        // которые пользователь слушал до запуска Волны, — иначе очередь не растёт
+        // и догрузка каждый раз считается проваленной.
+        let engine = Mutex::new(WaveEngine::new());
+        engine.lock().unwrap().record_played("2");
+        let tracks = vec![
+            track("1", "Roar", "Katy Perry"),
+            track("2", "Firework", "Katy Perry"),
+        ];
+        let kept: Vec<String> = pick_candidates(false, &engine, tracks)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(kept, ["1", "2"]);
+    }
+
+    #[test]
+    fn yt_branch_still_drops_played_tracks() {
+        let engine = Mutex::new(WaveEngine::new());
+        engine.lock().unwrap().record_played("2");
+        let tracks = vec![
+            track("1", "Roar", "Katy Perry"),
+            track("2", "Firework", "Katy Perry"),
+        ];
+        let kept: Vec<String> = pick_candidates(true, &engine, tracks)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(kept, ["1"]);
+    }
+
+    #[test]
+    fn empty_history_keeps_everything_on_both_sides() {
+        let engine = Mutex::new(WaveEngine::new());
+        let make = || vec![track("1", "Roar", "Katy Perry"), track("2", "Firework", "Katy Perry")];
+        assert_eq!(pick_candidates(false, &engine, make()).len(), 2);
+        assert_eq!(pick_candidates(true, &engine, make()).len(), 2);
     }
 }
 
