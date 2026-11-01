@@ -512,6 +512,18 @@ impl PlayerManager {
             let _ = crate::api::auth::save_active_provider(id);
             if let Ok(mut state) = self.state.lock() {
                 state.liked_loaded = false;
+                // Фильтры не переносятся между сервисами: у Яндекса это нативный
+                // Ротор, у YouTube Music — локальный алгоритм. Токен продолжения
+                // тоже принадлежит прежнему провайдеру.
+                state.current_mood = None;
+                state.current_language = None;
+                state.current_character = None;
+                state.wave_label = None;
+                state.batch_id = None;
+                state.station_id = "user:onyourwave".to_string();
+                state.wave_dead = false;
+                state.refill_failures = 0;
+                state.pending_advance = false;
             }
             let me = self.clone();
             tokio::spawn(async move {
@@ -4031,6 +4043,54 @@ mod like_tests {
 
         let current_station = state_arc.lock().unwrap().station_id.clone();
         assert_eq!(current_station, "user:onyourwave");
+    }
+
+    #[tokio::test]
+    async fn test_switch_provider_resets_filters() {
+        let client = YandexMusicClient::new(None);
+        let audio = Arc::new(AudioBackend::new().unwrap());
+        let client_mutex = Arc::new(Mutex::new(client.clone()));
+        let state_arc = Arc::new(Mutex::new(PlayerState::default()));
+        {
+            let mut st = state_arc.lock().unwrap();
+            st.current_mood = Some("active".to_string());
+            st.current_language = Some("russian".to_string());
+            st.current_character = Some("favorite".to_string());
+            st.wave_label = Some("🇷🇺 На русском".to_string());
+            st.batch_id = Some("yandex_cont_token".to_string());
+            st.station_id = "track:123".to_string();
+        }
+
+        let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = Arc::new(YtMusicClient::new()) as Arc<dyn MusicProvider>;
+        let provider_manager =
+            ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+
+        let manager = PlayerManager {
+            audio,
+            client: client_mutex,
+            providers: Arc::new(provider_manager),
+            yt_client: Arc::new(YtMusicClient::new()),
+            state: state_arc.clone(),
+            wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
+            event_senders: Arc::new(Mutex::new(Vec::new())),
+            cast: Arc::default(),
+            prefetch: Arc::default(),
+            prefetch_inflight: Arc::default(),
+            generation: Arc::new(AtomicU64::new(0)),
+            tail_swap_epoch: Arc::new(AtomicU64::new(0)),
+            crossfade: Arc::new(Mutex::new((false, 3))),
+        };
+
+        manager.switch_provider(ProviderId::YouTubeMusic);
+
+        let st = state_arc.lock().unwrap();
+        assert_eq!(st.current_mood, None);
+        assert_eq!(st.current_language, None);
+        assert_eq!(st.current_character, None);
+        assert_eq!(st.wave_label, None);
+        assert_eq!(st.batch_id, None);
+        assert_eq!(st.station_id, "user:onyourwave");
     }
 
 }

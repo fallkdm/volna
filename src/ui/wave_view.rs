@@ -98,6 +98,9 @@ impl WaveShaderState {
     }
 }
 
+/// Выбранный пункт фильтра: значение, подпись и цвет
+type Pick = Option<(&'static str, &'static str, [f64; 3])>;
+
 pub struct WaveViewWidgets {
     pub container: Overlay,
     pub title_label: Label,
@@ -120,6 +123,10 @@ pub struct WaveViewWidgets {
     /// Кнопки секции «Настроение»: у YouTube Music нет BPM/energy, поэтому на YT
     /// они гаснут (`sensitive = false`) с подсказкой про Яндекс Музыку
     mood_buttons: Rc<RefCell<Vec<Button>>>,
+    /// Выбранные пункты фильтров (настроение, характер, язык)
+    selection: Rc<RefCell<[Pick; 3]>>,
+    /// Текущий акцент плашки — сбрасывается вместе с фильтрами
+    accent_color: Rc<RefCell<[f64; 3]>>,
 }
 
 impl WaveViewWidgets {
@@ -165,6 +172,25 @@ impl WaveViewWidgets {
                 btn.set_tooltip_text(Some("Доступно в Яндекс Музыке"));
             }
         }
+    }
+
+    /// Полный сброс фильтров в интерфейсе — без запуска новой Волны.
+    ///
+    /// Нужен при смене провайдера: фильтры Яндекса (нативный Ротор) не должны
+    /// переноситься на YouTube Music и наоборот.
+    pub fn reset_filter_ui(&self) {
+        self.filter_pill.set_visible(false);
+        *self.selection.borrow_mut() = [None; 3];
+        for b in self.option_buttons.borrow().iter() {
+            b.remove_css_class("selected");
+        }
+        *self.accent_color.borrow_mut() = [1.0, 0.42, 0.29];
+        self.drawing_area.queue_draw();
+        self.shader_state.borrow_mut().set_target_colors(
+            [0.95, 0.42, 0.02],
+            [0.36, 0.10, 0.00],
+            [1.0, 0.84, 0.42],
+        );
     }
 
     /// Обновляет целевые цвета шейдера при переключении трека из derivedColors
@@ -466,7 +492,6 @@ pub fn create_wave_view(
     ];
 
     // выбор по одному пункту в каждом разделе (настроение, характер, язык); разделы сочетаются
-    type Pick = Option<(&'static str, &'static str, [f64; 3])>;
     let selection: Rc<RefCell<[Pick; 3]>> = Rc::new(RefCell::new([None; 3]));
     let slot_buttons: Rc<RefCell<Vec<(Button, usize, &'static str)>>> = Rc::default();
     let mood_buttons: Rc<RefCell<Vec<Button>>> = Rc::default();
@@ -660,6 +685,8 @@ pub fn create_wave_view(
         source_target: source_target.clone(),
         option_buttons,
         mood_buttons,
+        selection,
+        accent_color: accent_color.clone(),
     }
 }
 

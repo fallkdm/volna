@@ -2038,6 +2038,8 @@ fn setup_event_listener(
                         player.providers.current().provider_id()
                             != crate::api::provider::ProviderId::YouTubeMusic,
                     );
+                    // Фильтры одного сервиса не должны переноситься на другой
+                    wave_view.reset_filter_ui();
                     update_auth_ui(
                         &auth_btn,
                         &auth_icon,
