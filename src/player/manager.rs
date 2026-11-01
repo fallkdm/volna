@@ -2407,6 +2407,9 @@ impl PlayerManager {
                     language.as_deref(),
                 )
                 .await;
+                if language.as_deref() == Some("without-words") && seeds.len() < 2 {
+                    add_instrumental_search_seeds(&me.yt_client, &mut seeds).await;
+                }
                 if seeds.len() < TAIL_SWAP_SEEDS {
                     let extra = crate::api::history::load_recent_played()
                         .into_iter()
@@ -3222,6 +3225,34 @@ async fn add_seeds_from_history_search(
     }
 }
 
+/// Инструментальные сиды для фильтра «Без слов».
+///
+/// В лайках и истории пользователя инструменталов может не быть вовсе, а радио
+/// от вокального трека инструменталов и не выдаёт. Поэтому берём сиды из
+/// поиска YouTube Music по явно инструментальным запросам.
+async fn add_instrumental_search_seeds(yt: &YtMusicClient, seeds: &mut Vec<String>) {
+    const QUERIES: [&str; 3] = [
+        "lofi instrumental",
+        "ambient instrumental",
+        "post-rock instrumental",
+    ];
+    for query in QUERIES {
+        if seeds.len() >= 2 {
+            break;
+        }
+        let Ok(found) = yt.search_songs(query).await else {
+            continue;
+        };
+        if let Some(track) = found
+            .into_iter()
+            .find(|t| !t.id.is_empty() && crate::api::ytmusic::parser::is_clean_music_track(t))
+            && !seeds.contains(&track.id)
+        {
+            seeds.push(track.id);
+        }
+    }
+}
+
 /// Перемешивание без зависимости `rand` (xorshift на наносекундах).
 fn shuffle_tracks(items: &mut [Track]) {
     if items.len() < 2 {
@@ -3291,15 +3322,6 @@ fn select_wave_seeds_from_pool(
     }
 
     let with_title = |t: &Track| format!("{} {}", t.title, t.artists_string());
-    let with_all = |t: &Track| {
-        format!(
-            "{} {} {}",
-            t.title,
-            t.version.as_deref().unwrap_or(""),
-            t.artists_string()
-        )
-    };
-
     let mut matching: Vec<Track> = match (language, character) {
         (Some("russian"), _) => pool
             .iter()
@@ -3313,7 +3335,11 @@ fn select_wave_seeds_from_pool(
             .collect(),
         (Some("without-words"), _) => pool
             .iter()
-            .filter(|t| lf::has_instrumental_marker(&with_all(t)))
+            .filter(|t| {
+                // маркеры — только название/версия, имя артиста обманывает
+                let meta = format!("{} {}", t.title, t.version.as_deref().unwrap_or(""));
+                lf::has_instrumental_marker(&meta)
+            })
             .cloned()
             .collect(),
         (None, Some("favorite")) => state.liked_tracks_cache.clone(),
@@ -3456,6 +3482,19 @@ async fn apply_filters(
             accepted.push(track);
             continue;
         };
+
+        // «Без слов»: маркеры ищем только в названии и версии. Имя артиста
+        // обманывает (например, группа The Score), а наличие маркера ещё не
+        // значит, что нет вокала — трек всё равно проверяется текстом.
+        if filter == lf::LanguageFilter::WithoutWords {
+            // Инструментал определяем по отсутствию текста, а не только по
+            // маркеру: у большинства инструменталов маркеров в названии нет.
+            if ambiguous.len() < PHASE2_MAX_CANDIDATES {
+                ambiguous.push(track);
+            }
+            continue;
+        }
+
         let verdict = match lf::phase_one(
             &track.title,
             track.version.as_deref().unwrap_or(""),
@@ -3510,6 +3549,17 @@ async fn apply_filters(
     let by_id: std::collections::HashMap<String, crate::api::lrclib::LyricsLookup> =
         results.into_iter().collect();
     for track in ambiguous {
+        // «Без слов»: инструментал — это отсутствие текста. Нашли текст
+        // (даже если в нём есть слово-маркер) — значит, трек с вокалом.
+        if filter == lf::LanguageFilter::WithoutWords {
+            if matches!(
+                by_id.get(&track.id),
+                Some(crate::api::lrclib::LyricsLookup::NotFound)
+            ) {
+                accepted.push(track);
+            }
+            continue;
+        }
         let verdict = match by_id.get(&track.id) {
             Some(crate::api::lrclib::LyricsLookup::Found(text)) => {
                 lf::classify_lyrics(&crate::api::lrclib::strip_lrc_tags(text))
@@ -4376,12 +4426,16 @@ mod filter_pipeline_tests {
     }
 
     #[tokio::test]
-    async fn phase_one_accepts_instrumental_for_without_words() {
+    async fn without_words_requires_absence_of_lyrics() {
         let yt = YtMusicClient::new();
         let candidates = vec![
+            // Маркер в названии/версии — но проверка текста обязательна
             track("1", "Track", "Artist", Some("Instrumental")),
-            track("2", "Song", "Band", None),
+            // «The Score» — пример артиста, чьё имя содержит маркер:
+            // оно не должно влиять на вердикт
+            track("2", "Unstoppable", "The Score", None),
         ];
+        // Бюджет 0 → проба текста недоступна (Failed) → треки не приняты
         let accepted = apply_filters(
             &yt,
             candidates,
@@ -4392,8 +4446,10 @@ mod filter_pipeline_tests {
             0,
         )
         .await;
-        let ids: Vec<_> = accepted.into_iter().map(|t| t.id).collect();
-        assert_eq!(ids, ["1"]);
+        assert!(
+            accepted.is_empty(),
+            "без проверки текста инструментал принимать нельзя"
+        );
     }
 
     #[tokio::test]
