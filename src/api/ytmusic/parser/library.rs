@@ -168,6 +168,38 @@ pub fn parse_tv_tile_tracks(json: &serde_json::Value) -> Vec<Track> {
             }]
         };
 
+        // длительность лежит в оверлее превью: «3:04»
+        fn tile_duration(tile: &serde_json::Value) -> Option<u64> {
+            let overlays = tile
+                .get("header")?
+                .get("tileHeaderRenderer")?
+                .get("thumbnailOverlays")?
+                .as_array()?;
+            for overlay in overlays {
+                let text = overlay
+                    .get("thumbnailOverlayTimeStatusRenderer")?
+                    .get("text")?;
+                let raw = text
+                    .get("simpleText")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| text.get("accessibility").and_then(|a| a.get("accessibilityData")).and_then(|d| d.get("label")).and_then(|l| l.as_str()))?;
+                let parts: Vec<&str> = raw.split(':').collect();
+                let seconds: u64 = match parts.as_slice() {
+                    [minutes, seconds] => minutes.parse::<u64>().ok()? * 60 + seconds.parse::<u64>().ok()?,
+                    [hours, minutes, seconds] => {
+                        hours.parse::<u64>().ok()? * 3600
+                            + minutes.parse::<u64>().ok()? * 60
+                            + seconds.parse::<u64>().ok()?
+                    }
+                    _ => continue,
+                };
+                if seconds > 0 {
+                    return Some(seconds * 1000);
+                }
+            }
+            None
+        }
+
         let cover_uri = super::thumbnails::extract_best_thumbnail(tile)
             .or_else(|| Some(format!("https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")));
 
@@ -177,7 +209,7 @@ pub fn parse_tv_tile_tracks(json: &serde_json::Value) -> Vec<Track> {
             version: None,
             artists,
             albums: Vec::new(),
-            duration_ms: None,
+            duration_ms: tile_duration(tile),
             cover_uri,
             og_image: None,
             available: Some(true),
