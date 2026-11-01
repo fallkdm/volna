@@ -561,30 +561,6 @@ menubutton.fluid-pill > button {
     color: #ffffff;
 }
 
-/* Чипы станции от сервиса (варианты сида YouTube Music) */
-.wave-chips button {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 9999px;
-    padding: 6px 14px;
-    font-size: 13px;
-}
-
-.wave-chips button:hover {
-    background: rgba(255, 255, 255, 0.16);
-}
-
-/* Активный вариант станции: подсветка как у выбранного фильтра Волны */
-.wave-chips button.selected {
-    background: #ff6b4a;
-    border-color: #ff6b4a;
-    color: #ffffff;
-}
-
-.wave-chips button.selected:hover {
-    background: #ff7d60;
-}
-
 /* Всплывающие уведомления (тосты) Libadwaita: поднимаем выше плавающего острова плеера */
 toast {
     margin-bottom: 115px;

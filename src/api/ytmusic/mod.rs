@@ -50,6 +50,17 @@ fn store_track_duration(track_id: &str, secs: u64) {
 const BLOCKED_GGC_NODE_MARKERS: [&str; 7] =
     ["vo-", "238s", "hxb", "5hne", "4g5edn", "4g5e6n", "5g0z"];
 
+/// Статус официального текста YouTube Music.
+///
+/// `NoTab` — терминально (вкладки Lyrics нет), `Failed` — сеть/таймаут.
+/// Различие принципиально: только `NoTab` разрешает запись негативного кэша.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YtLyrics {
+    Found(String),
+    NoTab,
+    Failed,
+}
+
 /// Клиент YouTube Music на базе Google InnerTube API
 #[derive(Clone)]
 pub struct YtMusicClient {
@@ -926,23 +937,43 @@ impl YtMusicClient {
     }
 
     /// Запрос официального текста песни из YouTube Music через InnerTube (вкладка Lyrics)
+    ///
+    /// Обёртка для UI: сетевая ошибка и «вкладки текста нет» здесь неразличимы.
+    /// Для алгоритмических фильтров нужен `get_yt_lyrics_status`.
     pub async fn get_yt_lyrics(&self, track_id: &str) -> Option<String> {
+        match self.get_yt_lyrics_status(track_id).await {
+            YtLyrics::Found(text) => Some(text),
+            YtLyrics::NoTab | YtLyrics::Failed => None,
+        }
+    }
+
+    /// Официальный текст с сохранением терминальности.
+    ///
+    /// `NoTab` — терминально (вкладки текста нет), `Failed` — сеть/таймаут.
+    /// Только по этому различию можно безопасно писать негативный кэш.
+    pub async fn get_yt_lyrics_status(&self, track_id: &str) -> YtLyrics {
         let body = serde_json::json!({
             "videoId": track_id
         });
-        let next_json = self
+        let next_json = match self
             .post_innertube("next", "WEB_REMIX", "1.20240101.01.00", body)
             .await
-            .ok()?;
+        {
+            Ok(json) => json,
+            Err(_) => return YtLyrics::Failed,
+        };
 
         // Поиск browseId вкладки текста в tabs
-        let tabs = next_json
+        let Some(tabs) = next_json
             .get("contents")
             .and_then(|c| c.get("singleColumnMusicWatchNextResultsRenderer"))
             .and_then(|w| w.get("tabbedRenderer"))
             .and_then(|t| t.get("watchNextTabbedResultsRenderer"))
             .and_then(|r| r.get("tabs"))
-            .and_then(|t| t.as_array())?;
+            .and_then(|t| t.as_array())
+        else {
+            return YtLyrics::NoTab;
+        };
 
         let mut lyrics_browse_id = None;
         for t in tabs {
@@ -959,17 +990,22 @@ impl YtMusicClient {
             }
         }
 
-        let browse_id = lyrics_browse_id?;
+        let Some(browse_id) = lyrics_browse_id else {
+            return YtLyrics::NoTab;
+        };
         let browse_body = serde_json::json!({
             "browseId": browse_id
         });
-        let browse_json = self
+        let browse_json = match self
             .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", browse_body)
             .await
-            .ok()?;
+        {
+            Ok(json) => json,
+            Err(_) => return YtLyrics::Failed,
+        };
 
         // Извлекаем текст песни из musicDescriptionShelfRenderer.description.runs
-        let runs = browse_json
+        let Some(runs) = browse_json
             .get("contents")
             .and_then(|c| c.get("sectionListRenderer"))
             .and_then(|s| s.get("contents"))
@@ -978,7 +1014,10 @@ impl YtMusicClient {
             .and_then(|first| first.get("musicDescriptionShelfRenderer"))
             .and_then(|shelf| shelf.get("description"))
             .and_then(|desc| desc.get("runs"))
-            .and_then(|r| r.as_array())?;
+            .and_then(|r| r.as_array())
+        else {
+            return YtLyrics::NoTab;
+        };
 
         let mut text = String::new();
         for r in runs {
@@ -988,10 +1027,65 @@ impl YtMusicClient {
         }
 
         let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            Some(trimmed.to_string())
+        if trimmed.is_empty() {
+            YtLyrics::NoTab
         } else {
-            None
+            YtLyrics::Found(trimmed.to_string())
+        }
+    }
+
+    /// Проба текста для алгоритмических фильтров Волны.
+    ///
+    /// Порядок: маркер `.no_lyrics` → `.lrc`-кэш → LRCLib → InnerTube.
+    /// Негативный маркер пишется только когда оба источника ответили терминально
+    /// (`LyricsLookup::NotFound` + `YtLyrics::NoTab`).
+    pub async fn probe_lyrics(&self, track: &Track) -> crate::api::lrclib::LyricsLookup {
+        use crate::api::lrclib::LyricsLookup;
+
+        // 1. Терминальный маркер: сеть не трогаем
+        if crate::cache::has_negative_lyrics_marker(&track.id) {
+            return LyricsLookup::NotFound;
+        }
+
+        // 2. Уже известный текст (синхронизированный или обычный)
+        let cache_path = crate::cache::lyrics_cache_path(&track.id);
+        if let Ok(cached) = std::fs::read_to_string(&cache_path) {
+            let trimmed = cached.trim();
+            if !trimmed.is_empty() {
+                crate::cache::clear_negative_lyrics_marker(&track.id);
+                return LyricsLookup::Found(trimmed.to_string());
+            }
+        }
+
+        let duration_secs = track.duration_ms.map(|d| d / 1000);
+        let artist = track.artists_string();
+        let title = track.title.clone();
+
+        // 3. LRCLib
+        match crate::api::lrclib::lookup_lyrics(&self.http, &artist, &title, duration_secs).await {
+            LyricsLookup::Found(text) => {
+                let _ = std::fs::write(&cache_path, &text);
+                crate::cache::clear_negative_lyrics_marker(&track.id);
+                return LyricsLookup::Found(text);
+            }
+            LyricsLookup::Failed => return LyricsLookup::Failed,
+            LyricsLookup::WrongTrack => return LyricsLookup::WrongTrack,
+            LyricsLookup::NotFound => {}
+        }
+
+        // 4. Официальный текст InnerTube
+        match self.get_yt_lyrics_status(&track.id).await {
+            YtLyrics::Found(text) => {
+                let _ = std::fs::write(&cache_path, &text);
+                crate::cache::clear_negative_lyrics_marker(&track.id);
+                LyricsLookup::Found(text)
+            }
+            YtLyrics::Failed => LyricsLookup::Failed,
+            YtLyrics::NoTab => {
+                // Оба источника ответили терминально — можно запоминать навсегда
+                crate::cache::write_negative_lyrics_marker(&track.id);
+                LyricsLookup::NotFound
+            }
         }
     }
 
@@ -1030,6 +1124,7 @@ impl YtMusicClient {
             let trimmed = lrclib_text.trim();
             if crate::api::lrclib::usable_synced_at(trimmed, duration_secs) {
                 let _ = std::fs::write(&cache_path, trimmed);
+                crate::cache::clear_negative_lyrics_marker(&track.id);
                 return Some(trimmed.to_string());
             } else if !trimmed.is_empty() {
                 lrclib_plain = Some(trimmed.to_string());
@@ -1044,6 +1139,7 @@ impl YtMusicClient {
                 // и в следующий раз проверка пройдёт — а заново размеченный текст уже не найти.
                 if stale_plain.is_none() {
                     let _ = std::fs::write(&cache_path, trimmed);
+                    crate::cache::clear_negative_lyrics_marker(&track.id);
                 }
                 return Some(trimmed.to_string());
             }
@@ -1053,6 +1149,7 @@ impl YtMusicClient {
         if let Some(plain) = lrclib_plain {
             if stale_plain.is_none() {
                 let _ = std::fs::write(&cache_path, &plain);
+                crate::cache::clear_negative_lyrics_marker(&track.id);
             }
             return Some(plain);
         }
@@ -1375,66 +1472,6 @@ impl MusicProvider for YtMusicClient {
             return Ok(StationBatch {
                 batch_id: cont.unwrap_or_default(),
                 tracks,
-                chips: parser::parse_station_chips(&json),
-            });
-        }
-
-        // 0. Вариант станции из чипа YouTube Music: `variant:<playlistId>` (`RDAT…`)
-        //
-        // Подпись чипа не фильтрует текущий микс, а открывает другой его сид-вариант,
-        // поэтому `playlistId` из чипа подставляется в запрос вместо `RDAMVM<seed>`.
-        // Третья часть (`variant:<playlistId>:<videoId>`) задаёт сид явно: так Seed Drift
-        // и догрузка очереди остаются внутри выбранного варианта, а не уходят в общий микс.
-        if station_id.starts_with("variant:") && parse_variant_station(station_id).is_none() {
-            return Err("пустой playlistId варианта станции".into());
-        }
-        if let Some((playlist_id, seed_override)) = parse_variant_station(station_id) {
-            let seed_video_id = match seed_override {
-                Some(seed) => seed.to_string(),
-                None => self
-                    .last_seed
-                    .read()
-                    .await
-                    .clone()
-                    .unwrap_or_else(|| "bgKxYnTEN5Y".to_string()),
-            };
-            let json = self
-                .post_innertube(
-                    "next",
-                    "WEB_REMIX",
-                    "1.20240101.01.00",
-                    serde_json::json!({
-                        "videoId": seed_video_id,
-                        "playlistId": playlist_id,
-                    }),
-                )
-                .await?;
-            let (tracks, continuation) = parser::parse_radio_batch(&json);
-            let chips = parser::parse_station_chips(&json);
-            if tracks.is_empty() {
-                // Вариант не отдал треков — возвращаем базовый автомикс того же сида
-                let base_json = self
-                    .post_innertube(
-                        "next",
-                        "WEB_REMIX",
-                        "1.20240101.01.00",
-                        serde_json::json!({
-                            "videoId": seed_video_id,
-                            "playlistId": format!("RDAMVM{}", seed_video_id),
-                        }),
-                    )
-                    .await?;
-                let (base_tracks, base_cont) = parser::parse_radio_batch(&base_json);
-                return Ok(StationBatch {
-                    batch_id: base_cont.unwrap_or_default(),
-                    tracks: base_tracks,
-                    chips: parser::parse_station_chips(&base_json),
-                });
-            }
-            return Ok(StationBatch {
-                batch_id: continuation.unwrap_or_default(),
-                tracks,
-                chips,
             });
         }
 
@@ -1488,7 +1525,6 @@ impl MusicProvider for YtMusicClient {
             .post_innertube("next", "WEB_REMIX", "1.20240101.01.00", body)
             .await?;
         let (mut tracks, mut continuation) = parser::parse_radio_batch(&json);
-        let mut chips = parser::parse_station_chips(&json);
 
         // Фолбэк: если треки не вернулись, делаем аварийный запрос с проверенным seed
         if tracks.is_empty() && seed_video_id != "bgKxYnTEN5Y" {
@@ -1507,7 +1543,6 @@ impl MusicProvider for YtMusicClient {
                     *guard = Some(fb_seed.to_string());
                     tracks = fb_tracks;
                     continuation = fb_cont;
-                    chips = parser::parse_station_chips(&fb_json);
                 }
             }
         }
@@ -1515,7 +1550,6 @@ impl MusicProvider for YtMusicClient {
         Ok(StationBatch {
             batch_id: continuation.unwrap_or_default(),
             tracks,
-            chips,
         })
     }
 
@@ -1531,39 +1565,9 @@ impl MusicProvider for YtMusicClient {
     }
 }
 
-/// Разбор идентификатора варианта станции: `variant:<playlistId>[:<videoId>]`.
-///
-/// Чип из ответа `next` несёт только `playlistId`; сид по умолчанию берётся из
-/// `last_seed`. Явный сид нужен догрузке очереди и Seed Drift: без него вариант
-/// станции терялся бы при первом же переезде на новый сид.
-fn parse_variant_station(station_id: &str) -> Option<(&str, Option<&str>)> {
-    let rest = station_id.strip_prefix("variant:")?;
-    let (playlist_id, seed) = match rest.split_once(':') {
-        Some((id, seed)) => (id.trim(), Some(seed.trim()).filter(|s| !s.is_empty())),
-        None => (rest.trim(), None),
-    };
-    if playlist_id.is_empty() {
-        return None;
-    }
-    Some((playlist_id, seed))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_variant_station() {
-        assert_eq!(parse_variant_station("variant:RDATabc"), Some(("RDATabc", None)));
-        assert_eq!(
-            parse_variant_station("variant:RDATabc:vid123"),
-            Some(("RDATabc", Some("vid123")))
-        );
-        // Пустой сид — как отсутствующий, а не «сид из пустой строки»
-        assert_eq!(parse_variant_station("variant:RDATabc:"), Some(("RDATabc", None)));
-        assert_eq!(parse_variant_station("variant:   "), None);
-        assert_eq!(parse_variant_station("track:vid123"), None);
-    }
 
     #[test]
     fn test_resolve_yt_dlp() {

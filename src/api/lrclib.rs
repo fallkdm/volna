@@ -13,6 +13,22 @@ pub enum LrclibFetch {
     Failed,
 }
 
+/// Итог поиска текста с сохранением терминальности.
+///
+/// Нужен алгоритмическим фильтрам Волны: негативный кэш можно писать только при
+/// `NotFound`, а `WrongTrack`/`Failed` — транзиентные состояния, их кэшировать нельзя.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LyricsLookup {
+    /// Текст найден (синхронизированный или обычный)
+    Found(String),
+    /// Терминально: 404 по обоим запросам и поиск ничего не дал
+    NotFound,
+    /// Запись есть, но это другой трек / не сошлась длительность — не терминально
+    WrongTrack,
+    /// Сеть, таймаут или битый JSON — не терминально
+    Failed,
+}
+
 /// GET к LRCLIB с повтором: сервис нередко отвечает 429 (лимит на общий IP) или 5xx, а 404 означает «текста нет»
 pub async fn lrclib_get(http: &reqwest::Client, url: &str) -> LrclibFetch {
     for attempt in 0..3u64 {
@@ -252,21 +268,39 @@ pub fn urlencoding_encode(s: &str) -> String {
 }
 
 /// Поиск в LRCLIB записи с синхронизированным текстом той же длительности (±4 с)
+///
+/// Обёртка над статусной версией: сетевой сбой и «ничего не нашли» здесь
+/// неразличимы — вызывающим, которым важна терминальность, нужен
+/// `lrclib_search_synced_status`.
 pub async fn lrclib_search_synced(
     http: &reqwest::Client,
     artist: &str,
     title: &str,
     duration_secs: Option<u64>,
 ) -> Option<String> {
+    lrclib_search_synced_status(http, artist, title, duration_secs)
+        .await
+        .unwrap_or(None)
+}
+
+/// То же, но с сохранением терминальности: `Err(())` — сетевой сбой или битый JSON.
+async fn lrclib_search_synced_status(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+) -> Result<Option<String>, ()> {
     let clean_t = clean_title_for_lyrics(title);
     let url = format!(
         "https://lrclib.net/api/search?q={}",
         urlencoding_encode(&format!("{clean_t} {artist}"))
     );
-    let LrclibFetch::Found(resp) = lrclib_get(http, &url).await else {
-        return None;
+    let resp = match lrclib_get(http, &url).await {
+        LrclibFetch::Found(resp) => resp,
+        LrclibFetch::Failed => return Err(()),
+        LrclibFetch::NotFound => return Ok(None),
     };
-    let items: Vec<serde_json::Value> = resp.json().await.ok()?;
+    let items: Vec<serde_json::Value> = resp.json().await.map_err(|_| ())?;
     let (title_n, artist_n) = (normalize_name(&clean_t), normalize_name(artist));
     let first_artist = normalize_name(artist.split(',').next().unwrap_or(artist));
     let raw_artist = artist.trim().to_lowercase();
@@ -287,7 +321,7 @@ pub async fn lrclib_search_synced(
         (t == title_n && same_artist(&a, &raw))
             || (!artist_n.is_empty() && t == artist_n && a == title_n)
     };
-    items
+    Ok(items
         .iter()
         .filter(|v| names_match(v))
         .filter(|v| match (duration_secs, v["duration"].as_f64()) {
@@ -300,20 +334,24 @@ pub async fn lrclib_search_synced(
                 .map(str::trim)
                 .filter(|t| usable_synced_at(t, duration_secs))
                 .map(String::from)
-        })
+        }))
 }
 
-/// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net)
-pub async fn fetch_lrclib_lyrics(
+/// Поиск текста с сохранением терминальности (для алгоритмических фильтров Волны).
+///
+/// Отличается от `fetch_lrclib_lyrics` тем, что не схлопывает «нет текста»,
+/// «это чужой трек» и «сеть недоступна» в один `None`.
+pub async fn lookup_lyrics(
     http: &reqwest::Client,
     artist: &str,
     title: &str,
     duration_secs: Option<u64>,
-) -> Option<String> {
+) -> LyricsLookup {
     let clean_artist = artist.trim();
     let clean_title = clean_title_for_lyrics(title);
+    // Нечего искать: это не «нет текста», а кривые метаданные — кэшировать нельзя
     if clean_artist.is_empty() || clean_title.is_empty() {
-        return None;
+        return LyricsLookup::WrongTrack;
     }
 
     let encoded_artist = urlencoding_encode(clean_artist);
@@ -334,70 +372,102 @@ pub async fn fetch_lrclib_lyrics(
     };
 
     let mut plain_fallback: Option<String> = None;
+    let mut mismatch = false;
+    let mut saw_failure = false;
+
     let mut resp = lrclib_get(http, &make_url(duration_secs)).await;
     // Если запрос с точной длительностью вернул 404, повторяем поиск без ограничения длительности
     if matches!(resp, LrclibFetch::NotFound) && duration_secs.is_some() {
         resp = lrclib_get(http, &make_url(None)).await;
     }
-    let resp = match resp {
-        LrclibFetch::Found(r) => Some(r),
-        LrclibFetch::Failed => return None,
-        LrclibFetch::NotFound => None,
-    };
 
-    if let Some(response) = resp
-        && let Ok(data) = response.json::<LrclibResponse>().await
-    {
-        // `/api/get` отвечает и на нечёткий запрос: если в ответе явно другой трек,
-        // его текст брать нельзя — иначе под одним названием окажется чужая песня
-        let matches_request = |name: &Option<String>| {
-            name.as_deref()
-                .is_none_or(|n| same_song_title(n, &clean_title))
-        };
-        let artist_matches = data
-            .artist_name
-            .as_deref()
-            .is_none_or(|n| same_artist_name(n, clean_artist));
-        let duration_matches = match (data.duration, duration_secs) {
-            (Some(got), Some(want)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
-            _ => true,
-        };
-        let record_matches = matches_request(&data.track_name)
-            && artist_matches
-            && duration_matches
-            && !looks_like_foreign_song(data.synced_lyrics.as_deref().unwrap_or(""), duration_secs);
-        if !record_matches {
-            println!(
-                "[lyrics] LRCLIB /api/get: «{}» / «{}» ({} с) — не тот трек",
-                data.track_name.as_deref().unwrap_or("?"),
-                data.artist_name.as_deref().unwrap_or("?"),
-                data.duration.unwrap_or(0.0)
-            );
-        }
-        if record_matches {
-            if let Some(synced) = data.synced_lyrics {
-                let trimmed = synced.trim();
-                if usable_synced_at(trimmed, duration_secs) {
-                    return Some(trimmed.to_string());
+    match resp {
+        LrclibFetch::Failed => saw_failure = true,
+        LrclibFetch::NotFound => {}
+        LrclibFetch::Found(response) => match response.json::<LrclibResponse>().await {
+            Err(_) => saw_failure = true,
+            Ok(data) => {
+                // `/api/get` отвечает и на нечёткий запрос: если в ответе явно другой трек,
+                // его текст брать нельзя — иначе под одним названием окажется чужая песня
+                let matches_request = |name: &Option<String>| {
+                    name.as_deref()
+                        .is_none_or(|n| same_song_title(n, &clean_title))
+                };
+                let artist_matches = data
+                    .artist_name
+                    .as_deref()
+                    .is_none_or(|n| same_artist_name(n, clean_artist));
+                let duration_matches = match (data.duration, duration_secs) {
+                    (Some(got), Some(want)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
+                    _ => true,
+                };
+                let record_matches = matches_request(&data.track_name)
+                    && artist_matches
+                    && duration_matches
+                    && !looks_like_foreign_song(
+                        data.synced_lyrics.as_deref().unwrap_or(""),
+                        duration_secs,
+                    );
+                if !record_matches {
+                    mismatch = true;
+                    println!(
+                        "[lyrics] LRCLIB /api/get: «{}» / «{}» ({} с) — не тот трек",
+                        data.track_name.as_deref().unwrap_or("?"),
+                        data.artist_name.as_deref().unwrap_or("?"),
+                        data.duration.unwrap_or(0.0)
+                    );
+                }
+                if record_matches {
+                    if let Some(synced) = data.synced_lyrics {
+                        let trimmed = synced.trim();
+                        if usable_synced_at(trimmed, duration_secs) {
+                            return LyricsLookup::Found(trimmed.to_string());
+                        }
+                    }
+                    if let Some(plain) = data.plain_lyrics {
+                        let trimmed = plain.trim();
+                        if !trimmed.is_empty() {
+                            plain_fallback = Some(trimmed.to_string());
+                        }
+                    }
                 }
             }
-            if let Some(plain) = data.plain_lyrics {
-                let trimmed = plain.trim();
-                if !trimmed.is_empty() {
-                    plain_fallback = Some(trimmed.to_string());
-                }
-            }
-        }
+        },
     }
 
     // Точное совпадение дало только обычный текст или 404: ищем запись с таймингами через поиск
-    if let Some(synced) =
-        lrclib_search_synced(http, clean_artist, &clean_title, duration_secs).await
-    {
-        return Some(synced);
+    match lrclib_search_synced_status(http, clean_artist, &clean_title, duration_secs).await {
+        Ok(Some(synced)) => return LyricsLookup::Found(synced),
+        Ok(None) => {}
+        Err(()) => saw_failure = true,
     }
 
-    plain_fallback
+    if let Some(plain) = plain_fallback {
+        return LyricsLookup::Found(plain);
+    }
+    if saw_failure {
+        LyricsLookup::Failed
+    } else if mismatch {
+        LyricsLookup::WrongTrack
+    } else {
+        LyricsLookup::NotFound
+    }
+}
+
+/// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net)
+///
+/// Обёртка над `lookup_lyrics`: три существующих вызова (UI-путь и кэш)
+/// продолжают работать с `Option<String>`.
+pub async fn fetch_lrclib_lyrics(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+) -> Option<String> {
+    match lookup_lyrics(http, artist, title, duration_secs).await {
+        LyricsLookup::Found(text) => Some(text),
+        _ => None,
+    }
 }
 
 /// Получение текста песни с дисковым кэшированием для мгновенного доступа

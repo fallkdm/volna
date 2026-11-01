@@ -27,6 +27,43 @@ pub fn lyrics_cache_path(track_id: &str) -> PathBuf {
     dir.join(format!("{}.lrc", safe))
 }
 
+/// Директория кэша текстов (~/.cache/volna/lyrics)
+fn lyrics_dir() -> PathBuf {
+    let dir = covers_cache_dir().parent().map(|p| p.join("lyrics")).unwrap_or_else(|| PathBuf::from("lyrics"));
+    let _ = create_dir_all(&dir);
+    dir
+}
+
+/// Путь к терминальному маркеру «текста нет» (~/.cache/volna/lyrics/ID.no_lyrics)
+///
+/// В отличие от `.lrc`-кэша, дефис и подчёркивание сохраняются: YouTube-ID может
+/// содержать оба символа, и замена их на `_` давала бы коллизии (`A-B` vs `A_B`).
+pub fn lyrics_negative_cache_path(track_id: &str) -> PathBuf {
+    let safe: String = track_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    lyrics_dir().join(format!("{}.no_lyrics", safe))
+}
+
+/// Есть ли терминальный маркер «у трека нет текста»
+pub fn has_negative_lyrics_marker(track_id: &str) -> bool {
+    lyrics_negative_cache_path(track_id).exists()
+}
+
+/// Записать терминальный маркер «у трека нет текста»
+pub fn write_negative_lyrics_marker(track_id: &str) {
+    let _ = std::fs::write(lyrics_negative_cache_path(track_id), b"");
+}
+
+/// Снять маркер «текста нет» — вызывается, когда текст всё-таки нашёлся
+pub fn clear_negative_lyrics_marker(track_id: &str) {
+    let path = lyrics_negative_cache_path(track_id);
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Вычисляет хэш для имени файла обложки
 pub fn cover_cache_path(url: &str) -> PathBuf {
     let mut hasher = Md5::new();
@@ -440,3 +477,28 @@ mod audio_cache_tests {
     }
 }
 
+
+#[cfg(test)]
+mod negative_cache_tests {
+    use super::*;
+
+    #[test]
+    fn marker_paths_do_not_collide() {
+        let a = lyrics_negative_cache_path("A-B");
+        let b = lyrics_negative_cache_path("A_B");
+        assert_ne!(a, b, "дефис и подчёркивание должны различаться");
+        assert!(a.to_string_lossy().ends_with("A-B.no_lyrics"));
+        assert!(b.to_string_lossy().ends_with("A_B.no_lyrics"));
+    }
+
+    #[test]
+    fn marker_write_and_clear() {
+        let id = "test-marker-track_1";
+        let _ = std::fs::remove_file(lyrics_negative_cache_path(id));
+        assert!(!has_negative_lyrics_marker(id));
+        write_negative_lyrics_marker(id);
+        assert!(has_negative_lyrics_marker(id));
+        clear_negative_lyrics_marker(id);
+        assert!(!has_negative_lyrics_marker(id));
+    }
+}

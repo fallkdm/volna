@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod filters;
 pub mod cast;
 pub mod events;
 pub mod manager;

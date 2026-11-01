@@ -94,6 +94,11 @@ impl VolnaWindow {
 
         // Экран 1: Волна
         let wave_view = create_wave_view(&player, is_playing_state.clone(), accent_color);
+        // «Настроение» работает только в Яндексе: у YouTube Music нет BPM/energy
+        wave_view.set_mood_sensitive(
+            player.providers.current().provider_id()
+                != crate::api::provider::ProviderId::YouTubeMusic,
+        );
         let wave_page = view_stack.add_titled(&wave_view.container, Some("wave"), "Волна");
         wave_page.set_icon_name(Some("audio-volume-high-symbolic"));
 
@@ -1357,8 +1362,6 @@ impl VolnaWindow {
             is_collapsed.clone(),
         );
 
-        player.ensure_wave_chips();
-
         Self { window }
     }
 
@@ -1747,8 +1750,6 @@ fn setup_event_listener(
                         island.total_time_label.set_text(&format_seconds(total_secs));
                         island.seek_scale.set_range(0.0, total_secs as f64);
                     }
-
-                    player.ensure_wave_chips();
                 }
                 PlayerUiEvent::PlaybackToggled(is_playing) => {
                     *is_playing_state.borrow_mut() = is_playing;
@@ -1791,7 +1792,6 @@ fn setup_event_listener(
                     *wave_view.source_target.borrow_mut() = source.and_then(|s| s.target);
                 }
                 PlayerUiEvent::StationTarget(target) => *wave_view.source_target.borrow_mut() = target,
-                PlayerUiEvent::WaveChips(chips) => wave_view.set_chips(&chips),
                 PlayerUiEvent::RepeatChanged(mode) => {
                     let tip = match mode {
                         RepeatMode::Off => "Повтор: выключен",
@@ -2033,6 +2033,11 @@ fn setup_event_listener(
                             source_label.set_text("Яндекс");
                         }
                     }
+                    // У YouTube Music нет BPM/energy — «Настроение» доступно только в Яндексе
+                    wave_view.set_mood_sensitive(
+                        player.providers.current().provider_id()
+                            != crate::api::provider::ProviderId::YouTubeMusic,
+                    );
                     update_auth_ui(
                         &auth_btn,
                         &auth_icon,

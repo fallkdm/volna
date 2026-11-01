@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use async_channel::Sender;
+use futures_util::stream::StreamExt;
 
 use crate::api::client::YandexMusicClient;
 use crate::api::models::{Album, Playlist, Track, TrackSource};
-use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId, StationChip};
+use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId};
 use crate::api::provider_manager::ProviderManager;
 use crate::api::ytmusic::YtMusicClient;
 use super::audio::AudioBackend;
@@ -85,8 +87,6 @@ pub enum PlayerUiEvent {
     SourceContext(Option<PlaySource>),
     /// Страница, куда ведёт плашка Волны («По треку», «По артисту»)
     StationTarget(Option<SourceTarget>),
-    /// Чипы станции от сервиса («Знакомое», «Редкие треки», «Металл»…); пусто — чипов нет
-    WaveChips(Vec<crate::api::provider::StationChip>),
     /// Изменились настройки Discord (включение, Application ID)
     DiscordSettingsChanged,
     /// Изменились настройки плавного перехода между треками
@@ -145,13 +145,8 @@ pub struct PlayerState {
     pub wave_dead: bool,
     /// Сколько догрузок Волны подряд не дали новых треков (сбрасывается при удаче)
     pub refill_failures: usize,
-    /// Чипы станции от сервиса (варианты станции в YouTube Music)
-    pub wave_chips: Vec<crate::api::provider::StationChip>,
-    /// Ключ станции, к которой относятся `wave_chips`; пусто — чипы ещё не спрашивали.
-    /// Пустой `wave_chips` при заполненном ключе — кэш «у станции вариантов нет»
-    pub wave_chips_station: String,
-    /// Ключ станции, для которой запрос чипов уже в полёте (защита от дублей)
-    pub wave_chips_pending: String,
+    /// Полные объекты любимых треков — источник сидов для алгоритмических фильтров
+    pub liked_tracks_cache: Vec<Track>,
 }
 
 impl PlayerState {
@@ -218,9 +213,7 @@ impl Default for PlayerState {
             pending_advance: false,
             wave_dead: false,
             refill_failures: 0,
-            wave_chips: Vec::new(),
-            wave_chips_station: String::new(),
-            wave_chips_pending: String::new(),
+            liked_tracks_cache: Vec::new(),
         }
     }
 }
@@ -295,6 +288,9 @@ pub struct PlayerManager {
     pub(super) cast: Arc<Mutex<Option<super::cast::CastLink>>>,
     /// Номер последнего запроса воспроизведения: устаревшие асинхронные задачи (быстрые клики) отбрасываются
     generation: Arc<AtomicU64>,
+    /// Эпоха бесшовного обмена хвоста (TailSwap). Отдельно от `generation`: та
+    /// инкрементируется на каждом переходе трека и не должна отменять фильтр.
+    tail_swap_epoch: Arc<AtomicU64>,
     /// Настройки плавного перехода: (включен, длительность в секундах)
     crossfade: Arc<Mutex<(bool, u32)>>,
 }
@@ -353,6 +349,7 @@ impl PlayerManager {
             prefetch: Arc::default(),
             prefetch_inflight: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
+            tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade,
         };
 
@@ -515,16 +512,11 @@ impl PlayerManager {
             let _ = crate::api::auth::save_active_provider(id);
             if let Ok(mut state) = self.state.lock() {
                 state.liked_loaded = false;
-                state.wave_chips.clear();
-                // У другого сервиса своя станция и свои чипы — кэш ответов не переносим
-                state.wave_chips_station.clear();
-                state.wave_chips_pending.clear();
             }
             let me = self.clone();
             tokio::spawn(async move {
                 me.ensure_liked_loaded().await;
             });
-            self.emit(PlayerUiEvent::WaveChips(Vec::new()));
             self.emit(PlayerUiEvent::ProviderChanged(id));
         }
     }
@@ -545,11 +537,14 @@ impl PlayerManager {
         let provider = self.providers.current();
         if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
             if let Ok(tracks) = provider.get_liked_tracks().await {
-                let ids: Vec<String> = tracks.into_iter().map(|t| t.id).filter(|id| !id.is_empty()).collect();
+                let tracks: Vec<Track> = tracks.into_iter().filter(|t| !t.id.is_empty()).collect();
+                let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
                 let current_liked = {
                     let mut state = self.state.lock().unwrap();
                     state.liked_loaded = true;
                     state.merge_server_likes(ids);
+                    // Полные объекты нужны фильтрам для выбора сида
+                    state.liked_tracks_cache = tracks;
                     let track_id = state.current_track.as_ref().map(|t| t.id.clone());
                     track_id.map(|id| state.sync_track_like_status(&id))
                 };
@@ -1179,6 +1174,8 @@ impl PlayerManager {
         let senders = self.event_senders.clone();
         // Нужен, чтобы после догрузки перейти на новый трек, если очередь кончилась
         let me = self.clone();
+        // Снимок эпохи берём до сети: TailSwap за это время мог обрезать хвост
+        let epoch_snapshot = self.tail_swap_epoch.load(Ordering::SeqCst);
 
         let (station_id, batch_id, mood, language, character) = {
             let state = self.state.lock().unwrap();
@@ -1202,32 +1199,61 @@ impl PlayerManager {
                 // Seed Drift: один и тот же «RDAMVM» сид бесконечно выдаёт всё более узкий
                 // поджанровый пузырь. Через каждые N сыгранных треков переезжаем на свежий
                 // сид — от того трека, который слушатель слышит сейчас.
+                //
+                // Порядок важен: кандидаты в якоря отбираются ДО лока `wave_engine`,
+                // а решение и сброс счётчика делаются одним локом. Иначе две параллельные
+                // догрузки стартовали бы два разных сида на одном переходе.
                 let drift_due = {
-                    let mut engine = wave_engine_clone.lock().unwrap();
-                    let due = engine.seed_drift_due();
-                    if due {
-                        // Счётчик гасим до запроса: параллельные догрузки не должны
-                        // стартовать два разных сида на одном переходе.
-                        engine.mark_seed_started();
-                    }
-                    due
+                    let engine = wave_engine_clone.lock().unwrap();
+                    engine.seed_drift_due()
                 };
-
-                let (primary_anchor, spare_anchor) = {
+                let (primary_track, spare_track) = {
                     let state = state_clone.lock().unwrap();
-                    let anchor = state
+                    let primary = state
                         .current_track
-                        .as_ref()
-                        .or_else(|| state.queue.get(state.current_index))
-                        .map(|t| t.id.clone())
-                        .filter(|id| !id.is_empty());
-                    let spare = state.queue.last().map(|t| t.id.clone()).filter(|id| !id.is_empty());
-                    (anchor, spare)
+                        .clone()
+                        .or_else(|| state.queue.get(state.current_index).cloned())
+                        .filter(|t| !t.id.is_empty());
+                    let spare = state.queue.last().cloned().filter(|t| !t.id.is_empty());
+                    (primary, spare)
+                };
+                let (liked_ids, history_set) = snapshots_for_filters(&me);
+                let primary_anchor = primary_track
+                    .filter(|t| {
+                        anchor_passes_filters(
+                            t,
+                            language.as_deref(),
+                            character.as_deref(),
+                            &liked_ids,
+                            &history_set,
+                        )
+                    })
+                    .map(|t| t.id);
+                let spare_anchor = spare_track
+                    .filter(|t| {
+                        anchor_passes_filters(
+                            t,
+                            language.as_deref(),
+                            character.as_deref(),
+                            &liked_ids,
+                            &history_set,
+                        )
+                    })
+                    .map(|t| t.id);
+                let has_candidate = primary_anchor.is_some() || spare_anchor.is_some();
+                let drift_active = {
+                    let mut engine = wave_engine_clone.lock().unwrap();
+                    if drift_due && has_candidate {
+                        engine.mark_seed_started();
+                        true
+                    } else {
+                        false
+                    }
                 };
 
                 // Multi-seed: каждый второй переезд стартует не от текущего трека, а от
                 // дальнего края очереди — так в миксе чередуются два соседних пузыря.
-                let anchor = if drift_due {
+                let anchor = if drift_active {
                     let serial = wave_engine_clone.lock().unwrap().note_seed_drift();
                     let picked = pick_drift_anchor(serial, primary_anchor.as_deref(), spare_anchor.as_deref());
                     eprintln!(
@@ -1237,10 +1263,13 @@ impl PlayerManager {
                     );
                     picked
                 } else {
+                    if drift_due {
+                        eprintln!("[wave] дрейф отложен: нет якоря под активные фильтры");
+                    }
                     primary_anchor.clone()
                 };
 
-                let plan = plan_wave_fetch(&station_id, batch_id.as_deref(), drift_due, anchor.as_deref());
+                let plan = plan_wave_fetch(&station_id, batch_id.as_deref(), drift_active, anchor.as_deref());
                 let mut station_batch = provider
                     .get_station_tracks(&plan.station, plan.continuation.as_deref())
                     .await
@@ -1276,13 +1305,30 @@ impl PlayerManager {
                 }
 
                 let raw = station_batch.tracks.len();
-                let filtered = pick_candidates(true, &wave_engine_clone, station_batch.tracks);
+                let pre = pick_candidates(true, &wave_engine_clone, station_batch.tracks);
+                let filtered = apply_filters(
+                    &me.yt_client,
+                    pre,
+                    language.as_deref(),
+                    character.as_deref(),
+                    &liked_ids,
+                    &history_set,
+                    4800,
+                )
+                .await;
+
+                // Пока тянули батч, пользователь мог сменить фильтр: хвост уже обрезан
+                if me.tail_swap_epoch.load(Ordering::SeqCst) != epoch_snapshot {
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    return;
+                }
+
                 let updated = {
                     let mut state = state_clone.lock().unwrap();
                     state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
                     let new_tracks = dedup_tracks(&state.queue, filtered);
                     let mut dropped: Vec<String> = Vec::new();
-                    if drift_due && !new_tracks.is_empty() {
+                    if drift_active && !new_tracks.is_empty() {
                         // Свежий сид заменяет ещё не сыгранный хвост старого микса:
                         // иначе очередь растёт бесконечно и в ней копятся треки чужого сида.
                         let keep = (state.current_index + 1).min(state.queue.len());
@@ -1298,13 +1344,6 @@ impl PlayerManager {
                 if !dropped.is_empty() {
                     // Выброшенный хвост тоже не должен вернуться в следующей порции
                     me.wave_engine.lock().unwrap().remember_dropped(&dropped);
-                }
-                if !station_batch.chips.is_empty() {
-                    if let Ok(mut state) = state_clone.lock() {
-                        state.wave_chips = station_batch.chips.clone();
-                        state.wave_chips_station = wave_chips_key(&station_id);
-                    }
-                    emit_all(&senders, PlayerUiEvent::WaveChips(station_batch.chips.clone()));
                 }
                 eprintln!("[wave] raw={} added={} queue={}", raw, added, updated_queue.len());
                 emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
@@ -1500,7 +1539,6 @@ impl PlayerManager {
             state.current_mood = None;
             state.current_language = None;
             state.current_character = None;
-            state.wave_chips.clear();
             if let Some(t) = &first {
                 state.queue = vec![t.clone()];
                 state.current_index = 0;
@@ -1534,11 +1572,9 @@ impl PlayerManager {
             let provider = me.providers.current();
             let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
 
-            let mut wave_chips: Vec<StationChip> = Vec::new();
             let mut result: Result<(Vec<Track>, Option<String>), String> = if is_yt {
                 match provider.get_station_tracks(&station_id, None).await {
                     Ok(batch) => {
-                        wave_chips = batch.chips.clone();
                         let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                         Ok((batch.tracks, b_id))
                     }
@@ -1565,7 +1601,6 @@ impl PlayerManager {
                     if tr.is_empty() {
                         if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
                             if !batch.tracks.is_empty() {
-                                wave_chips = batch.chips.clone();
                                 let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                                 result = Ok((batch.tracks, b_id));
                             }
@@ -1573,11 +1608,6 @@ impl PlayerManager {
                     }
                 }
             }
-
-            if let Ok(mut state) = me.state.lock() {
-                state.wave_chips = wave_chips.clone();
-            }
-            me.emit(PlayerUiEvent::WaveChips(wave_chips));
 
             if first.is_none() {
                 me.emit(PlayerUiEvent::LoadingState(false));
@@ -2274,6 +2304,18 @@ impl PlayerManager {
         }
 
         let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+
+        // YouTube Music: фильтры языка/характера применяются локально и бесшовно
+        // (хвост очереди меняется, текущий трек продолжает играть).
+        if is_yt {
+            if mood.is_some() {
+                // Настроению на YT взяться неоткуда — кнопки выключены в UI
+                return;
+            }
+            self.tail_swap(language, character);
+            return;
+        }
+
         let is_reset = mood.is_none() && language.is_none() && character.is_none();
         let station_id = if is_yt && is_reset {
             self.state
@@ -2289,98 +2331,170 @@ impl PlayerManager {
         self.apply_wave_station(station_id, mood, language, character);
     }
 
-    /// Переключает Волну на вариант станции из чипа YouTube Music (`playlistId` вида `RDAT…`)
+    /// Бесшовный обмен хвоста очереди под выбранные фильтры (только YouTube Music).
     ///
-    /// Чип — не фильтр поверх текущего микса, а другой его сид-вариант, поэтому станция
-    /// получает префикс `variant:`, который разбирает провайдер.
-    pub fn apply_station_variant(&self, playlist_id: String) {
-        let playlist_id = playlist_id.trim().to_string();
-        if playlist_id.is_empty() {
-            return;
-        }
-        let provider = self.providers.current();
-        if provider.provider_id() == ProviderId::YouTubeMusic && !provider.is_authenticated() {
-            self.emit(PlayerUiEvent::StatusMessage(
-                "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
-            ));
-            return;
-        }
-        self.apply_wave_station(format!("variant:{}", playlist_id), None, None, None);
-    }
-
-    /// Возвращает сохранённые чипы вариантов волны
-    pub fn wave_chips(&self) -> Vec<crate::api::provider::StationChip> {
-        self.state.lock().map(|s| s.wave_chips.clone()).unwrap_or_default()
-    }
-
-    /// `playlistId` активного варианта станции, если Волна идёт от чипа
-    pub fn wave_variant_id(&self) -> Option<String> {
-        let station_id = self.state.lock().ok()?.station_id.clone();
-        variant_playlist_id(&station_id).map(str::to_string)
-    }
-
-    /// Гарантирует наличие чипов станции для текущего контекста YouTube Music:
-    /// если они уже в памяти — пересылает в UI, иначе запрашивает в фоне
-    ///
-    /// Кэш привязан к станции, а не к треку: ответ «чипов нет» тоже запоминается,
-    /// иначе каждый переход трека стоил бы лишнего запроса `next`.
-    pub fn ensure_wave_chips(&self) {
-        let provider = self.providers.current();
-        if provider.provider_id() != ProviderId::YouTubeMusic {
-            return;
-        }
-
-        let (cached_chips, cached_station, pending, station_request, station_key) = {
-            let state = match self.state.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            (
-                state.wave_chips.clone(),
-                state.wave_chips_station.clone(),
-                state.wave_chips_pending.clone(),
-                wave_chips_request(&state),
-                wave_chips_key(&state.station_id),
-            )
-        };
-
-        if !cached_chips.is_empty() {
-            self.emit(PlayerUiEvent::WaveChips(cached_chips));
-            return;
-        }
-        // Станция уже ответила «вариантов нет» либо запрос за ними ещё в полёте
-        if cached_station == station_key || pending == station_key {
-            return;
-        }
-
-        if !provider.is_authenticated() {
-            return;
-        }
-
-        if let Ok(mut state) = self.state.lock() {
-            state.wave_chips_pending = station_key.clone();
-        }
+    /// Текущий трек продолжает играть: `queue` обрезается до него, старый хвост
+    /// запоминается в истории, новый сид подбирается из `liked_tracks_cache`.
+    pub fn tail_swap(&self, language: Option<String>, character: Option<String>) {
+        let epoch = self.tail_swap_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.emit(PlayerUiEvent::LoadingState(true));
 
         let me = self.clone();
         tokio::spawn(async move {
-            let provider = me.providers.current();
-            let chips = match provider.get_station_tracks(&station_request, None).await {
-                Ok(batch) => batch.chips,
-                Err(err) => {
-                    eprintln!("[wave] чипы станции «{}»: {}", station_request, err);
-                    Vec::new()
-                }
+            // Холодный старт: кэш лайков нужен и для выбора сида, и для предикатов
+            me.ensure_liked_loaded().await;
+
+            // 1. Короткий лок: фильтры, обрезка хвоста, выбор сида
+            let (dropped, station_id) = {
+                let mut state = me.state.lock().unwrap();
+                state.current_language = language.clone();
+                state.current_character = character.clone();
+                state.batch_id = None;
+                state.pending_advance = false;
+                state.wave_dead = false;
+                state.refill_failures = 0;
+
+                let keep = (state.current_index + 1).min(state.queue.len());
+                let ids: Vec<String> = state
+                    .queue
+                    .get(keep..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|t| t.id.clone())
+                    .collect();
+                state.queue.truncate(keep);
+
+                let station_id = match select_wave_seed(
+                    &state,
+                    language.as_deref(),
+                    character.as_deref(),
+                ) {
+                    Some(id) if !id.is_empty() => format!("seed:{}", id),
+                    _ => "user:onyourwave".to_string(),
+                };
+                state.station_id = station_id.clone();
+                state.restored = false;
+                (ids, station_id)
             };
-            if let Ok(mut state) = me.state.lock() {
-                // Станцию сменили, пока шёл запрос: ответ уже не про неё
-                if state.wave_chips_pending != station_key {
-                    return;
+            me.set_wave(true);
+            // Лок `state` отпущен: порядок локов state → wave_engine не создаём
+            me.wave_engine.lock().unwrap().remember_dropped(&dropped);
+            me.wave_engine.lock().unwrap().mark_seed_started();
+
+            // 2. Сеть и фильтрация
+            let provider = me.providers.current();
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut accepted: Vec<Track> = Vec::new();
+            let mut continuation: Option<String> = None;
+            let mut provider_empty = true;
+
+            for round in 0..2u32 {
+                if accepted.len() >= TAIL_SWAP_QUOTA || Instant::now() >= deadline {
+                    break;
                 }
-                state.wave_chips = chips.clone();
-                state.wave_chips_station = station_key;
-                state.wave_chips_pending.clear();
+                let batch = match provider
+                    .get_station_tracks(&station_id, continuation.as_deref())
+                    .await
+                {
+                    Ok(batch) => batch,
+                    Err(err) => {
+                        eprintln!("[filter] станция «{}»: {}", station_id, err);
+                        break;
+                    }
+                };
+                if !batch.tracks.is_empty() {
+                    provider_empty = false;
+                }
+                continuation = if batch.batch_id.is_empty() {
+                    None
+                } else {
+                    Some(batch.batch_id.clone())
+                };
+                if batch.tracks.is_empty() {
+                    continue;
+                }
+
+                // Конвейер: история/чистота → дубли → Фаза 1 → Фаза 2
+                let pre = pick_candidates(true, &me.wave_engine, batch.tracks);
+                let pre = {
+                    let state = me.state.lock().unwrap();
+                    dedup_tracks(&state.queue, pre)
+                };
+                let (liked, history) = snapshots_for_filters(&me);
+                let budget = if round == 0 { 4800 } else { 2500 };
+                let mut got = apply_filters(
+                    &me.yt_client,
+                    pre,
+                    language.as_deref(),
+                    character.as_deref(),
+                    &liked,
+                    &history,
+                    budget,
+                )
+                .await;
+                accepted.append(&mut got);
             }
-            me.emit(PlayerUiEvent::WaveChips(chips));
+
+            // 3. Мягкий режим «Моё любимое»: строгая приёмка часто даёт 0
+            if accepted.is_empty()
+                && character.as_deref() == Some("favorite")
+                && !provider_empty
+            {
+                eprintln!("[filter] favorite: fallback to automix");
+                if let Ok(batch) = provider.get_station_tracks(&station_id, None).await {
+                    let pre = pick_candidates(true, &me.wave_engine, batch.tracks);
+                    let (liked, history) = snapshots_for_filters(&me);
+                    accepted = apply_filters(
+                        &me.yt_client,
+                        pre,
+                        language.as_deref(),
+                        None,
+                        &liked,
+                        &history,
+                        4800,
+                    )
+                    .await;
+                }
+            }
+
+            // 4. Устаревший батч отбрасываем, но спиннер гасим всегда
+            if me.tail_swap_epoch.load(Ordering::SeqCst) != epoch {
+                emit_all(&me.event_senders, PlayerUiEvent::LoadingState(false));
+                return;
+            }
+
+            if accepted.is_empty() {
+                if provider_empty {
+                    eprintln!("[filter] provider empty batch");
+                } else {
+                    eprintln!("[filter] rejected all candidates");
+                }
+                let mut state = me.state.lock().unwrap();
+                state.wave_dead = true;
+                state.pending_advance = false;
+                drop(state);
+                me.emit(PlayerUiEvent::StatusMessage(
+                    "Не удалось найти треки под выбранный фильтр".to_string(),
+                ));
+                me.emit(PlayerUiEvent::LoadingState(false));
+                return;
+            }
+
+            let updated_queue = {
+                let mut state = me.state.lock().unwrap();
+                let new_tracks = dedup_tracks(&state.queue, accepted);
+                state.queue.extend(new_tracks);
+                // Токен продолжения новой станции: следующая догрузка должна
+                // продолжить этот микс, а не перезапустить его от текущего трека
+                state.batch_id = continuation.clone();
+                state.wave_dead = false;
+                state.refill_failures = 0;
+                state.queue.clone()
+            };
+            me.emit(PlayerUiEvent::QueueUpdated(updated_queue));
+            me.emit(PlayerUiEvent::LoadingState(false));
+            me.prefetch_next_track();
+            eprintln!("[tail_swap] epoch={} хвост обновлён", epoch);
         });
     }
 
@@ -2396,9 +2510,6 @@ impl PlayerManager {
         let client_clone = self.client.clone();
         let state_clone = self.state.clone();
         let senders = self.event_senders.clone();
-        // Чипы придут вместе с первой порцией; станция сразу помечается «в полёте»,
-        // чтобы UI не сходил за теми же чипами вторым запросом на TrackStarted
-        let chips_station = wave_chips_key(&station_id);
 
         {
             let mut state = self.state.lock().unwrap();
@@ -2407,13 +2518,6 @@ impl PlayerManager {
             state.current_character = character.clone();
             state.station_id = station_id.clone();
             state.restored = false;
-            // У варианта станции чипы описывают ту же станцию: прежний набор оставляем,
-            // чтобы ряд не исчезал, если ответ нового варианта придёт без чипов
-            if !station_id.starts_with("variant:") {
-                state.wave_chips.clear();
-            }
-            state.wave_chips_station.clear();
-            state.wave_chips_pending = chips_station.clone();
         }
         // Смена фильтра Ротора = новый автомикс, отсчёт дрейфа начинается заново
         self.wave_engine.lock().unwrap().mark_seed_started();
@@ -2438,11 +2542,6 @@ impl PlayerManager {
 
             if is_yt {
                 if !provider.is_authenticated() {
-                    // Запрос не состоится: снимаем пометку «чипы в полёте», иначе после
-                    // входа в аккаунт набор чипов для этой станции уже не дозапросится
-                    if let Ok(mut state) = state_clone.lock() {
-                        state.wave_chips_pending.clear();
-                    }
                     emit_all(&senders, PlayerUiEvent::StatusMessage(
                         "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
                     ));
@@ -2457,12 +2556,9 @@ impl PlayerManager {
             }
 
             emit_all(&senders, PlayerUiEvent::LoadingState(true));
-            // Чипы, которые сервис прислал вместе с этой порцией (для YT Music — кнопки над очередью)
-            let mut wave_chips: Vec<StationChip> = Vec::new();
             let mut fetch_res: Result<(Vec<Track>, Option<String>), String> = if is_yt {
                 match provider.get_station_tracks(&station_id, None).await {
                     Ok(batch) => {
-                        wave_chips = batch.chips.clone();
                         let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                         Ok((batch.tracks, b_id))
                     }
@@ -2490,7 +2586,6 @@ impl PlayerManager {
                     if tr.is_empty() {
                         if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
                             if !batch.tracks.is_empty() {
-                                wave_chips = batch.chips.clone();
                                 let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
                                 fetch_res = Ok((batch.tracks, b_id));
                             }
@@ -2498,24 +2593,6 @@ impl PlayerManager {
                     }
                 }
             }
-
-            // Пустой список — тоже ответ: он прячет чипы прежней станции (например, у Яндекса их нет).
-            // Исключение — выбранный вариант станции: его чипы относятся к той же станции,
-            // поэтому без них ряд исчез бы и вернуться к другому варианту было бы нечем
-            let mut effective_chips = wave_chips.clone();
-            if let Ok(mut state) = state_clone.lock() {
-                if wave_chips.is_empty()
-                    && station_id.starts_with("variant:")
-                    && !state.wave_chips.is_empty()
-                {
-                    effective_chips = state.wave_chips.clone();
-                } else {
-                    state.wave_chips = wave_chips.clone();
-                }
-                state.wave_chips_station = chips_station.clone();
-                state.wave_chips_pending.clear();
-            }
-            emit_all(&senders, PlayerUiEvent::WaveChips(effective_chips));
 
             match fetch_res {
                 Ok((tracks, batch_id)) => {
@@ -2778,6 +2855,7 @@ fn spawn_cover_and_lyrics(
                 let trimmed = lr_text.trim();
                 if crate::api::lrclib::usable_synced_at(trimmed, duration) {
                     let _ = std::fs::write(&cache_path, trimmed);
+                    crate::cache::clear_negative_lyrics_marker(&track_id);
                     final_text = Some(trimmed.to_string());
                 } else if !trimmed.is_empty() {
                     final_text = Some(crate::api::lrclib::demote_stale_synced(trimmed, duration));
@@ -2811,6 +2889,7 @@ fn spawn_cover_and_lyrics(
                                 } else
                                 if crate::api::lrclib::usable_synced_at(trimmed, duration) {
                                     let _ = std::fs::write(&cache_path, trimmed);
+                                    crate::cache::clear_negative_lyrics_marker(&track_id);
                                     final_text = Some(trimmed.to_string());
                                 }
                             }
@@ -2833,6 +2912,7 @@ fn spawn_cover_and_lyrics(
                         // и при следующей проверке таймлайн ещё пригодится
                         if !had_stale_synced {
                             let _ = std::fs::write(&cache_path, trimmed);
+                            crate::cache::clear_negative_lyrics_marker(&track_id);
                         }
                         final_text = Some(trimmed.to_string());
                     }
@@ -2891,6 +2971,227 @@ fn track_key(t: &Track) -> String {
 /// самому. У Яндекса станцию считает сервер: он и так не присылает сыгранное, а фильтр
 /// лишь выбрасывал пришедшие треки (плюс гасил те, что пользователь слушал до Волны),
 /// из-за чего очередь не росла и догрузка считалась проваленной.
+/// Целевой размер принятого хвоста после TailSwap
+const TAIL_SWAP_QUOTA: usize = 6;
+
+/// Сколько `Ambiguous`-кандидатов максимум опрашивается текстами за раунд
+const PHASE2_MAX_CANDIDATES: usize = 12;
+
+/// Кандидат в сид из лайков под выбранные фильтры.
+///
+/// `None` — подходящего лайка нет (вызывающий откатывается на текущий трек).
+fn select_wave_seed(
+    state: &PlayerState,
+    language: Option<&str>,
+    character: Option<&str>,
+) -> Option<String> {
+    use super::filters::language as lf;
+
+    let current = state
+        .current_track
+        .as_ref()
+        .map(|t| t.id.clone())
+        .filter(|id| !id.is_empty());
+
+    // «Незнакомое» — сид всегда текущий трек
+    if character == Some("discover") {
+        return current;
+    }
+
+    let cache = &state.liked_tracks_cache;
+    let with_title = |t: &Track| format!("{} {}", t.title, t.artists_string());
+    let with_all = |t: &Track| {
+        format!(
+            "{} {} {}",
+            t.title,
+            t.version.as_deref().unwrap_or(""),
+            t.artists_string()
+        )
+    };
+
+    let liked_pick = match language {
+        Some("russian") => cache.iter().find(|t| lf::has_cyrillic(&with_title(t))),
+        Some("not-russian") => cache.iter().find(|t| !lf::has_cyrillic(&with_title(t))),
+        Some("without-words") => cache.iter().find(|t| lf::has_instrumental_marker(&with_all(t))),
+        _ => None,
+    };
+    if let Some(track) = liked_pick {
+        return Some(track.id.clone());
+    }
+
+    if language.is_none() && character == Some("favorite") && !cache.is_empty() {
+        let pick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        return Some(cache[pick % cache.len()].id.clone());
+    }
+
+    current
+}
+
+/// Предикат характера: любимое / незнакомое / без отсева
+fn character_matches(
+    track: &Track,
+    character: Option<&str>,
+    liked: &std::collections::HashSet<String>,
+    history: &std::collections::HashSet<String>,
+) -> bool {
+    match character {
+        Some("favorite") => liked.contains(&track.id),
+        Some("discover") => !liked.contains(&track.id) && !history.contains(&track.id),
+        _ => true,
+    }
+}
+
+/// Годится ли трек в якорь Seed Drift под активные фильтры.
+///
+/// `Ambiguous` считается прошедшим: под «Иностранным» любой не-кириллический
+/// трек неоднозначен, и если бы он не проходил, дрейф откладывался бы всегда.
+fn anchor_passes_filters(
+    track: &Track,
+    language: Option<&str>,
+    character: Option<&str>,
+    liked: &std::collections::HashSet<String>,
+    history: &std::collections::HashSet<String>,
+) -> bool {
+    use super::filters::language as lf;
+
+    if !character_matches(track, character, liked, history) {
+        return false;
+    }
+    let Some(filter) = language.and_then(lf::parse_filter) else {
+        return true;
+    };
+    match lf::phase_one(
+        &track.title,
+        track.version.as_deref().unwrap_or(""),
+        &track.artists_string(),
+    ) {
+        lf::PhaseOne::Instrumental => lf::accepts(filter, lf::LanguageVerdict::Instrumental),
+        lf::PhaseOne::Russian => lf::accepts(filter, lf::LanguageVerdict::Russian),
+        lf::PhaseOne::Ambiguous => true,
+    }
+}
+
+/// Снимки для фильтров: лайки и история прослушиваний.
+///
+/// Локи берутся последовательно и сразу отпускаются — вложенных локов нет.
+fn snapshots_for_filters(
+    me: &PlayerManager,
+) -> (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
+) {
+    let liked = me
+        .state
+        .lock()
+        .map(|s| s.liked_track_ids.clone())
+        .unwrap_or_default();
+    let history = me
+        .wave_engine
+        .lock()
+        .map(|e| e.recent_history.iter().cloned().collect())
+        .unwrap_or_default();
+    (liked, history)
+}
+
+/// Фаза 1 + Фаза 2: оставляет треки, прошедшие активные фильтры.
+///
+/// Фаза 1 — метаданные (0 мс). Фаза 2 — параллельный опрос текстов с глобальным
+/// дедлайном на весь батч (`buffer_unordered(3)`, поэтому таймаут общий, а не
+/// на кандидата). Без фильтра языка Фаза 2 не запускается вовсе.
+async fn apply_filters(
+    yt: &YtMusicClient,
+    tracks: Vec<Track>,
+    language: Option<&str>,
+    character: Option<&str>,
+    liked: &std::collections::HashSet<String>,
+    history: &std::collections::HashSet<String>,
+    phase2_budget_ms: u64,
+) -> Vec<Track> {
+    use super::filters::language as lf;
+
+    let filter = language.and_then(lf::parse_filter);
+    let mut accepted: Vec<Track> = Vec::new();
+    let mut ambiguous: Vec<Track> = Vec::new();
+
+    for track in tracks {
+        if !character_matches(&track, character, liked, history) {
+            continue;
+        }
+        let Some(filter) = filter else {
+            accepted.push(track);
+            continue;
+        };
+        let verdict = match lf::phase_one(
+            &track.title,
+            track.version.as_deref().unwrap_or(""),
+            &track.artists_string(),
+        ) {
+            lf::PhaseOne::Instrumental => Some(lf::LanguageVerdict::Instrumental),
+            lf::PhaseOne::Russian => Some(lf::LanguageVerdict::Russian),
+            lf::PhaseOne::Ambiguous => None,
+        };
+        match verdict {
+            Some(verdict) => {
+                if lf::accepts(filter, verdict) {
+                    accepted.push(track);
+                }
+            }
+            None => {
+                if ambiguous.len() < PHASE2_MAX_CANDIDATES {
+                    ambiguous.push(track);
+                }
+            }
+        }
+    }
+
+    let Some(filter) = filter else {
+        return accepted;
+    };
+    if ambiguous.is_empty() {
+        return accepted;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(phase2_budget_ms);
+    let results: Vec<(String, crate::api::lrclib::LyricsLookup)> =
+        futures_util::stream::iter(ambiguous.iter().cloned().map(|track| {
+            let yt = yt.clone();
+            async move {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let verdict = if left.is_zero() {
+                    crate::api::lrclib::LyricsLookup::Failed
+                } else {
+                    match tokio::time::timeout(left, yt.probe_lyrics(&track)).await {
+                        Ok(v) => v,
+                        Err(_) => crate::api::lrclib::LyricsLookup::Failed,
+                    }
+                };
+                (track.id.clone(), verdict)
+            }
+        }))
+        .buffer_unordered(3)
+        .collect()
+        .await;
+
+    let by_id: std::collections::HashMap<String, crate::api::lrclib::LyricsLookup> =
+        results.into_iter().collect();
+    for track in ambiguous {
+        let verdict = match by_id.get(&track.id) {
+            Some(crate::api::lrclib::LyricsLookup::Found(text)) => {
+                lf::classify_lyrics(&crate::api::lrclib::strip_lrc_tags(text))
+            }
+            // Failed / WrongTrack / NotFound — данных нет: трек не принят в этом раунде
+            _ => lf::LanguageVerdict::Unknown,
+        };
+        if lf::accepts(filter, verdict) {
+            accepted.push(track);
+        }
+    }
+    accepted
+}
+
 fn pick_candidates(is_yt: bool, engine: &Mutex<WaveEngine>, tracks: Vec<Track>) -> Vec<Track> {
     if is_yt {
         engine.lock().unwrap().filter_candidates(tracks)
@@ -3071,52 +3372,11 @@ mod yt_track_selection_tests {
 #[derive(Debug, PartialEq, Eq)]
 struct WaveFetchPlan {
     /// Аргумент `station_id` для провайдера: `user:onyourwave`, `track:<id>`
-    /// либо выбранный вариант станции `variant:<playlistId>[:<id>]`
     station: String,
     /// Токен продолжения текущего автомикса
     continuation: Option<String>,
     /// Запрос начинает новый автомикс (первый запрос, Seed Drift или пере-сидирование)
     new_seed: bool,
-}
-
-/// `playlistId` выбранного варианта станции (`variant:<playlistId>[:<videoId>]`).
-///
-/// Вариант — не фильтр, а другой сид того же микса, поэтому при пере-сидировании его
-/// нужно сохранять: иначе клик по чипу откатывался к общей Волне после первого дрейфа.
-fn variant_playlist_id(station_id: &str) -> Option<&str> {
-    let rest = station_id.strip_prefix("variant:")?;
-    let playlist_id = rest.split(':').next().map(str::trim)?;
-    if playlist_id.is_empty() {
-        None
-    } else {
-        Some(playlist_id)
-    }
-}
-
-/// Ключ станции для кэша чипов.
-///
-/// Чипы описывают станцию, а не текущий трек, поэтому у «обычной Волны» ключ стабилен:
-/// иначе каждый переход трека считался бы новой станцией и запрос `next` уходил бы заново.
-fn wave_chips_key(station_id: &str) -> String {
-    let station_id = station_id.trim();
-    if station_id.is_empty() {
-        "user:onyourwave".to_string()
-    } else {
-        station_id.to_string()
-    }
-}
-
-/// Запрос станции, которым добываются чипы: они описывают станцию, но у «обычной
-/// Волны» сид — текущий трек, поэтому станция всё равно нужна конкретная.
-fn wave_chips_request(state: &PlayerState) -> String {
-    let station_id = state.station_id.trim();
-    if !station_id.is_empty() && station_id != "user:onyourwave" {
-        return station_id.to_string();
-    }
-    match state.current_track.as_ref().map(|track| track.id.trim()) {
-        Some(id) if !id.is_empty() => format!("track:{}", id),
-        _ => "user:onyourwave".to_string(),
-    }
 }
 
 /// План догрузки Волны для YouTube Music.
@@ -3142,12 +3402,7 @@ fn plan_wave_fetch(
     }
     match anchor {
         Some(id) => WaveFetchPlan {
-            // Выбранный вариант станции переживает дрейф: `variant:<playlistId>:<якорь>`.
-            // Иначе клик по чипу молча откатывался к общему автомиксу того же сида.
-            station: match variant_playlist_id(station_id) {
-                Some(playlist_id) => format!("variant:{}:{}", playlist_id, id),
-                None => format!("track:{}", id),
-            },
+            station: format!("track:{}", id),
             continuation: None,
             new_seed: true,
         },
@@ -3367,30 +3622,11 @@ mod wave_fetch_tests {
     }
 
     #[test]
-    fn test_drift_keeps_selected_station_variant() {
-        let plan = plan_wave_fetch("variant:RDAT123", None, true, Some("new_seed_id"));
-        assert_eq!(
-            plan.station, "variant:RDAT123:new_seed_id",
-            "дрейф должен остаться внутри выбранного варианта станции"
-        );
+    fn test_drift_starts_new_seed_from_anchor() {
+        let plan = plan_wave_fetch("user:onyourwave", None, true, Some("new_seed_id"));
+        assert_eq!(plan.station, "track:new_seed_id");
         assert_eq!(plan.continuation, None);
         assert!(plan.new_seed);
-    }
-
-    #[test]
-    fn test_drift_replaces_previous_variant_seed() {
-        let plan = plan_wave_fetch("variant:RDAT123:old_seed", None, true, Some("new_seed_id"));
-        assert_eq!(plan.station, "variant:RDAT123:new_seed_id");
-    }
-
-    #[test]
-    fn test_variant_playlist_id_parsing() {
-        assert_eq!(variant_playlist_id("variant:RDAT123"), Some("RDAT123"));
-        assert_eq!(variant_playlist_id("variant:RDAT123:vid"), Some("RDAT123"));
-        assert_eq!(variant_playlist_id("variant:  "), None);
-        assert_eq!(variant_playlist_id("track:vid"), None);
-        assert_eq!(wave_chips_key(""), "user:onyourwave");
-        assert_eq!(wave_chips_key(" track:abc "), "track:abc");
     }
 }
 
@@ -3624,6 +3860,7 @@ mod like_tests {
             prefetch: Arc::default(),
             prefetch_inflight: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
+            tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
         };
 
@@ -3633,15 +3870,131 @@ mod like_tests {
         assert_eq!(current_station, "user:onyourwave");
     }
 
-    #[test]
-    fn test_player_state_wave_chips() {
-        let mut state = PlayerState::default();
-        assert!(state.wave_chips.is_empty());
-        state.wave_chips.push(crate::api::provider::StationChip {
-            label: "Редкие треки".to_string(),
-            playlist_id: "RDATabc".to_string(),
+}
+
+#[cfg(test)]
+mod filter_pipeline_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn track(id: &str, title: &str, artist: &str, version: Option<&str>) -> Track {
+        let mut value = serde_json::json!({
+            "id": id, "title": title, "artists": [{"id": "1", "name": artist}]
         });
-        assert_eq!(state.wave_chips.len(), 1);
-        assert_eq!(state.wave_chips[0].label, "Редкие треки");
+        if let Some(v) = version {
+            value["version"] = serde_json::json!(v);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn state_with(tracks: Vec<Track>, current: Option<&str>) -> PlayerState {
+        let mut state = PlayerState::default();
+        state.liked_tracks_cache = tracks;
+        state.current_track = current.map(|id| track(id, "Current", "Artist", None));
+        state
+    }
+
+    #[test]
+    fn seed_for_russian_prefers_cyrillic_like() {
+        let state = state_with(
+            vec![
+                track("1", "English song", "Artist", None),
+                track("2", "Русская песня", "Артист", None),
+            ],
+            Some("9"),
+        );
+        assert_eq!(select_wave_seed(&state, Some("russian"), None).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn seed_for_not_russian_prefers_latin_like() {
+        let state = state_with(
+            vec![
+                track("1", "Русская песня", "Артист", None),
+                track("2", "English song", "Artist", None),
+            ],
+            Some("9"),
+        );
+        assert_eq!(select_wave_seed(&state, Some("not-russian"), None).as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn seed_falls_back_to_current_when_no_like_matches() {
+        let state = state_with(vec![], Some("9"));
+        assert_eq!(select_wave_seed(&state, Some("without-words"), None).as_deref(), Some("9"));
+        assert_eq!(select_wave_seed(&state, None, Some("favorite")).as_deref(), Some("9"));
+        assert_eq!(select_wave_seed(&state, None, Some("discover")).as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn ambiguous_anchor_passes_filter() {
+        let latin = track("1", "Some Song", "Artist", None);
+        let cyrillic = track("2", "Русская песня", "Артист", None);
+        let (liked, history) = (HashSet::new(), HashSet::new());
+        // Ambiguous под «Иностранным» и «На русском» — проходит (решается в Фазе 2)
+        assert!(anchor_passes_filters(&latin, Some("not-russian"), None, &liked, &history));
+        assert!(anchor_passes_filters(&latin, Some("russian"), None, &liked, &history));
+        // Явное несоответствие — не проходит: кириллица под «Иностранным»
+        assert!(!anchor_passes_filters(&cyrillic, Some("not-russian"), None, &liked, &history));
+        // Инструментал под «На русском» — не проходит (приоритет маркеров)
+        let instrumental = track("3", "Track", "Artist", Some("Instrumental"));
+        assert!(!anchor_passes_filters(&instrumental, Some("russian"), None, &liked, &history));
+    }
+
+    #[tokio::test]
+    async fn phase_one_rejects_instrumental_under_russian() {
+        let yt = YtMusicClient::new();
+        let candidates = vec![
+            track("1", "Песня", "Артист", None),
+            track("2", "Track", "Artist", Some("Instrumental")),
+            track("3", "Song", "Band", None),
+        ];
+        let accepted = apply_filters(
+            &yt,
+            candidates,
+            Some("russian"),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            0, // без сети: все вердикты Фазы 1
+        )
+        .await;
+        let ids: Vec<_> = accepted.into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["1"]);
+    }
+
+    #[tokio::test]
+    async fn phase_one_accepts_instrumental_for_without_words() {
+        let yt = YtMusicClient::new();
+        let candidates = vec![
+            track("1", "Track", "Artist", Some("Instrumental")),
+            track("2", "Song", "Band", None),
+        ];
+        let accepted = apply_filters(
+            &yt,
+            candidates,
+            Some("without-words"),
+            None,
+            &HashSet::new(),
+            &HashSet::new(),
+            0,
+        )
+        .await;
+        let ids: Vec<_> = accepted.into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["1"]);
+    }
+
+    #[tokio::test]
+    async fn character_favorite_filters_by_liked_ids() {
+        let yt = YtMusicClient::new();
+        let candidates = vec![
+            track("1", "Песня", "Артист", None),
+            track("2", "Другая", "Артист", None),
+        ];
+        let mut liked = HashSet::new();
+        liked.insert("1".to_string());
+        let accepted = apply_filters(&yt, candidates, None, Some("favorite"), &liked, &HashSet::new(), 0).await;
+        let ids: Vec<_> = accepted.into_iter().map(|t| t.id).collect();
+        assert_eq!(ids, ["1"]);
     }
 }

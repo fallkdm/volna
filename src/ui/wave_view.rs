@@ -3,7 +3,6 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use gtk4::{glib, Align, Box as GtkBox, Button, Label, Orientation, Overlay};
 
-use crate::api::provider::StationChip;
 use crate::player::PlayerManager;
 
 /// Состояние цветов и параметров живого рендерера «Плавающего нечто»
@@ -118,30 +117,9 @@ pub struct WaveViewWidgets {
     /// Куда ведёт клик по плашке (источник очереди или станция)
     pub source_target: Rc<RefCell<Option<crate::player::SourceTarget>>>,
     option_buttons: Rc<RefCell<Vec<Button>>>,
-    /// Чипы станции от сервиса (у YT Music — «Знакомое», «Редкие треки»…); пусто — ряд скрыт
-    pub chips_row: gtk4::FlowBox,
-    /// Последние отрисованные чипы и активный вариант: чтобы не перерисовывать ряд вхолостую
-    chips_cache: Rc<RefCell<(Vec<StationChip>, Option<String>)>>,
-    player: PlayerManager,
-}
-
-/// Кнопка-чип варианта станции; активный вариант подсвечен
-fn chip_button(player: &PlayerManager, chip: &StationChip, selected: bool) -> Button {
-    let btn = Button::with_label(&chip.label);
-    btn.add_css_class("wave-chip");
-    if selected {
-        btn.add_css_class("selected");
-    }
-    btn.set_valign(Align::Center);
-    btn.set_tooltip_text(Some(if selected {
-        "Текущий вариант волны"
-    } else {
-        "Переключить волну на этот вариант"
-    }));
-    let player = player.clone();
-    let playlist_id = chip.playlist_id.clone();
-    btn.connect_clicked(move |_| player.apply_station_variant(playlist_id.clone()));
-    btn
+    /// Кнопки секции «Настроение»: у YouTube Music нет BPM/energy, поэтому на YT
+    /// они гаснут (`sensitive = false`) с подсказкой про Яндекс Музыку
+    mood_buttons: Rc<RefCell<Vec<Button>>>,
 }
 
 impl WaveViewWidgets {
@@ -174,31 +152,19 @@ impl WaveViewWidgets {
         }
     }
 
-    /// Чипы станции, которые сервис прислал вместе с очередью
+    /// Гасит или включает секцию «Настроение».
     ///
-    /// У YouTube Music это не фильтры поверх текущего микса, а варианты его сида:
-    /// клик открывает станцию с `playlistId` чипа. Пустой список прячет ряд.
-    pub fn set_chips(&self, chips: &[StationChip]) {
-        let active = self.player.wave_variant_id();
-        {
-            // Ряд обновляется на каждом треке: без этой проверки кнопки пересоздавались
-            // бы вхолостую вместе с их подсветкой и обработчиками
-            let mut last = self.chips_cache.borrow_mut();
-            if last.0 == chips && last.1 == active {
-                self.chips_row.set_visible(!chips.is_empty());
-                return;
+    /// У YouTube Music нет BPM/energy, поэтому фильтры настроения там не работают:
+    /// кнопки получают `sensitive = false` и подсказку про Яндекс Музыку.
+    pub fn set_mood_sensitive(&self, sensitive: bool) {
+        for btn in self.mood_buttons.borrow().iter() {
+            btn.set_sensitive(sensitive);
+            if sensitive {
+                btn.set_tooltip_text(None);
+            } else {
+                btn.set_tooltip_text(Some("Доступно в Яндекс Музыке"));
             }
-            *last = (chips.to_vec(), active.clone());
         }
-        while let Some(child) = self.chips_row.first_child() {
-            self.chips_row.remove(&child);
-        }
-        for chip in chips {
-            let selected = active.as_deref() == Some(chip.playlist_id.as_str());
-            let btn = chip_button(&self.player, chip, selected);
-            self.chips_row.insert(&btn, -1);
-        }
-        self.chips_row.set_visible(!chips.is_empty());
     }
 
     /// Обновляет целевые цвета шейдера при переключении трека из derivedColors
@@ -398,26 +364,6 @@ pub fn create_wave_view(
     card_header.append(&close_btn);
     popover_box.append(&card_header);
 
-    // Чипы станции от сервиса (у YT Music — «Знакомое», «Редкие треки», «Металл»…):
-    // приходят вместе с очередью, поэтому ряд скрыт, пока сервис их не прислал
-    let chips_row = gtk4::FlowBox::new();
-    chips_row.add_css_class("wave-chips");
-    chips_row.set_selection_mode(gtk4::SelectionMode::None);
-    chips_row.set_max_children_per_line(6);
-    chips_row.set_column_spacing(8);
-    chips_row.set_row_spacing(8);
-    chips_row.set_halign(Align::Center);
-    chips_row.set_valign(Align::Center);
-    let initial_chips = player.wave_chips();
-    let initial_active = player.wave_variant_id();
-    for chip in &initial_chips {
-        let selected = initial_active.as_deref() == Some(chip.playlist_id.as_str());
-        let btn = chip_button(player, chip, selected);
-        chips_row.insert(&btn, -1);
-    }
-    chips_row.set_visible(!initial_chips.is_empty());
-    popover_box.append(&chips_row);
-
     struct RotorFilterOption {
         label: &'static str,
         mood: Option<&'static str>,
@@ -523,6 +469,7 @@ pub fn create_wave_view(
     type Pick = Option<(&'static str, &'static str, [f64; 3])>;
     let selection: Rc<RefCell<[Pick; 3]>> = Rc::new(RefCell::new([None; 3]));
     let slot_buttons: Rc<RefCell<Vec<(Button, usize, &'static str)>>> = Rc::default();
+    let mood_buttons: Rc<RefCell<Vec<Button>>> = Rc::default();
 
     for (s_idx, section) in sections.into_iter().enumerate() {
         let section_flow = gtk4::FlowBox::new();
@@ -547,6 +494,9 @@ pub fn create_wave_view(
             btn.add_css_class("rotor-filter-btn");
             btn.set_halign(Align::Fill);
             option_buttons.borrow_mut().push(btn.clone());
+            if s_idx == 0 {
+                mood_buttons.borrow_mut().push(btn.clone());
+            }
 
             let player_clone = player.clone();
             let accent_clone = accent_color.clone();
@@ -662,10 +612,8 @@ pub fn create_wave_view(
     // Открытие по кнопке; закрытие — крестиком или кликом по затемнению
     {
         let pop = popover.clone();
-        let p_for_menu = player.clone();
         menu_button.connect_clicked(move |_| {
             pop.set_visible(true);
-            p_for_menu.ensure_wave_chips();
         });
         let pop = popover.clone();
         close_btn.connect_clicked(move |_| pop.set_visible(false));
@@ -711,9 +659,7 @@ pub fn create_wave_view(
         pill_close: pill_close.clone(),
         source_target: source_target.clone(),
         option_buttons,
-        chips_row,
-        chips_cache: Rc::new(RefCell::new((initial_chips, initial_active))),
-        player: player.clone(),
+        mood_buttons,
     }
 }
 
