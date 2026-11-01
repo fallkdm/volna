@@ -217,6 +217,25 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
                 *liked_total.borrow_mut() = total_cnt_opt;
 
+                // Пустая медиатека при "авторизованном" аккаунте — почти всегда
+                // протухшая кука Google: приложение считает вход живым и молчит.
+                let library_empty = liked_res
+                    .as_ref()
+                    .map(|tracks| tracks.is_empty())
+                    .unwrap_or(true)
+                    && playlists_res
+                        .as_ref()
+                        .map(|playlists| playlists.is_empty())
+                        .unwrap_or(true)
+                    && albums_res.as_ref().map(|albums| albums.is_empty()).unwrap_or(true);
+                if is_yt && provider.is_authenticated() && library_empty {
+                    status.set_text(
+                        "Не удалось загрузить медиатеку: похоже, сессия Google истекла. Войдите заново через карточку сервиса → «Аккаунт»",
+                    );
+                    status.set_visible(true);
+                    yt_login_btn.set_visible(true);
+                }
+
                 if let Ok(tracks) = liked_res {
                     *liked_tracks.borrow_mut() = tracks.clone();
                     if !tracks.is_empty() {
