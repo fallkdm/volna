@@ -212,8 +212,38 @@ struct Prefetched {
     at: std::time::Instant,
 }
 
+impl Prefetched {
+    /// Ссылка всё ещё пригодна к воспроизведению.
+    ///
+    /// У googlevideo в query есть `expire=<unix>` — время, до которого ссылка жива (обычно
+    /// 6 часов). Прежняя проверка «не старше 90 секунд» выбрасывала полностью рабочую ссылку:
+    /// prefetch запускается сразу после старта предыдущего трека, то есть за 3–5 минут до
+    /// использования, поэтому условие не выполнялось НИКОГДА. В результате ссылку запрашивали
+    /// заново (другой `ei=` → другой URL), и прогрев слота пропадал: кроссфейд начинал трек
+    /// с нуля вместо мгновенного старта.
+    fn is_fresh(&self) -> bool {
+        match url_expire_unix(&self.url) {
+            Some(expire) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                expire > now + 120
+            }
+            // Локальный файл или прямой URL без срока жизни — ограничиваем только по возрасту.
+            None => self.at.elapsed() < PREFETCH_MAX_AGE,
+        }
+    }
+}
+
+/// Достаёт `expire=<unix>` из query-строки ссылки (googlevideo и подобные).
+fn url_expire_unix(url: &str) -> Option<u64> {
+    url.split_once('?')?.1.split('&').find_map(|kv| kv.strip_prefix("expire=")?.parse().ok())
+}
+
 /// Ссылки на поток живут недолго (через несколько минут отвечают 410): заранее полученной верим 90 секунд
-const PREFETCH_TTL: std::time::Duration = std::time::Duration::from_secs(90);
+/// Максимальный возраст prefetch-ссылки без явного срока жизни (локальные файлы, прямые URL).
+const PREFETCH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// Менеджер плеера
 #[derive(Clone)]
@@ -227,6 +257,8 @@ pub struct PlayerManager {
     pub event_senders: Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
     /// Ссылка на следующий трек очереди, полученная заранее (один слот)
     prefetch: Arc<Mutex<Option<Prefetched>>>,
+    /// id трека, для которого преролл уже запрашивается (защита от параллельных дублей)
+    prefetch_inflight: Arc<Mutex<Option<String>>>,
     /// Привязанная Яндекс Станция (см. `cast.rs`)
     pub(super) cast: Arc<Mutex<Option<super::cast::CastLink>>>,
     /// Номер последнего запроса воспроизведения: устаревшие асинхронные задачи (быстрые клики) отбрасываются
@@ -274,6 +306,7 @@ impl PlayerManager {
             event_senders: Arc::new(Mutex::new(event_senders)),
             cast: Arc::default(),
             prefetch: Arc::default(),
+            prefetch_inflight: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
             crossfade,
         };
@@ -873,10 +906,31 @@ impl PlayerManager {
         };
         let Some(next) = next else { return };
 
+        // Один и тот же трек запрашивают сразу несколько мест (next_track, play_track_stream,
+        // append_to_queue) — без этой проверки на каждый переход уходило 2–3 параллельных
+        // запроса к InnerTube, а каждый из них заново дёргал слот преролла.
+        {
+            let mut inflight = self.prefetch_inflight.lock().unwrap();
+            if inflight.as_deref() == Some(next.id.as_str()) {
+                return;
+            }
+            *inflight = Some(next.id.clone());
+        }
+        let inflight_arc = self.prefetch_inflight.clone();
+        let inflight_id = next.id.clone();
+        let clear_inflight = move || {
+            if let Ok(mut inflight) = inflight_arc.lock() {
+                if inflight.as_deref() == Some(inflight_id.as_str()) {
+                    *inflight = None;
+                }
+            }
+        };
+
         if let Some(path) = crate::cache::offline_audio_path(&next.id).or_else(|| crate::cache::cached_audio_path(&next.id)) {
             let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
             self.audio.preroll_next_url(&uri);
             eprintln!("[prefetch] «{}» уже на диске, preroll локального файла: {}", next.title, uri);
+            clear_inflight();
             return;
         }
 
@@ -904,6 +958,7 @@ impl PlayerManager {
                 Ok((url, lbl)) => (url, lbl),
                 Err(e) => {
                     eprintln!("[prefetch] Ошибка получения URL для «{}»: {}", track_title, e);
+                    clear_inflight();
                     return;
                 }
             };
@@ -921,9 +976,19 @@ impl PlayerManager {
             let ext = if is_yt { "opus" } else { "mp3" };
             if let Some(path) = download_audio_to_cache(&stream_url, &track_id, ext).await {
                 let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
+                // Слот теперь прогрет локальным файлом: обновляем и саму prefetch-ссылку, иначе
+                // play_track_stream отдаст в crossfade сетевой URL, тот не совпадёт с file://
+                // в слоте — и мгновенный старт снова превратится в полную переинициализацию.
+                if let Ok(mut entry) = prefetch_arc.lock() {
+                    if let Some(p) = entry.as_mut().filter(|p| p.track_id == track_id) {
+                        p.url = local_uri.to_string();
+                        p.at = std::time::Instant::now();
+                    }
+                }
                 audio.preroll_next_url(&local_uri);
                 eprintln!("[prefetch] «{}» скачан на диск и переведен в локальный preroll: {}", track_title, local_uri);
             }
+            clear_inflight();
         });
     }
 
@@ -1599,7 +1664,9 @@ impl PlayerManager {
         let mgr_clone = self.clone();
 
         self.emit(PlayerUiEvent::Progress { current_sec: 0, total_sec: track.duration_ms.unwrap_or(0) / 1000 });
-        self.prefetch_next_track();
+        // prefetch здесь не запускаем: активный слот ещё не переключён, и преролл следующего
+        // трека стёр бы уже прогретый слот текущего — кроссфейд остался бы без мгновенного старта.
+        // Преролл следующего трека делает ветка успешного старта (и next_track).
 
         tokio::spawn(async move {
             let is_yt = track_source == TrackSource::YouTubeMusic;
@@ -1609,7 +1676,7 @@ impl PlayerManager {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
                 let started = std::time::Instant::now();
                 // ссылка могла быть получена заранее, пока играл прежний трек
-                let ready = prefetch.lock().unwrap().take().filter(|p| p.track_id == track_id && p.at.elapsed() < PREFETCH_TTL);
+                let ready = prefetch.lock().unwrap().take().filter(|p| p.track_id == track_id && p.is_fresh());
                 let hit = ready.is_some();
                 let result: Result<(String, String), String> = match ready {
                     Some(p) => Ok((p.url, p.label)),

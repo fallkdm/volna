@@ -141,15 +141,16 @@ impl PlayerSlot {
 
         let pipeline = play.pipeline();
         if pipeline.find_property("flags").is_some() {
-            pipeline.set_property_from_str("flags", "audio+soft-volume+buffering");
+            // download, а не buffering: queue2 тянет поток целиком во временный файл настолько
+            // быстро, насколько позволяет сеть, и не переигрывает BUFFERING->PLAYING каждые
+            // buffer-duration секунд (это давало провалы на 4-7 секунде трека). Так же было до
+            // коммита с предзагрузкой, и так же работает преролл: в PAUSED буфер заполняется
+            // заранее, поэтому старт следующего трека остаётся мгновенным.
+            pipeline.set_property_from_str("flags", "audio+soft-volume+download");
         }
         use gtk4::glib::prelude::ObjectExt;
-        if pipeline.has_property("buffer-duration") {
-            let _ = pipeline.set_property("buffer-duration", (5 * 1_000_000_000u64) as i64);
-        }
-        if pipeline.has_property("buffer-size") {
-            let _ = pipeline.set_property("buffer-size", (4 * 1024 * 1024) as i32);
-        }
+        // buffer-duration/buffer-size не переопределяем: в download-режиме дефолты playbin
+        // (без ограничения по времени, 4 МиБ) как раз и означают «качать как можно быстрее».
 
         pipeline.connect("source-setup", false, |values| {
             if let Some(source) = values.get(1).and_then(|v| v.get::<gstreamer::Element>().ok()) {
@@ -162,9 +163,9 @@ impl PlayerSlot {
                 if source.has_property("iradio-mode") {
                     let _ = source.set_property("iradio-mode", false);
                 }
-                if source.has_property("keep-alive") {
-                    let _ = source.set_property("keep-alive", true);
-                }
+                // keep-alive намеренно не включаем: souphttpsrc по умолчанию переоткрывает
+                // соединение, а переиспользованный сокет к googlevideo периодически оказывается
+                // полумертвым — поток замирал до ближайшего seek. Возврат к дефолту.
                 if source.has_property("blocksize") {
                     let _ = source.set_property("blocksize", 65536u32);
                 }
@@ -192,12 +193,58 @@ impl PlayerSlot {
     }
 }
 
+/// Отложенный преролл, который нужно выполнить в освободившийся слот.
+struct PendingPreroll<'a> {
+    pending: &'a Arc<Mutex<Option<String>>>,
+    /// URI слота, который сейчас звучит: его повторно прогревать не нужно.
+    playing_uri: &'a Arc<Mutex<Option<String>>>,
+    slot_play: &'a Play,
+    slot_uri: &'a Arc<Mutex<Option<String>>>,
+    slot_prerolled: &'a Arc<AtomicBool>,
+    slot_idx: usize,
+}
+
+impl PendingPreroll<'_> {
+    fn flush(&self) {
+        let Some(url) = self.pending.lock().ok().and_then(|mut p| p.take()) else { return };
+        if self.playing_uri.lock().map(|c| c.as_deref() == Some(url.as_str())).unwrap_or(false) {
+            return;
+        }
+        preroll_slot(self.slot_play, self.slot_uri, self.slot_prerolled, self.slot_idx, &url);
+    }
+}
+
+/// Переводит слот в состояние «прогретого» преролла: поток открыт, начало декодировано,
+/// громкость 0.0. Повторный вызов для того же URL ничего не делает, чтобы не рвать уже
+/// установленное соединение и не сбрасывать буфер.
+fn preroll_slot(play: &Play, current_uri: &Arc<Mutex<Option<String>>>, is_prerolled: &Arc<AtomicBool>, idx: usize, url: &str) {
+    if let Ok(cur) = current_uri.lock() {
+        if cur.as_deref() == Some(url) && is_prerolled.load(Ordering::SeqCst) {
+            return;
+        }
+    }
+    play.stop();
+    play.set_volume(0.0);
+    play.set_uri(Some(url));
+    play.pause(); // Начинает сетевую буферизацию до 100% без воспроизведения звука
+    is_prerolled.store(true, Ordering::SeqCst);
+    if let Ok(mut cur) = current_uri.lock() {
+        *cur = Some(url.to_string());
+    }
+    eprintln!("[audio] Аппаратная предбуферизация следующего трека в слот {}: {}", idx, url);
+}
+
 /// Аудио-бэкенд на базе двух слотов GStreamer Play для одновременного воспроизведения и настоящей сводки (кроссфейда)
 pub struct AudioBackend {
     slots: [PlayerSlot; 2],
     active_slot: Arc<AtomicUsize>,
     user_volume: Arc<Mutex<f64>>,
     fade_gen: Arc<AtomicU64>,
+    /// Поколение идущей прямо сейчас сводки; 0 — сводки нет. Пока сводка идёт, исходящий
+    /// слот ещё звучит, и его нельзя останавливать прероллом (иначе затухание обрывается).
+    fading_gen: Arc<AtomicU64>,
+    /// Преролл, отложенный до конца сводки: URL, который нужно подготовить в освободившийся слот.
+    pending_preroll: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioBackend {
@@ -210,6 +257,7 @@ impl AudioBackend {
         let initial_vol = slot0.play.volume().clamp(0.0, 1.0);
         let user_volume = Arc::new(Mutex::new(if initial_vol <= 0.0 { 1.0 } else { initial_vol }));
         let fade_gen = Arc::new(AtomicU64::new(0));
+        let fading_gen = Arc::new(AtomicU64::new(0));
         let active_slot = Arc::new(AtomicUsize::new(0));
 
         Ok(Self {
@@ -217,6 +265,8 @@ impl AudioBackend {
             active_slot,
             user_volume,
             fade_gen,
+            fading_gen,
+            pending_preroll: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -266,28 +316,42 @@ impl AudioBackend {
         let inactive_idx = 1 - (self.active_slot.load(Ordering::SeqCst) % 2);
         let slot = &self.slots[inactive_idx];
 
-        // Если в слоте уже подготовлен именно этот URL — повторно не переинициализируем
-        if let Ok(cur) = slot.current_uri.lock() {
-            if cur.as_deref() == Some(url) && slot.is_prerolled.load(Ordering::SeqCst) {
-                return;
+        // Идёт сводка: неактивный слот — это ещё звучащий исходящий трек. Если его остановить
+        // ради преролла, плавное затухание обрывается на середине (щелчок и резкий обрыв).
+        // Поэтому откладываем преролл до момента, когда сводка доиграет и слот освободится.
+        if self.fading_gen.load(Ordering::SeqCst) != 0 && slot.play.pipeline().current_state() == gstreamer::State::Playing {
+            if let Ok(mut pending) = self.pending_preroll.lock() {
+                *pending = Some(url.to_string());
             }
+            eprintln!("[audio] Преролл отложен до конца сводки: слот {} ещё звучит ({})", inactive_idx, url);
+            return;
         }
 
-        slot.play.stop();
-        slot.play.set_volume(0.0);
-        slot.play.set_uri(Some(url));
-        slot.play.pause(); // Начинает сетевую буферизацию до 100% без воспроизведения звука
-        slot.is_prerolled.store(true, Ordering::SeqCst);
-        if let Ok(mut cur) = slot.current_uri.lock() {
-            *cur = Some(url.to_string());
-        }
-        eprintln!("[audio] Аппаратная предбуферизация следующего трека в слот {}: {}", inactive_idx, url);
+        preroll_slot(&slot.play, &slot.current_uri, &slot.is_prerolled, inactive_idx, url);
+    }
+
+    /// Готовит отложенный преролл (если он есть) в освободившийся неактивный слот.
+    /// Вызывается из конца сводки и из жёстких переключений трека.
+    fn flush_pending_preroll(&self) {
+        let inactive_idx = 1 - (self.active_slot.load(Ordering::SeqCst) % 2);
+        let slot = &self.slots[inactive_idx];
+        let uris = PendingPreroll {
+            pending: &self.pending_preroll,
+            playing_uri: &self.active().current_uri,
+            slot_play: &slot.play,
+            slot_uri: &slot.current_uri,
+            slot_prerolled: &slot.is_prerolled,
+            slot_idx: inactive_idx,
+        };
+        uris.flush();
     }
 
     /// Загружает и начинает воспроизведение трека по прямой ссылке в текущий слот (без кроссфейда)
     pub fn play_url(&self, url: &str) {
         eprintln!("[audio] play_url {}", url.chars().take(90).collect::<String>());
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
+        // Жёсткое переключение: прежней сводки больше нет, отложенный преролл можно выполнять.
+        self.fading_gen.store(0, Ordering::SeqCst);
         let curr_idx = self.active_slot.load(Ordering::SeqCst) % 2;
         let inactive_idx = 1 - curr_idx;
 
@@ -311,6 +375,7 @@ impl AudioBackend {
                 *lock = true;
             }
             eprintln!("[audio] Мгновенный 0-мс старт предбуферизованного слота {}", inactive_idx);
+            self.flush_pending_preroll();
             return;
         }
 
@@ -332,12 +397,14 @@ impl AudioBackend {
         if let Ok(mut lock) = current.is_playing.lock() {
             *lock = true;
         }
+        self.flush_pending_preroll();
     }
 
     /// Загружает трек и начинает воспроизведение с плавным нарастанием громкости (Fade-In) от 0.0 до user_volume
     pub fn play_url_fade_in(&self, url: &str, duration_ms: u64) {
         eprintln!("[audio] play_url_fade_in ({} ms) {}", duration_ms, url.chars().take(90).collect::<String>());
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
+        self.fading_gen.store(0, Ordering::SeqCst);
         let curr_idx = self.active_slot.load(Ordering::SeqCst) % 2;
         let inactive_idx = 1 - curr_idx;
 
@@ -361,6 +428,7 @@ impl AudioBackend {
                 *lock = true;
             }
             eprintln!("[audio] Мгновенный 0-мс старт предбуферизованного слота {} с fade-in", inactive_idx);
+            self.flush_pending_preroll();
             self.fade_in(duration_ms);
             return;
         }
@@ -383,6 +451,7 @@ impl AudioBackend {
             *lock = true;
         }
 
+        self.flush_pending_preroll();
         self.fade_in(duration_ms);
     }
 
@@ -445,10 +514,19 @@ impl AudioBackend {
                 *lock = false;
             }
             next_play.set_volume(user_vol);
+            self.flush_pending_preroll();
             return;
         }
 
+        // Отмечаем, что исходящий слот ещё звучит: преролл не должен его останавливать.
+        self.fading_gen.store(generation_id, Ordering::SeqCst);
+
         let start_current_vol = current_play.volume().min(user_vol);
+        let fading_gen = self.fading_gen.clone();
+        let pending_preroll = self.pending_preroll.clone();
+        let current_uri = current_slot.current_uri.clone();
+        let current_prerolled = current_slot.is_prerolled.clone();
+        let next_uri = next_slot.current_uri.clone();
 
         tokio::spawn(async move {
             // Ждем, пока новый поток сбуферизируется и физически перейдет в Playing
@@ -470,7 +548,29 @@ impl AudioBackend {
             }
 
             if !started {
-                eprintln!("[audio] новый поток не перешел в Playing за 15 с, отменяем затухание старого");
+                // Новый поток так и не заиграл: вместо тишины отдаём трек без сводки, иначе
+                // active_slot уже указывает на молчащий слот, а UI считает, что играет он.
+                if fade_gen.load(Ordering::SeqCst) == generation_id {
+                    eprintln!("[audio] новый поток не перешел в Playing за 15 с — переключаем без сводки");
+                    let vol = user_volume_arc.lock().map(|l| *l).unwrap_or(1.0);
+                    current_play.stop();
+                    if let Ok(mut lock) = current_is_playing.lock() {
+                        *lock = false;
+                    }
+                    next_play.set_volume(vol);
+                    if fading_gen.load(Ordering::SeqCst) == generation_id {
+                        fading_gen.store(0, Ordering::SeqCst);
+                    }
+                    PendingPreroll {
+                        pending: &pending_preroll,
+                        playing_uri: &next_uri,
+                        slot_play: &current_play,
+                        slot_uri: &current_uri,
+                        slot_prerolled: &current_prerolled,
+                        slot_idx: current_idx,
+                    }
+                    .flush();
+                }
                 return;
             }
 
@@ -504,6 +604,19 @@ impl AudioBackend {
                 }
                 let cur_user_vol = user_volume_arc.lock().map(|l| *l).unwrap_or(1.0);
                 next_play.set_volume(cur_user_vol);
+                if fading_gen.load(Ordering::SeqCst) == generation_id {
+                    fading_gen.store(0, Ordering::SeqCst);
+                }
+                // Сводка доиграла, исходящий слот освободился — самое время прогреть следующий трек.
+                PendingPreroll {
+                    pending: &pending_preroll,
+                    playing_uri: &next_uri,
+                    slot_play: &current_play,
+                    slot_uri: &current_uri,
+                    slot_prerolled: &current_prerolled,
+                    slot_idx: current_idx,
+                }
+                .flush();
             }
         });
     }
@@ -511,6 +624,12 @@ impl AudioBackend {
     /// Останавливает оба слота конвейера и отменяет активный fade
     pub fn stop(&self) {
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
+        // Сводки больше нет: снимаем блокировку преролла и выбрасываем отложенный URL —
+        // после остановки его всё равно придётся запрашивать заново.
+        self.fading_gen.store(0, Ordering::SeqCst);
+        if let Ok(mut pending) = self.pending_preroll.lock() {
+            *pending = None;
+        }
         for slot in &self.slots {
             slot.play.stop();
             slot.is_prerolled.store(false, Ordering::SeqCst);
@@ -526,12 +645,14 @@ impl AudioBackend {
     /// Возобновляет воспроизведение активного слота немедленно (на установленной громкости)
     pub fn play(&self) {
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
+        self.fading_gen.store(0, Ordering::SeqCst);
         let active = self.active();
         active.play.set_volume(self.user_volume());
         active.play.play();
         if let Ok(mut lock) = active.is_playing.lock() {
             *lock = true;
         }
+        self.flush_pending_preroll();
     }
 
     /// Возобновляет воспроизведение с мягким нарастанием громкости за duration_ms
