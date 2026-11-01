@@ -497,54 +497,6 @@ impl YtMusicClient {
         Ok(json)
     }
 
-    /// Порция Волны через TV-клиент: он единственный принимает Bearer-токен.
-    ///
-    /// `batch_id` в TV-ответе нет, поэтому каждый следующий батч берём от нового
-    /// сида — середины предыдущей порции, чтобы Волна не повторяла треки.
-    async fn station_batch_tv(
-        &self,
-        station_id: &str,
-    ) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>> {
-        let seed = match self.last_seed.read().await.clone() {
-            Some(seed) if seed.len() == 11 => seed,
-            _ => {
-                let candidate = station_id
-                    .strip_prefix("track:")
-                    .or_else(|| station_id.strip_prefix("seed:"))
-                    .or_else(|| station_id.strip_prefix("artist:"))
-                    .unwrap_or(station_id);
-                if candidate.len() == 11 && !candidate.starts_with("UC") {
-                    candidate.to_string()
-                } else {
-                    "bgKxYnTEN5Y".to_string()
-                }
-            }
-        };
-
-        let body = serde_json::json!({
-            "videoId": seed,
-            "playlistId": format!("RDAMVM{seed}"),
-        });
-        let json = self
-            .post_innertube("next", "TVHTML5", "7.20250101.10.00", body)
-            .await?;
-
-        let mut tracks = parser::parse_tv_tile_tracks(&json);
-        tracks.retain(|track| track.id != seed);
-        if tracks.is_empty() {
-            return Err(Box::new(YtMusicError::Message(
-                "TV-клиент не вернул треки радио".into(),
-            )));
-        }
-        if let Some(next_seed) = tracks.get(tracks.len() / 2).map(|track| track.id.clone()) {
-            *self.last_seed.write().await = Some(next_seed);
-        }
-        Ok(StationBatch {
-            batch_id: String::new(),
-            tracks,
-        })
-    }
-
     /// Все треки плейлиста «Мне нравится» (LM) через YouTube Data API v3.
     ///
     /// Дата-API отдаёт по 50 записей с `nextPageToken`, поэтому приходит весь список,
@@ -1996,11 +1948,6 @@ impl MusicProvider for YtMusicClient {
         station_id: &str,
         batch_id: Option<&str>,
     ) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>> {
-        // OAuth: WEB_REMIX не принимает Bearer, радио отдаёт TV-клиент плитками
-        if self.refresh_token.read().await.is_some() {
-            return self.station_batch_tv(station_id).await;
-        }
-
         if let Some(continuation) = batch_id {
             let body = serde_json::json!({
                 "continuation": continuation
