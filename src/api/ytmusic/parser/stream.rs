@@ -98,3 +98,30 @@ pub fn parse_stream_url(json: &serde_json::Value) -> Result<String, String> {
 
     Err("Не удалось выбрать подходящий аудиопоток".to_string())
 }
+
+/// Длительность трека из ответа `/player` (`videoDetails.lengthSeconds`).
+/// Поиск YouTube Music без фильтра «Песни» приходит без длительности в строке результата,
+/// а для проверки текста песни она нужна — берём её из того же ответа, что и поток.
+pub fn parse_video_length_secs(json: &serde_json::Value) -> Option<u64> {
+    let text = |v: Option<&serde_json::Value>| -> Option<String> {
+        match v? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
+    };
+
+    text(
+        json.get("videoDetails")
+            .and_then(|d| d.get("lengthSeconds")),
+    )
+    .or_else(|| {
+        text(
+            json.get("microformat")
+                .and_then(|m| m.get("playerMicroformatRenderer"))
+                .and_then(|m| m.get("lengthSeconds")),
+        )
+    })
+    .and_then(|s| s.trim().parse::<u64>().ok())
+    .filter(|s| *s > 0)
+}

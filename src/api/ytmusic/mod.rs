@@ -2,8 +2,8 @@ pub mod auth;
 pub mod error;
 pub mod parser;
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::api::models::{Album, ArtistBrief, Playlist, SearchResult, Track};
@@ -28,6 +28,22 @@ const UA_CHROME_124: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 const PROBE_TIMEOUT_PRIMARY_MS: u64 = 1200;
 /// Таймаут пре-флайта резервной ноды: ей даём больше времени.
 const PROBE_TIMEOUT_FALLBACK_MS: u64 = 2000;
+
+/// Длительности треков по `videoId`: их отдаёт только `/player`, а нужны они и тексту песни,
+/// и повторным открытиям трека — держим в памяти, чтобы не дёргать сеть дважды.
+static TRACK_DURATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn track_duration_cached(track_id: &str) -> Option<u64> {
+    TRACK_DURATIONS.lock().ok()?.get(track_id).copied()
+}
+
+fn store_track_duration(track_id: &str, secs: u64) {
+    if let Ok(mut map) = TRACK_DURATIONS.lock() {
+        map.insert(track_id.to_string(), secs);
+    }
+}
 
 /// Маркеры имён заблокированных в РФ кэшей GGC (`sn-...googlevideo.com`).
 /// Сравнение по подстроке — намеренно: имя ноды может содержать префикс региона.
@@ -76,8 +92,15 @@ impl YtMusicClient {
         let detected_authuser = if cookie.contains("authuser=3") {
             Some("3".to_string())
         } else if let Some(pos) = cookie.find("authuser=") {
-            let num: String = cookie[pos + 9..].chars().take_while(|c| c.is_ascii_digit()).collect();
-            if !num.is_empty() { Some(num) } else { Some("3".to_string()) }
+            let num: String = cookie[pos + 9..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !num.is_empty() {
+                Some(num)
+            } else {
+                Some("3".to_string())
+            }
         } else {
             Some("3".to_string())
         };
@@ -143,9 +166,10 @@ impl YtMusicClient {
         {
             let auth_guard = self.auth.read().await;
             if let Some(token) = auth_guard.as_ref()
-                && !token.is_expired() {
-                    return Some(token.access_token.clone());
-                }
+                && !token.is_expired()
+            {
+                return Some(token.access_token.clone());
+            }
         }
 
         // Если токена нет или он просрочен — выполняем refresh
@@ -173,11 +197,7 @@ impl YtMusicClient {
 
     /// Проверяет, аутентифицирован ли клиент
     pub fn is_authenticated(&self) -> bool {
-        let has_cookie = self
-            .cookie
-            .try_read()
-            .map(|r| r.is_some())
-            .unwrap_or(false);
+        let has_cookie = self.cookie.try_read().map(|r| r.is_some()).unwrap_or(false);
         let has_token = self
             .refresh_token
             .try_read()
@@ -234,10 +254,7 @@ impl YtMusicClient {
             .http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header(
-                "User-Agent",
-                UA_CHROME_120,
-            )
+            .header("User-Agent", UA_CHROME_120)
             .header("X-Goog-Api-Format-Version", "2");
 
         let cookie_opt = {
@@ -278,10 +295,7 @@ impl YtMusicClient {
         let fetched_id = match self
             .http
             .get("https://www.youtube.com/sw.js_data")
-            .header(
-                "User-Agent",
-                UA_SAFARI_26,
-            )
+            .header("User-Agent", UA_SAFARI_26)
             .send()
             .await
         {
@@ -302,10 +316,34 @@ impl YtMusicClient {
     }
 
     /// Прямой запрос потока через InnerTube VisionOS API (~200 мс)
-    pub async fn get_stream_url_visionos(
+    pub async fn get_stream_url_visionos(&self, track_id: &str) -> Result<String, YtMusicError> {
+        let json = self.visionos_player_json(track_id).await?;
+        let url = parser::parse_stream_url(&json).map_err(YtMusicError::Message)?;
+
+        println!(
+            "[ytmusic] Стрим {} получен НАПРЯМУЮ через VisionOS API (itag 251)",
+            track_id
+        );
+        Ok(url)
+    }
+
+    /// Длительность трека в секундах (`videoDetails.lengthSeconds` из ответа `/player`).
+    /// Результат запоминается в памяти: одна и та же длительность нужна и префетчу, и тексту песни.
+    pub async fn track_duration_secs(&self, track_id: &str) -> Option<u64> {
+        if let Some(secs) = track_duration_cached(track_id) {
+            return Some(secs);
+        }
+        let json = self.visionos_player_json(track_id).await.ok()?;
+        let secs = parser::parse_video_length_secs(&json)?;
+        store_track_duration(track_id, secs);
+        Some(secs)
+    }
+
+    /// Ответ InnerTube VisionOS `/player`: поток и метаданные трека одним запросом
+    async fn visionos_player_json(
         &self,
         track_id: &str,
-    ) -> Result<String, YtMusicError> {
+    ) -> Result<serde_json::Value, YtMusicError> {
         let visitor_id = self.get_visitor_id().await;
         let body = serde_json::json!({
             "context": {
@@ -339,10 +377,7 @@ impl YtMusicClient {
             .header("X-YouTube-Client-Name", "101")
             .header("X-YouTube-Client-Version", "1.02")
             .header("Origin", "https://www.youtube.com")
-            .header(
-                "User-Agent",
-                UA_SAFARI_26,
-            )
+            .header("User-Agent", UA_SAFARI_26)
             .header("X-Goog-Visitor-Id", &visitor_id)
             .json(&body)
             .send()
@@ -350,20 +385,11 @@ impl YtMusicClient {
             .error_for_status()?;
 
         let json = resp.json::<serde_json::Value>().await?;
-        let url = parser::parse_stream_url(&json).map_err(YtMusicError::Message)?;
-
-        println!(
-            "[ytmusic] Стрим {} получен НАПРЯМУЮ через VisionOS API (itag 251)",
-            track_id
-        );
-        Ok(url)
+        Ok(json)
     }
 
     /// Поиск студийных треков ("Songs" / "Песни") с официальным фильтром YouTube Music
-    pub async fn search_songs(
-        &self,
-        query: &str,
-    ) -> Result<Vec<Track>, YtMusicError> {
+    pub async fn search_songs(&self, query: &str) -> Result<Vec<Track>, YtMusicError> {
         let body = serde_json::json!({
             "query": query,
             "params": "EgWKAQIIAWoKEAMQBBAKEAUQCRgB"
@@ -401,21 +427,20 @@ impl YtMusicClient {
     /// Запрос информации об артисте (Топ треков, альбомы, фото).
     /// Если передан не UC... ID (например, поисковый запрос или ID из Яндекса),
     /// сначала выполняется поиск артиста в YouTube Music.
-    pub async fn get_artist(
-        &self,
-        query_or_id: &str,
-    ) -> Result<ArtistBrief, YtMusicError> {
+    pub async fn get_artist(&self, query_or_id: &str) -> Result<ArtistBrief, YtMusicError> {
         let browse_id = if query_or_id.starts_with("UC") {
             query_or_id.to_string()
         } else {
             let search_res = self.search_all(query_or_id).await?;
-            let artist_opt = search_res.artists.and_then(|sec| {
-                sec.results.into_iter().find(|a| a.id.starts_with("UC"))
-            });
+            let artist_opt = search_res
+                .artists
+                .and_then(|sec| sec.results.into_iter().find(|a| a.id.starts_with("UC")));
             match artist_opt {
                 Some(a) => a.id,
                 None => {
-                    return Err(format!("Исполнитель «{}» не найден в YouTube Music", query_or_id).into());
+                    return Err(
+                        format!("Исполнитель «{}» не найден в YouTube Music", query_or_id).into(),
+                    );
                 }
             }
         };
@@ -437,14 +462,24 @@ impl YtMusicClient {
     /// Загрузка понравившихся треков пользователя (через HTML LM или browse fallback)
     pub async fn get_liked_tracks(&self) -> Result<Vec<Track>, YtMusicError> {
         // 1. Надежный запрос плейлиста LM через HTML с полной сохраненной кукой пользователя
-        if let Ok(html) = self.fetch_ytmusic_html("https://music.youtube.com/playlist?list=LM").await {
+        if let Ok(html) = self
+            .fetch_ytmusic_html("https://music.youtube.com/playlist?list=LM")
+            .await
+        {
             if let Some(cnt) = parser::parse_header_track_count_from_html(&html) {
-                println!("[ytmusic] Официальное общее количество треков в заголовке: {}", cnt);
+                println!(
+                    "[ytmusic] Официальное общее количество треков в заголовке: {}",
+                    cnt
+                );
                 *self.liked_total_count.write().await = Some(cnt);
             }
-            let (mut tracks, mut continuation_opt) = parser::parse_tracks_and_continuation_from_html(&html);
+            let (mut tracks, mut continuation_opt) =
+                parser::parse_tracks_and_continuation_from_html(&html);
             if !tracks.is_empty() {
-                println!("[ytmusic] Загружено {} понравившихся треков через HTML плейлиста LM", tracks.len());
+                println!(
+                    "[ytmusic] Загружено {} понравившихся треков через HTML плейлиста LM",
+                    tracks.len()
+                );
 
                 // Дозагрузка следующих порций через InnerTube browse continuation
                 let mut batches = 0;
@@ -457,19 +492,23 @@ impl YtMusicClient {
                         "continuation": continuation
                     });
                     // POST к browse с {"continuation": token}
-                    let res = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body).await;
+                    let res = self
+                        .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+                        .await;
                     match res {
                         Ok(json) => {
                             if self.liked_total_count.read().await.is_none()
-                                && let Some(cnt) = parser::parse_header_track_count(&json) {
-                                    *self.liked_total_count.write().await = Some(cnt);
-                                }
+                                && let Some(cnt) = parser::parse_header_track_count(&json)
+                            {
+                                *self.liked_total_count.write().await = Some(cnt);
+                            }
                             let next_tracks = parser::parse_liked_tracks(&json);
                             let next_cont = parser::find_continuation_token(&json);
                             if next_tracks.is_empty() {
                                 break;
                             }
-                            let mut seen_ids: std::collections::HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                            let mut seen_ids: std::collections::HashSet<String> =
+                                tracks.iter().map(|t| t.id.clone()).collect();
                             for t in next_tracks {
                                 if !t.id.is_empty() && seen_ids.insert(t.id.clone()) {
                                     tracks.push(t);
@@ -478,13 +517,19 @@ impl YtMusicClient {
                             continuation_opt = next_cont;
                         }
                         Err(e) => {
-                            eprintln!("[ytmusic] Ошибка дозагрузки continuation через browse: {:?}", e);
+                            eprintln!(
+                                "[ytmusic] Ошибка дозагрузки continuation через browse: {:?}",
+                                e
+                            );
                             break;
                         }
                     }
                 }
 
-                println!("[ytmusic] Всего загружено {} понравившихся треков", tracks.len());
+                println!(
+                    "[ytmusic] Всего загружено {} понравившихся треков",
+                    tracks.len()
+                );
                 return Ok(tracks);
             }
         }
@@ -494,9 +539,15 @@ impl YtMusicClient {
             let body = serde_json::json!({
                 "browseId": browse_id
             });
-            if let Ok(json) = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body).await {
+            if let Ok(json) = self
+                .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+                .await
+            {
                 if let Some(cnt) = parser::parse_header_track_count(&json) {
-                    println!("[ytmusic] Официальное общее количество треков в заголовке browse: {}", cnt);
+                    println!(
+                        "[ytmusic] Официальное общее количество треков в заголовке browse: {}",
+                        cnt
+                    );
                     *self.liked_total_count.write().await = Some(cnt);
                 }
                 let mut tracks = parser::parse_liked_tracks(&json);
@@ -511,13 +562,17 @@ impl YtMusicClient {
                         let body = serde_json::json!({
                             "continuation": continuation
                         });
-                        if let Ok(next_json) = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body).await {
+                        if let Ok(next_json) = self
+                            .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+                            .await
+                        {
                             let next_tracks = parser::parse_liked_tracks(&next_json);
                             let next_cont = parser::find_continuation_token(&next_json);
                             if next_tracks.is_empty() {
                                 break;
                             }
-                            let mut seen_ids: std::collections::HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                            let mut seen_ids: std::collections::HashSet<String> =
+                                tracks.iter().map(|t| t.id.clone()).collect();
                             for t in next_tracks {
                                 if !t.id.is_empty() && seen_ids.insert(t.id.clone()) {
                                     tracks.push(t);
@@ -560,14 +615,14 @@ impl YtMusicClient {
     }
 
     /// Запрос списка треков альбома или плейлиста
-    pub async fn get_album_tracks(
-        &self,
-        browse_id: &str,
-    ) -> Result<Vec<Track>, YtMusicError> {
+    pub async fn get_album_tracks(&self, browse_id: &str) -> Result<Vec<Track>, YtMusicError> {
         let body = serde_json::json!({
             "browseId": browse_id
         });
-        if let Ok(json) = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body).await {
+        if let Ok(json) = self
+            .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+            .await
+        {
             let tracks = parser::parse_album_tracks(&json);
             if !tracks.is_empty() {
                 return Ok(tracks);
@@ -575,7 +630,10 @@ impl YtMusicClient {
         }
 
         // Фолбэк для пользовательских плейлистов (VLPL... / PL...): запрос HTML
-        if browse_id.starts_with("VLPL") || browse_id.starts_with("PL") || browse_id.starts_with("VL") {
+        if browse_id.starts_with("VLPL")
+            || browse_id.starts_with("PL")
+            || browse_id.starts_with("VL")
+        {
             let clean_id = browse_id.strip_prefix("VL").unwrap_or(browse_id);
             let url = format!("https://music.youtube.com/playlist?list={clean_id}");
             if let Ok(html) = self.fetch_ytmusic_html(&url).await {
@@ -596,20 +654,35 @@ impl YtMusicClient {
         let user_agent = UA_SAFARI_26;
 
         if let Some((fallback_url, primary, fallback)) = &fallback_info
-            && is_known_blocked_ggc_node(primary) {
+            && is_known_blocked_ggc_node(primary)
+        {
+            println!(
+                "[ytmusic] Обнаружена заблокированная РКН нода GGC ({primary}). Переключаем поток на резервную европейскую ноду Google ({fallback})..."
+            );
+            if let Some(verified) = check_stream_connectivity(
+                &self.http,
+                fallback_url,
+                user_agent,
+                PROBE_TIMEOUT_FALLBACK_MS,
+            )
+            .await
+            {
                 println!(
-                    "[ytmusic] Обнаружена заблокированная РКН нода GGC ({primary}). Переключаем поток на резервную европейскую ноду Google ({fallback})..."
+                    "[ytmusic] Резервный поток подтвержден и готов к мгновенному воспроизведению"
                 );
-                if let Some(verified) = check_stream_connectivity(&self.http, fallback_url, user_agent, PROBE_TIMEOUT_FALLBACK_MS).await {
-                    println!("[ytmusic] Резервный поток подтвержден и готов к мгновенному воспроизведению");
-                    return verified;
-                }
-                println!("[ytmusic] Резервный поток не ответил на предварительный пинг, используем fallback URL напрямую");
-                return fallback_url.clone();
+                return verified;
             }
+            println!(
+                "[ytmusic] Резервный поток не ответил на предварительный пинг, используем fallback URL напрямую"
+            );
+            return fallback_url.clone();
+        }
 
         // Если первичная нода не из черного списка блокировок, проверяем её доступность за 1200 мс
-        if let Some(verified) = check_stream_connectivity(&self.http, raw_url, user_agent, PROBE_TIMEOUT_PRIMARY_MS).await {
+        if let Some(verified) =
+            check_stream_connectivity(&self.http, raw_url, user_agent, PROBE_TIMEOUT_PRIMARY_MS)
+                .await
+        {
             return verified;
         }
 
@@ -618,7 +691,14 @@ impl YtMusicClient {
             println!(
                 "[ytmusic] Первичная нода ({primary}) не ответила вовремя. Переключаем на резервную ноду ({fallback})..."
             );
-            if let Some(verified) = check_stream_connectivity(&self.http, &fallback_url, user_agent, PROBE_TIMEOUT_FALLBACK_MS).await {
+            if let Some(verified) = check_stream_connectivity(
+                &self.http,
+                &fallback_url,
+                user_agent,
+                PROBE_TIMEOUT_FALLBACK_MS,
+            )
+            .await
+            {
                 return verified;
             }
             return fallback_url;
@@ -633,7 +713,9 @@ impl YtMusicClient {
         let raw_url = match self.get_stream_url_visionos(track_id).await {
             Ok(url) => url,
             Err(e) => {
-                eprintln!("[ytmusic] VisionOS API вернул ошибку ({e}), переключаемся на резервный yt-dlp fallback");
+                eprintln!(
+                    "[ytmusic] VisionOS API вернул ошибку ({e}), переключаемся на резервный yt-dlp fallback"
+                );
                 get_stream_url_ytdlp_fallback(track_id).await?
             }
         };
@@ -643,7 +725,11 @@ impl YtMusicClient {
     }
 
     /// Отправляет действие оценки (like/like, like/dislike, like/removelike) во все связанные профили Google и домены (YouTube Music и YouTube Video)
-    pub async fn send_rating_action(&self, endpoint: &str, track_id: &str) -> Result<(), YtMusicError> {
+    pub async fn send_rating_action(
+        &self,
+        endpoint: &str,
+        track_id: &str,
+    ) -> Result<(), YtMusicError> {
         let cookie_opt = {
             let guard = self.cookie.read().await;
             guard.clone()
@@ -676,7 +762,9 @@ impl YtMusicClient {
                     }
                 });
 
-                let mut req = self.http.post(&url)
+                let mut req = self
+                    .http
+                    .post(&url)
                     .header("Content-Type", "application/json")
                     .header("User-Agent", UA_CHROME_124)
                     .header("X-Goog-Api-Format-Version", "2")
@@ -685,9 +773,7 @@ impl YtMusicClient {
                     .header("Referer", format!("{}/", origin));
 
                 if let Some(cookie) = &cookie_opt {
-                    req = req
-                        .header("Cookie", cookie)
-                        .header("X-Goog-AuthUser", *au);
+                    req = req.header("Cookie", cookie).header("X-Goog-AuthUser", *au);
 
                     if let Some(sapisid) = auth::extract_sapisid(cookie) {
                         let auth_header = auth::build_sapisid_hash(&sapisid, origin);
@@ -714,12 +800,14 @@ impl YtMusicClient {
         }
 
         if success {
-            println!("[ytmusic] Оценка {endpoint} для {track_id} успешно доставлена в Google YouTube");
+            println!(
+                "[ytmusic] Оценка {endpoint} для {track_id} успешно доставлена в Google YouTube"
+            );
             Ok(())
         } else {
-            let err_msg = last_error.unwrap_or_else(|| YtMusicError::Message(
-                "Не удалось отправить оценку трека".to_string(),
-            ));
+            let err_msg = last_error.unwrap_or_else(|| {
+                YtMusicError::Message("Не удалось отправить оценку трека".to_string())
+            });
             eprintln!("[ytmusic] Ошибка доставки оценки {endpoint} для {track_id}: {err_msg}");
             Err(err_msg)
         }
@@ -731,7 +819,11 @@ impl YtMusicClient {
     }
 
     /// Добавляет трек в плейлист по его ID
-    pub async fn add_track_to_playlist(&self, playlist_id: &str, track_id: &str) -> Result<(), YtMusicError> {
+    pub async fn add_track_to_playlist(
+        &self,
+        playlist_id: &str,
+        track_id: &str,
+    ) -> Result<(), YtMusicError> {
         let clean_id = playlist_id.strip_prefix("VL").unwrap_or(playlist_id);
         let body = serde_json::json!({
             "playlistId": clean_id,
@@ -742,13 +834,22 @@ impl YtMusicClient {
                 }
             ]
         });
-        self.post_innertube("browse/edit_playlist", "WEB_REMIX", "1.20240101.01.00", body)
-            .await?;
+        self.post_innertube(
+            "browse/edit_playlist",
+            "WEB_REMIX",
+            "1.20240101.01.00",
+            body,
+        )
+        .await?;
         Ok(())
     }
 
     /// Создает приватный плейлист и опционально добавляет в него первый трек
-    pub async fn create_playlist(&self, title: &str, initial_track_id: Option<&str>) -> Result<String, YtMusicError> {
+    pub async fn create_playlist(
+        &self,
+        title: &str,
+        initial_track_id: Option<&str>,
+    ) -> Result<String, YtMusicError> {
         let mut body = serde_json::json!({
             "title": title,
             "privacyStatus": "PRIVATE"
@@ -763,7 +864,9 @@ impl YtMusicClient {
             .as_str()
             .or_else(|| json["browseId"].as_str())
             .ok_or_else(|| {
-                let msg = json["error"]["message"].as_str().unwrap_or("Не удалось получить ID созданного плейлиста");
+                let msg = json["error"]["message"]
+                    .as_str()
+                    .unwrap_or("Не удалось получить ID созданного плейлиста");
                 format!("InnerTube playlist/create: {}", msg)
             })?
             .to_string();
@@ -771,7 +874,10 @@ impl YtMusicClient {
     }
 
     /// Скачивает трек в `~/Music/Волна` и возвращает путь к сохраненному файлу
-    pub async fn download_track_file(&self, track: &Track) -> Result<std::path::PathBuf, YtMusicError> {
+    pub async fn download_track_file(
+        &self,
+        track: &Track,
+    ) -> Result<std::path::PathBuf, YtMusicError> {
         let stream_url = self.get_stream_url(&track.id).await?;
         let bytes = self
             .http
@@ -824,7 +930,10 @@ impl YtMusicClient {
         let body = serde_json::json!({
             "videoId": track_id
         });
-        let next_json = self.post_innertube("next", "WEB_REMIX", "1.20240101.01.00", body).await.ok()?;
+        let next_json = self
+            .post_innertube("next", "WEB_REMIX", "1.20240101.01.00", body)
+            .await
+            .ok()?;
 
         // Поиск browseId вкладки текста в tabs
         let tabs = next_json
@@ -843,17 +952,21 @@ impl YtMusicClient {
                     .and_then(|e| e.get("browseEndpoint"))
                     .and_then(|b| b.get("browseId"))
                     .and_then(|id| id.as_str())
-                    && browse_id.starts_with("MPLY") {
-                        lyrics_browse_id = Some(browse_id.to_string());
-                        break;
-                    }
+                && browse_id.starts_with("MPLY")
+            {
+                lyrics_browse_id = Some(browse_id.to_string());
+                break;
+            }
         }
 
         let browse_id = lyrics_browse_id?;
         let browse_body = serde_json::json!({
             "browseId": browse_id
         });
-        let browse_json = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", browse_body).await.ok()?;
+        let browse_json = self
+            .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", browse_body)
+            .await
+            .ok()?;
 
         // Извлекаем текст песни из musicDescriptionShelfRenderer.description.runs
         let runs = browse_json
@@ -889,23 +1002,33 @@ impl YtMusicClient {
     /// 4. LRCLIB статический текст fallback
     pub async fn get_track_lyrics(&self, track: &Track) -> Option<String> {
         let cache_path = crate::cache::lyrics_cache_path(&track.id);
+        let duration_secs = track.duration_ms.map(|d| d / 1000);
+        // Разметка из кэша может быть от другой версии трека: текст верный, а караоке уезжает.
+        // Тогда файл не отдаём как синхронизированный, а пробуем найти разметку заново; старый текст
+        // держим про запас, чтобы в крайнем случае показать его без врущих таймкодов.
+        let mut stale_plain = None;
         if let Ok(cached) = std::fs::read_to_string(&cache_path) {
             let trimmed = cached.trim();
-            if crate::api::lrclib::usable_synced(trimmed) || !trimmed.is_empty() {
+            if crate::api::lrclib::cached_usable(trimmed, duration_secs) {
                 return Some(trimmed.to_string());
+            }
+            if !trimmed.is_empty() {
+                stale_plain = Some(crate::api::lrclib::strip_lrc_tags(trimmed));
             }
         }
 
         let artist = track.artists_string();
         let title = track.title.clone();
-        let duration_secs = track.duration_ms.map(|d| d / 1000);
 
         let mut lrclib_plain = None;
 
         // 1. Пробуем LRCLIB для получения синхронизированного караоке
-        if let Some(lrclib_text) = crate::api::lrclib::fetch_lrclib_lyrics(&self.http, &artist, &title, duration_secs).await {
+        if let Some(lrclib_text) =
+            crate::api::lrclib::fetch_lrclib_lyrics(&self.http, &artist, &title, duration_secs)
+                .await
+        {
             let trimmed = lrclib_text.trim();
-            if crate::api::lrclib::usable_synced(trimmed) {
+            if crate::api::lrclib::usable_synced_at(trimmed, duration_secs) {
                 let _ = std::fs::write(&cache_path, trimmed);
                 return Some(trimmed.to_string());
             } else if !trimmed.is_empty() {
@@ -917,14 +1040,26 @@ impl YtMusicClient {
         if let Some(yt_lyrics) = self.get_yt_lyrics(&track.id).await {
             let trimmed = yt_lyrics.trim();
             if !trimmed.is_empty() {
-                let _ = std::fs::write(&cache_path, trimmed);
+                // Отвергнутую разметку не затираем статикой: вдруг длительность в метаданных врёт,
+                // и в следующий раз проверка пройдёт — а заново размеченный текст уже не найти.
+                if stale_plain.is_none() {
+                    let _ = std::fs::write(&cache_path, trimmed);
+                }
                 return Some(trimmed.to_string());
             }
         }
 
         // 3. Fallback на статический текст из LRCLIB
         if let Some(plain) = lrclib_plain {
-            let _ = std::fs::write(&cache_path, &plain);
+            if stale_plain.is_none() {
+                let _ = std::fs::write(&cache_path, &plain);
+            }
+            return Some(plain);
+        }
+
+        // 4. Ничего лучше не нашлось — отдаём текст из отвергнутой разметки, но без таймкодов,
+        //    чтобы подсветка не уезжала от музыки
+        if let Some(plain) = stale_plain {
             return Some(plain);
         }
 
@@ -942,14 +1077,22 @@ fn extract_visitor_id(text: &str) -> Option<String> {
             let start = search_from + pos;
             let tail = &text[start..];
             let end = tail.find('"').unwrap_or_else(|| {
-                tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '%' || c == '=' || c == '(' || c == ')'))
-                    .unwrap_or(tail.len())
+                tail.find(|c: char| {
+                    !(c.is_ascii_alphanumeric()
+                        || c == '_'
+                        || c == '-'
+                        || c == '%'
+                        || c == '='
+                        || c == '('
+                        || c == ')')
+                })
+                .unwrap_or(tail.len())
             });
             let candidate = &tail[..end];
             if candidate.len() >= 50 {
                 return Some(candidate.to_string());
             }
-        search_from = start + prefix.len();
+            search_from = start + prefix.len();
         }
     }
     None
@@ -957,7 +1100,9 @@ fn extract_visitor_id(text: &str) -> Option<String> {
 
 /// Извлекает хост и путь с query string из URL вида https://host/path?query
 fn parse_url_host_and_path(url: &str) -> Option<(String, String)> {
-    let without_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let slash_pos = without_scheme.find('/')?;
     let host = without_scheme[..slash_pos].to_string();
     let path = without_scheme[slash_pos..].to_string();
@@ -999,7 +1144,9 @@ fn build_fallback_stream_url(raw_url: &str) -> Option<(String, String, String)> 
 /// Проверяет, принадлежит ли нода к известным блокируемым в РФ российским кэшам GGC
 fn is_known_blocked_ggc_node(node: &str) -> bool {
     let n = node.to_lowercase();
-    BLOCKED_GGC_NODE_MARKERS.iter().any(|marker| n.contains(marker))
+    BLOCKED_GGC_NODE_MARKERS
+        .iter()
+        .any(|marker| n.contains(marker))
 }
 
 /// Проверяет доступность стрима и возвращает финальный рабочий URL после редиректов
@@ -1047,9 +1194,7 @@ fn resolve_yt_dlp() -> String {
     }
 }
 
-async fn get_stream_url_ytdlp_fallback(
-    track_id: &str,
-) -> Result<String, YtMusicError> {
+async fn get_stream_url_ytdlp_fallback(track_id: &str) -> Result<String, YtMusicError> {
     let yt_dlp_binary = resolve_yt_dlp();
     if yt_dlp_binary == "yt-dlp" {
         // `resolve_yt_dlp` возвращает голое имя только если ничего не нашёл.
@@ -1103,15 +1248,23 @@ impl MusicProvider for YtMusicClient {
         self.is_authenticated()
     }
 
-    async fn get_stream_url(&self, track_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_stream_url(
+        &self,
+        track_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.get_stream_url(track_id).await.map_err(Into::into)
     }
 
-    async fn search(&self, query: &str) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn search(
+        &self,
+        query: &str,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         self.search_all(query).await.map_err(Into::into)
     }
 
-    async fn get_liked_tracks(&self) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_liked_tracks(
+        &self,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_liked_tracks().await.map_err(Into::into)
     }
 
@@ -1119,16 +1272,31 @@ impl MusicProvider for YtMusicClient {
         self.get_liked_total_count().await
     }
 
-    async fn set_track_like(&self, track_id: &str, liked: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let endpoint = if liked { "like/like" } else { "like/removelike" };
-        self.send_rating_action(endpoint, track_id).await.map_err(Into::into)
+    async fn set_track_like(
+        &self,
+        track_id: &str,
+        liked: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let endpoint = if liked {
+            "like/like"
+        } else {
+            "like/removelike"
+        };
+        self.send_rating_action(endpoint, track_id)
+            .await
+            .map_err(Into::into)
     }
 
-    async fn set_track_dislike(&self, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn set_track_dislike(
+        &self,
+        track_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.dislike_track(track_id).await.map_err(Into::into)
     }
 
-    async fn get_liked_albums(&self) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_liked_albums(
+        &self,
+    ) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>> {
         let body = serde_json::json!({
             "browseId": "FEmusic_liked_albums"
         });
@@ -1138,22 +1306,37 @@ impl MusicProvider for YtMusicClient {
         Ok(parser::parse_albums(&json))
     }
 
-    async fn get_playlists(&self) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_playlists(
+        &self,
+    ) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>> {
         // 1. Надежный запрос библиотеки плейлистов через HTML
-        if let Ok(html) = self.fetch_ytmusic_html("https://music.youtube.com/library/playlists").await {
+        if let Ok(html) = self
+            .fetch_ytmusic_html("https://music.youtube.com/library/playlists")
+            .await
+        {
             let playlists = parser::parse_playlists_from_html(&html);
             if !playlists.is_empty() {
-                println!("[ytmusic] Загружено {} плейлистов через HTML library/playlists", playlists.len());
+                println!(
+                    "[ytmusic] Загружено {} плейлистов через HTML library/playlists",
+                    playlists.len()
+                );
                 return Ok(playlists);
             }
         }
 
         // 2. Фолбэк на feed/library и playlist?list=LM (где /guide содержит все плейлисты пользователя)
-        for url in &["https://music.youtube.com/feed/library", "https://music.youtube.com/playlist?list=LM"] {
+        for url in &[
+            "https://music.youtube.com/feed/library",
+            "https://music.youtube.com/playlist?list=LM",
+        ] {
             if let Ok(html) = self.fetch_ytmusic_html(url).await {
                 let playlists = parser::parse_playlists_from_html(&html);
                 if !playlists.is_empty() {
-                    println!("[ytmusic] Загружено {} плейлистов через HTML {}", playlists.len(), url);
+                    println!(
+                        "[ytmusic] Загружено {} плейлистов через HTML {}",
+                        playlists.len(),
+                        url
+                    );
                     return Ok(playlists);
                 }
             }
@@ -1163,7 +1346,10 @@ impl MusicProvider for YtMusicClient {
         let body = serde_json::json!({
             "browseId": "FEmusic_liked_playlists"
         });
-        if let Ok(json) = self.post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body).await {
+        if let Ok(json) = self
+            .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+            .await
+        {
             let playlists = parser::parse_playlists(&json);
             if !playlists.is_empty() {
                 return Ok(playlists);
@@ -1250,7 +1436,10 @@ impl MusicProvider for YtMusicClient {
                 "videoId": fb_seed,
                 "playlistId": format!("RDAMVM{}", fb_seed)
             });
-            if let Ok(fb_json) = self.post_innertube("next", "WEB_REMIX", "1.20240101.01.00", fb_body).await {
+            if let Ok(fb_json) = self
+                .post_innertube("next", "WEB_REMIX", "1.20240101.01.00", fb_body)
+                .await
+            {
                 let (fb_tracks, fb_cont) = parser::parse_radio_batch(&fb_json);
                 if !fb_tracks.is_empty() {
                     let mut guard = self.last_seed.write().await;
@@ -1267,7 +1456,10 @@ impl MusicProvider for YtMusicClient {
         })
     }
 
-    async fn send_feedback(&self, _event: FeedbackEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn send_feedback(
+        &self,
+        _event: FeedbackEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
 
@@ -1298,14 +1490,18 @@ mod tests {
         let extracted_cgs = extract_visitor_id(sample_cgs);
         assert_eq!(
             extracted_cgs.as_deref(),
-            Some("CgsSampleVisitorIdLongEnoughToPassTheFiftyCharactersMinimumValidationCheck1234567890%3D")
+            Some(
+                "CgsSampleVisitorIdLongEnoughToPassTheFiftyCharactersMinimumValidationCheck1234567890%3D"
+            )
         );
 
         let sample_cgt = r#")]}'\n[["yt.sw.adr",null,[[["ru","RU",null,"1.1.1.1",null,null,null,null,null,null,null,"Robot","Bot","CgtSampleVisitorIdLongEnoughToPassTheFiftyCharactersMinimumValidationCheck1234567890"]]]"#;
         let extracted_cgt = extract_visitor_id(sample_cgt);
         assert_eq!(
             extracted_cgt.as_deref(),
-            Some("CgtSampleVisitorIdLongEnoughToPassTheFiftyCharactersMinimumValidationCheck1234567890")
+            Some(
+                "CgtSampleVisitorIdLongEnoughToPassTheFiftyCharactersMinimumValidationCheck1234567890"
+            )
         );
 
         let too_short = r#"["CgsShort123"]"#;
@@ -1331,7 +1527,10 @@ mod tests {
     async fn test_visionos_stream_live() {
         let client = YtMusicClient::new();
         // dQw4w9WgXcQ — Never Gonna Give You Up
-        let stream_url = client.get_stream_url("dQw4w9WgXcQ").await.expect("Failed to get stream url");
+        let stream_url = client
+            .get_stream_url("dQw4w9WgXcQ")
+            .await
+            .expect("Failed to get stream url");
         assert!(stream_url.starts_with("https://"));
         assert!(stream_url.contains("videoplayback"));
     }
@@ -1341,14 +1540,20 @@ mod tests {
     async fn test_problematic_track_stream_live() {
         let client = YtMusicClient::new();
         // lK5Oy7c57Ss — Три дня дождя — Перезаряжай
-        let stream_url = client.get_stream_url("lK5Oy7c57Ss").await.expect("Failed to get stream url");
+        let stream_url = client
+            .get_stream_url("lK5Oy7c57Ss")
+            .await
+            .expect("Failed to get stream url");
         println!("[test] Final stream URL: {stream_url}");
         assert!(stream_url.starts_with("https://"));
         assert!(stream_url.contains("videoplayback"));
         // Хост не должен указывать на заблокированную ноду
         let (host, _) = parse_url_host_and_path(&stream_url).expect("Failed to parse host");
         println!("[test] Verified host: {host}");
-        assert!(!host.contains("sn-hxb54vo-238s"), "Host should not contain blocked node!");
+        assert!(
+            !host.contains("sn-hxb54vo-238s"),
+            "Host should not contain blocked node!"
+        );
         assert!(host.contains("sn-u15hn5-cc") || host.contains("googlevideo.com"));
     }
 
@@ -1358,13 +1563,24 @@ mod tests {
         let cookie = crate::api::auth::load_ytmusic_cookie().expect("Cookie not found in config");
         let client = YtMusicClient::with_cookie(cookie);
 
-        let liked = client.get_liked_tracks().await.expect("Failed to get liked tracks");
+        let liked = client
+            .get_liked_tracks()
+            .await
+            .expect("Failed to get liked tracks");
         println!("[test] Loaded {} liked tracks", liked.len());
         assert!(!liked.is_empty(), "Liked tracks should not be empty!");
         let first = &liked[0];
-        println!("[test] First liked track: {} - {} (cover: {:?})", first.title, first.artists_string(), first.cover_uri);
+        println!(
+            "[test] First liked track: {} - {} (cover: {:?})",
+            first.title,
+            first.artists_string(),
+            first.cover_uri
+        );
 
-        let playlists = client.get_playlists().await.expect("Failed to get playlists");
+        let playlists = client
+            .get_playlists()
+            .await
+            .expect("Failed to get playlists");
         println!("[test] Loaded {} playlists", playlists.len());
         for p in &playlists {
             println!("[test] Playlist: {} ({})", p.title, p.uid);
@@ -1372,10 +1588,23 @@ mod tests {
         assert!(!playlists.is_empty(), "Playlists should not be empty!");
 
         // Проверяем получение треков одного из плейлистов
-        let pl_tracks = client.get_album_tracks("VLPLcHCtI7UKhDqwiMLD3A_nTUx7DJxKQt2c").await.expect("Failed to get playlist tracks");
-        println!("[test] Loaded {} tracks for playlist TikTok Songs", pl_tracks.len());
-        assert!(!pl_tracks.is_empty(), "Playlist TikTok Songs should not be empty!");
-        println!("[test] First track in TikTok Songs: {} - {}", pl_tracks[0].title, pl_tracks[0].artists_string());
+        let pl_tracks = client
+            .get_album_tracks("VLPLcHCtI7UKhDqwiMLD3A_nTUx7DJxKQt2c")
+            .await
+            .expect("Failed to get playlist tracks");
+        println!(
+            "[test] Loaded {} tracks for playlist TikTok Songs",
+            pl_tracks.len()
+        );
+        assert!(
+            !pl_tracks.is_empty(),
+            "Playlist TikTok Songs should not be empty!"
+        );
+        println!(
+            "[test] First track in TikTok Songs: {} - {}",
+            pl_tracks[0].title,
+            pl_tracks[0].artists_string()
+        );
     }
 
     #[test]
@@ -1384,8 +1613,10 @@ mod tests {
         let clean = pl_id.strip_prefix("VL").unwrap_or(pl_id);
         assert_eq!(clean, "PLcHCtI7UKhDqwiMLD3A");
 
-        let stream_webm = "https://rr---sn.googlevideo.com/videoplayback?mime=audio%2Fwebm&itag=251";
-        let ext_webm = if stream_webm.contains("mime=audio%2Fwebm") || stream_webm.contains("opus") {
+        let stream_webm =
+            "https://rr---sn.googlevideo.com/videoplayback?mime=audio%2Fwebm&itag=251";
+        let ext_webm = if stream_webm.contains("mime=audio%2Fwebm") || stream_webm.contains("opus")
+        {
             "opus"
         } else {
             "m4a"
@@ -1424,5 +1655,3 @@ mod tests {
         assert_eq!(mn, Some("sn-hxb54vo-238s%2Csn-oj5hn5-5g".to_string()));
     }
 }
-
-

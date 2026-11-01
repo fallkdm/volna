@@ -1,14 +1,14 @@
 use chrono::Utc;
 use md5::{Digest, Md5};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use std::fmt;
 use std::sync::Arc;
 
 use super::models::{
-    parse_lrc, AccountStatus, Album, AlbumWithTracks, ArtistBrief, DownloadInfo, LikedAlbumItem, LikedTracksResult, Playlist,
-    PlaylistWithTracks, SimilarTracks, LrclibResponse, RotorFeedback,
-    RotorFeedbackType, RotorStationTracks, SearchResult, Track, TrackSupplement,
-    YandexApiResponse,
+    AccountStatus, Album, AlbumWithTracks, ArtistBrief, DownloadInfo, LikedAlbumItem,
+    LikedTracksResult, LrclibResponse, Playlist, PlaylistWithTracks, RotorFeedback,
+    RotorFeedbackType, RotorStationTracks, SearchResult, SimilarTracks, Track, TrackSupplement,
+    YandexApiResponse, parse_lrc,
 };
 
 const BASE_API_URL: &str = "https://api.music.yandex.net";
@@ -125,7 +125,10 @@ impl YandexMusicClient {
 
     /// Проверяет, установлен ли токен
     pub fn has_token(&self) -> bool {
-        self.token.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+        self.token
+            .as_ref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
     }
 
     /// Формирует заголовки для запросов к API
@@ -144,8 +147,12 @@ impl YandexMusicClient {
     }
 
     /// Получает треки станции Ротора (по умолчанию «Волна» - "user:onyourwave")
-    pub async fn get_station_tracks(&self, station_id: &str) -> Result<RotorStationTracks, ApiError> {
-        self.get_station_tracks_with_params(station_id, None, None, None).await
+    pub async fn get_station_tracks(
+        &self,
+        station_id: &str,
+    ) -> Result<RotorStationTracks, ApiError> {
+        self.get_station_tracks_with_params(station_id, None, None, None)
+            .await
     }
 
     /// Получает треки станции Ротора с фильтрами настроения, языка и характера
@@ -164,19 +171,20 @@ impl YandexMusicClient {
                 "language": language.unwrap_or("any"),
             });
             let settings_url = format!("{}/rotor/station/{}/settings2", self.base_url, station_id);
-            let r = self.client.post(&settings_url).headers(self.headers()).json(&body).send().await?;
+            let r = self
+                .client
+                .post(&settings_url)
+                .headers(self.headers())
+                .json(&body)
+                .send()
+                .await?;
             if !r.status().is_success() {
                 eprintln!("rotor settings2: HTTP {}", r.status());
             }
         }
         let url = format!("{}/rotor/station/{}/tracks", self.base_url, station_id);
 
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(self.headers()).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -192,14 +200,12 @@ impl YandexMusicClient {
     }
 
     /// Получает информацию о доступных потоках трека
-    pub async fn get_track_download_info(&self, track_id: &str) -> Result<Vec<DownloadInfo>, ApiError> {
+    pub async fn get_track_download_info(
+        &self,
+        track_id: &str,
+    ) -> Result<Vec<DownloadInfo>, ApiError> {
         let url = format!("{}/tracks/{}/download-info", self.base_url, track_id);
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(self.headers()).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -223,7 +229,12 @@ impl YandexMusicClient {
             tokio::time::sleep(std::time::Duration::from_millis(900)).await;
             self.get_track_direct_url_once(track_id).await
         });
-        match futures_util::future::select_ok([first as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>, second]).await {
+        match futures_util::future::select_ok([
+            first as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send + '_>>,
+            second,
+        ])
+        .await
+        {
             Ok((url, _)) => Ok(url),
             // редкий сбой ответа лечится повтором с новой ссылкой
             Err(ApiError::XmlParse(_)) => {
@@ -238,14 +249,22 @@ impl YandexMusicClient {
     /// (у части треков первый байт приходит через 3–4 с) уже было готово к моменту переключения
     pub async fn prefetch_track(&self, track_id: &str) -> Option<(String, String)> {
         let (url, label) = self.get_track_direct_url(track_id).await.ok()?;
-        let warm = self.client.get(&url).header(reqwest::header::RANGE, "bytes=0-65535").send().await;
+        let warm = self
+            .client
+            .get(&url)
+            .header(reqwest::header::RANGE, "bytes=0-65535")
+            .send()
+            .await;
         if let Ok(resp) = warm {
             let _ = resp.bytes().await;
         }
         Some((url, label))
     }
 
-    async fn get_track_direct_url_once(&self, track_id: &str) -> Result<(String, String), ApiError> {
+    async fn get_track_direct_url_once(
+        &self,
+        track_id: &str,
+    ) -> Result<(String, String), ApiError> {
         let download_infos = self.get_track_download_info(track_id).await?;
         if download_infos.is_empty() {
             return Err(ApiError::MissingData(format!(
@@ -256,7 +275,11 @@ impl YandexMusicClient {
 
         let best_info = pick_download_info(&download_infos, &super::auth::load_quality())
             .ok_or_else(|| ApiError::MissingData("Не найден подходящий аудиопоток".into()))?;
-        let label = format!("{} {}", best_info.codec.to_uppercase(), best_info.bitrate_in_kbps);
+        let label = format!(
+            "{} {}",
+            best_info.codec.to_uppercase(),
+            best_info.bitrate_in_kbps
+        );
 
         let xml_resp = self
             .client
@@ -269,7 +292,11 @@ impl YandexMusicClient {
 
         let host = extract_xml_tag(&xml_resp, "host").ok_or_else(|| {
             // начало ответа помогает понять причину (лимит, капча, просроченная ссылка); без токенов, ответ публичный
-            let head: String = xml_resp.chars().filter(|c| !c.is_control()).take(80).collect();
+            let head: String = xml_resp
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(80)
+                .collect();
             ApiError::XmlParse(format!("в ответе Яндекса нет адреса потока («{}»)", head))
         })?;
         let path = extract_xml_tag(&xml_resp, "path")
@@ -307,20 +334,28 @@ impl YandexMusicClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+            return Err(ApiError::InvalidResponse(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         let bytes = resp.bytes().await?;
         // Через Value: поиск Яндекса отдаёт ключ `albums` дважды, а прямой разбор в структуру на этом падает.
         // Ошибка serde_json точнее общего «error decoding response body».
-        let api_response: YandexApiResponse<T> = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .and_then(serde_json::from_value)
-            .map_err(|e| ApiError::InvalidResponse(format!("{} ({})", e, path)))?;
+        let api_response: YandexApiResponse<T> =
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .and_then(serde_json::from_value)
+                .map_err(|e| ApiError::InvalidResponse(format!("{} ({})", e, path)))?;
         Ok(api_response.result)
     }
 
     /// POST формой (`application/x-www-form-urlencoded`) с разбором `result` как JSON
-    async fn post_form(&self, path: &str, form: &[(&str, String)]) -> Result<serde_json::Value, ApiError> {
+    async fn post_form(
+        &self,
+        path: &str,
+        form: &[(&str, String)],
+    ) -> Result<serde_json::Value, ApiError> {
         let body = form
             .iter()
             .map(|(k, v)| format!("{}={}", k, urlencoding_encode(v)))
@@ -341,7 +376,10 @@ impl YandexMusicClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+            return Err(ApiError::InvalidResponse(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
         let v: serde_json::Value = resp.json().await.unwrap_or_default();
         Ok(v.get("result").cloned().unwrap_or_default())
@@ -349,23 +387,47 @@ impl YandexMusicClient {
 
     /// Идентификаторы треков из «Мне нравится»
     pub async fn get_liked_track_ids(&self, uid: &str) -> Result<Vec<String>, ApiError> {
-        let v: serde_json::Value = self.get_result(&format!("/users/{}/likes/tracks", uid)).await?;
+        let v: serde_json::Value = self
+            .get_result(&format!("/users/{}/likes/tracks", uid))
+            .await?;
         Ok(v["library"]["tracks"]
             .as_array()
-            .map(|a| a.iter().filter_map(|t| t["id"].as_str().map(String::from).or_else(|| t["id"].as_u64().map(|n| n.to_string()))).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| {
+                        t["id"]
+                            .as_str()
+                            .map(String::from)
+                            .or_else(|| t["id"].as_u64().map(|n| n.to_string()))
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
     /// Поставить или снять «Мне нравится»
-    pub async fn set_track_like(&self, uid: &str, track_id: &str, like: bool) -> Result<(), ApiError> {
+    pub async fn set_track_like(
+        &self,
+        uid: &str,
+        track_id: &str,
+        like: bool,
+    ) -> Result<(), ApiError> {
         let action = if like { "add-multiple" } else { "remove" };
-        self.post_form(&format!("/users/{}/likes/tracks/{}", uid, action), &[("track-ids", track_id.to_string())]).await?;
+        self.post_form(
+            &format!("/users/{}/likes/tracks/{}", uid, action),
+            &[("track-ids", track_id.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
     /// «Не нравится» на трек
     pub async fn dislike_track(&self, uid: &str, track_id: &str) -> Result<(), ApiError> {
-        self.post_form(&format!("/users/{}/dislikes/tracks/add-multiple", uid), &[("track-ids", track_id.to_string())]).await?;
+        self.post_form(
+            &format!("/users/{}/dislikes/tracks/add-multiple", uid),
+            &[("track-ids", track_id.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
@@ -374,24 +436,35 @@ impl YandexMusicClient {
         let r = self
             .post_form(
                 &format!("/users/{}/playlists/create", uid),
-                &[("title", title.to_string()), ("visibility", "private".to_string())],
+                &[
+                    ("title", title.to_string()),
+                    ("visibility", "private".to_string()),
+                ],
             )
             .await?;
         match &r["kind"] {
             serde_json::Value::String(s) => Ok(s.clone()),
             serde_json::Value::Number(n) => Ok(n.to_string()),
-            _ => Err(ApiError::InvalidResponse("в ответе нет номера нового плейлиста".into())),
+            _ => Err(ApiError::InvalidResponse(
+                "в ответе нет номера нового плейлиста".into(),
+            )),
         }
     }
 
     /// Приватность, описание, владелец и дата изменения плейлиста
     pub async fn get_playlist_meta(&self, uid: &str, kind: &str) -> Result<PlaylistMeta, ApiError> {
-        let v: serde_json::Value = self.get_result(&format!("/users/{}/playlists/{}", uid, kind)).await?;
+        let v: serde_json::Value = self
+            .get_result(&format!("/users/{}/playlists/{}", uid, kind))
+            .await?;
         let text = |k: &str| v[k].as_str().unwrap_or("").to_string();
         Ok(PlaylistMeta {
             private: v["visibility"].as_str() == Some("private"),
             description: text("description"),
-            owner: v["owner"]["name"].as_str().or(v["owner"]["login"].as_str()).unwrap_or("").to_string(),
+            owner: v["owner"]["name"]
+                .as_str()
+                .or(v["owner"]["login"].as_str())
+                .unwrap_or("")
+                .to_string(),
             modified: text("modified"),
         })
     }
@@ -402,7 +475,8 @@ impl YandexMusicClient {
         if let Some(url) = self.get_track_clip_url(&track.id).await {
             return Some(url);
         }
-        let same_title = |t: &Track| t.title.trim().to_lowercase() == track.title.trim().to_lowercase();
+        let same_title =
+            |t: &Track| t.title.trim().to_lowercase() == track.title.trim().to_lowercase();
         // сначала версии той же песни на том же альбоме: у «Extended Mix» клипа нет, а у «Kazantip 2005 Mix» рядом есть
         let mut candidates: Vec<Track> = Vec::new();
         if let Some(album) = track.albums.first() {
@@ -412,9 +486,17 @@ impl YandexMusicClient {
         let artist_ids: Vec<&str> = track.artists.iter().map(|a| a.id.as_str()).collect();
         let query = format!("{} {}", track.artists_string(), track.title);
         if let Some(found) = self.search(&query).await.ok().and_then(|r| r.tracks) {
-            candidates.extend(found.results.into_iter().filter(|t| t.artists.iter().any(|a| artist_ids.contains(&a.id.as_str()))));
+            candidates.extend(found.results.into_iter().filter(|t| {
+                t.artists
+                    .iter()
+                    .any(|a| artist_ids.contains(&a.id.as_str()))
+            }));
         }
-        for t in candidates.into_iter().filter(|t| t.id != track.id && same_title(t)).take(5) {
+        for t in candidates
+            .into_iter()
+            .filter(|t| t.id != track.id && same_title(t))
+            .take(5)
+        {
             if let Some(url) = self.get_track_clip_url(&t.id).await {
                 return Some(url);
             }
@@ -430,7 +512,12 @@ impl YandexMusicClient {
                 headers.insert(AUTHORIZATION, v);
             }
         }
-        let resp = self.client.get("https://quasar.yandex.net/glagol/device_list").headers(headers).send().await?;
+        let resp = self
+            .client
+            .get("https://quasar.yandex.net/glagol/device_list")
+            .headers(headers)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(ApiError::InvalidResponse(format!("HTTP {}", status)));
@@ -444,7 +531,10 @@ impl YandexMusicClient {
                         id: d["id"].as_str().unwrap_or("").to_string(),
                         name: d["name"].as_str().unwrap_or("").to_string(),
                         platform: d["platform"].as_str().unwrap_or("").to_string(),
-                        cert_pem: d["glagol"]["security"]["server_certificate"].as_str().unwrap_or("").to_string(),
+                        cert_pem: d["glagol"]["security"]["server_certificate"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
                     })
                     .collect()
             })
@@ -461,26 +551,53 @@ impl YandexMusicClient {
         }
         let resp = self
             .client
-            .get(format!("https://quasar.yandex.net/glagol/token?device_id={}&platform={}", urlencoding_encode(device_id), urlencoding_encode(platform)))
+            .get(format!(
+                "https://quasar.yandex.net/glagol/token?device_id={}&platform={}",
+                urlencoding_encode(device_id),
+                urlencoding_encode(platform)
+            ))
             .headers(headers)
             .send()
             .await?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().await.unwrap_or_default();
-        v["token"].as_str().map(String::from).ok_or_else(|| ApiError::InvalidResponse(format!("HTTP {}: токен станции не выдан", status)))
+        v["token"].as_str().map(String::from).ok_or_else(|| {
+            ApiError::InvalidResponse(format!("HTTP {}: токен станции не выдан", status))
+        })
     }
 
     /// Раздел «О треке»: пары (заголовок, значение) — исполнитель, авторы, лейбл, источник
-    pub async fn get_track_credits(&self, track_id: &str) -> Result<Vec<(String, String)>, ApiError> {
-        let v: serde_json::Value = self.get_result(&format!("/tracks/{}/credits", track_id)).await?;
+    pub async fn get_track_credits(
+        &self,
+        track_id: &str,
+    ) -> Result<Vec<(String, String)>, ApiError> {
+        let v: serde_json::Value = self
+            .get_result(&format!("/tracks/{}/credits", track_id))
+            .await?;
         Ok(v["credits"]
             .as_array()
-            .map(|a| a.iter().filter_map(|c| Some((c["title"].as_str()?.to_string(), c["value"].as_str()?.to_string()))).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        Some((
+                            c["title"].as_str()?.to_string(),
+                            c["value"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
     /// Загружает обложку плейлиста (multipart, поле `image`); возвращает адрес новой обложки
-    pub async fn upload_playlist_cover(&self, uid: &str, kind: &str, file_name: &str, mime: &str, data: Vec<u8>) -> Result<Option<String>, ApiError> {
+    pub async fn upload_playlist_cover(
+        &self,
+        uid: &str,
+        kind: &str,
+        file_name: &str,
+        mime: &str,
+        data: Vec<u8>,
+    ) -> Result<Option<String>, ApiError> {
         let boundary = "----volna7e1f0c2a";
         let mut body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"{file_name}\"\r\nContent-Type: {mime}\r\n\r\n"
@@ -491,11 +608,15 @@ impl YandexMusicClient {
         let mut headers = self.headers();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}")).map_err(|e| ApiError::InvalidResponse(e.to_string()))?,
+            HeaderValue::from_str(&format!("multipart/form-data; boundary={boundary}"))
+                .map_err(|e| ApiError::InvalidResponse(e.to_string()))?,
         );
         let resp = self
             .client
-            .post(format!("{}/users/{}/playlists/{}/cover/upload", self.base_url, uid, kind))
+            .post(format!(
+                "{}/users/{}/playlists/{}/cover/upload",
+                self.base_url, uid, kind
+            ))
             .headers(headers)
             .body(body)
             .send()
@@ -503,27 +624,52 @@ impl YandexMusicClient {
         let status = resp.status();
         let v: serde_json::Value = resp.json().await.unwrap_or_default();
         if !status.is_success() || v.get("error").is_some() {
-            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, v["error"]["name"].as_str().unwrap_or(""))));
+            return Err(ApiError::InvalidResponse(format!(
+                "HTTP {}: {}",
+                status,
+                v["error"]["name"].as_str().unwrap_or("")
+            )));
         }
-        Ok(v["result"]["ogImage"].as_str().or(v["result"]["cover"]["uri"].as_str()).map(String::from))
+        Ok(v["result"]["ogImage"]
+            .as_str()
+            .or(v["result"]["cover"]["uri"].as_str())
+            .map(String::from))
     }
 
     /// Переименовывает плейлист
-    pub async fn rename_playlist(&self, uid: &str, kind: &str, title: &str) -> Result<(), ApiError> {
-        self.post_form(&format!("/users/{}/playlists/{}/name", uid, kind), &[("value", title.to_string())]).await?;
+    pub async fn rename_playlist(
+        &self,
+        uid: &str,
+        kind: &str,
+        title: &str,
+    ) -> Result<(), ApiError> {
+        self.post_form(
+            &format!("/users/{}/playlists/{}/name", uid, kind),
+            &[("value", title.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
     /// Скачивает mp3 трека целиком
     pub async fn download_track_bytes(&self, track_id: &str) -> Result<Vec<u8>, ApiError> {
         let (url, _) = self.get_track_direct_url(track_id).await?;
-        Ok(self.client.get(&url).send().await?.error_for_status()?.bytes().await?.to_vec())
+        Ok(self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?
+            .to_vec())
     }
 
     /// Сохраняет трек для прослушивания без интернета (внутри приложения)
     pub async fn save_track_offline(&self, track: &Track) -> Result<(), ApiError> {
         let bytes = self.download_track_bytes(&track.id).await?;
-        crate::cache::save_offline(track, &bytes).map_err(|e| ApiError::InvalidResponse(e.to_string()))
+        crate::cache::save_offline(track, &bytes)
+            .map_err(|e| ApiError::InvalidResponse(e.to_string()))
     }
 
     /// Скачивает трек в `~/Music/Волна` и возвращает путь к файлу
@@ -543,44 +689,102 @@ impl YandexMusicClient {
 
     /// Ключи `uid:kind` понравившихся плейлистов
     pub async fn get_liked_playlist_keys(&self, uid: &str) -> Result<Vec<String>, ApiError> {
-        let v: serde_json::Value = self.get_result(&format!("/users/{}/likes/playlists", uid)).await?;
-        let id = |x: &serde_json::Value| x.as_str().map(String::from).or_else(|| x.as_u64().map(|n| n.to_string())).unwrap_or_default();
+        let v: serde_json::Value = self
+            .get_result(&format!("/users/{}/likes/playlists", uid))
+            .await?;
+        let id = |x: &serde_json::Value| {
+            x.as_str()
+                .map(String::from)
+                .or_else(|| x.as_u64().map(|n| n.to_string()))
+                .unwrap_or_default()
+        };
         Ok(v.as_array()
-            .map(|a| a.iter().map(|i| format!("{}:{}", id(&i["playlist"]["uid"]), id(&i["playlist"]["kind"]))).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|i| {
+                        format!(
+                            "{}:{}",
+                            id(&i["playlist"]["uid"]),
+                            id(&i["playlist"]["kind"])
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
     /// Поставить или снять «Нравится» плейлисту (`key` вида `uid:kind`)
-    pub async fn set_playlist_like(&self, uid: &str, key: &str, like: bool) -> Result<(), ApiError> {
+    pub async fn set_playlist_like(
+        &self,
+        uid: &str,
+        key: &str,
+        like: bool,
+    ) -> Result<(), ApiError> {
         let action = if like { "add-multiple" } else { "remove" };
-        self.post_form(&format!("/users/{}/likes/playlists/{}", uid, action), &[("playlist-ids", key.to_string())]).await?;
+        self.post_form(
+            &format!("/users/{}/likes/playlists/{}", uid, action),
+            &[("playlist-ids", key.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
-    pub async fn set_playlist_description(&self, uid: &str, kind: &str, text: &str) -> Result<(), ApiError> {
-        self.post_form(&format!("/users/{}/playlists/{}/description", uid, kind), &[("value", text.to_string())]).await?;
+    pub async fn set_playlist_description(
+        &self,
+        uid: &str,
+        kind: &str,
+        text: &str,
+    ) -> Result<(), ApiError> {
+        self.post_form(
+            &format!("/users/{}/playlists/{}/description", uid, kind),
+            &[("value", text.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
-    pub async fn set_playlist_private(&self, uid: &str, kind: &str, private: bool) -> Result<(), ApiError> {
+    pub async fn set_playlist_private(
+        &self,
+        uid: &str,
+        kind: &str,
+        private: bool,
+    ) -> Result<(), ApiError> {
         let value = if private { "private" } else { "public" };
-        self.post_form(&format!("/users/{}/playlists/{}/visibility", uid, kind), &[("value", value.to_string())]).await?;
+        self.post_form(
+            &format!("/users/{}/playlists/{}/visibility", uid, kind),
+            &[("value", value.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn delete_playlist(&self, uid: &str, kind: &str) -> Result<(), ApiError> {
-        self.post_form(&format!("/users/{}/playlists/{}/delete", uid, kind), &[]).await?;
+        self.post_form(&format!("/users/{}/playlists/{}/delete", uid, kind), &[])
+            .await?;
         Ok(())
     }
 
     /// Добавляет трек в начало плейлиста
-    pub async fn add_track_to_playlist(&self, uid: &str, kind: &str, track: &Track) -> Result<(), ApiError> {
-        self.add_tracks_to_playlist(uid, kind, std::slice::from_ref(track)).await
+    pub async fn add_track_to_playlist(
+        &self,
+        uid: &str,
+        kind: &str,
+        track: &Track,
+    ) -> Result<(), ApiError> {
+        self.add_tracks_to_playlist(uid, kind, std::slice::from_ref(track))
+            .await
     }
 
     /// Добавляет треки в начало плейлиста одним изменением
-    pub async fn add_tracks_to_playlist(&self, uid: &str, kind: &str, tracks: &[Track]) -> Result<(), ApiError> {
-        let pl: serde_json::Value = self.get_result(&format!("/users/{}/playlists/{}", uid, kind)).await?;
+    pub async fn add_tracks_to_playlist(
+        &self,
+        uid: &str,
+        kind: &str,
+        tracks: &[Track],
+    ) -> Result<(), ApiError> {
+        let pl: serde_json::Value = self
+            .get_result(&format!("/users/{}/playlists/{}", uid, kind))
+            .await?;
         let revision = pl["revision"].as_u64().unwrap_or(1);
         let items: Vec<_> = tracks
             .iter()
@@ -589,7 +793,10 @@ impl YandexMusicClient {
         let diff = serde_json::json!([{"op": "insert", "at": 0, "tracks": items}]);
         self.post_form(
             &format!("/users/{}/playlists/{}/change", uid, kind),
-            &[("diff", diff.to_string()), ("revision", revision.to_string())],
+            &[
+                ("diff", diff.to_string()),
+                ("revision", revision.to_string()),
+            ],
         )
         .await?;
         Ok(())
@@ -597,40 +804,58 @@ impl YandexMusicClient {
 
     /// Поиск по запросу: треки, альбомы и плейлисты
     pub async fn search(&self, query: &str) -> Result<SearchResult, ApiError> {
-        self.get_result(&format!("/search?text={}&type=all&page=0", urlencoding_encode(query))).await
+        self.get_result(&format!(
+            "/search?text={}&type=all&page=0",
+            urlencoding_encode(query)
+        ))
+        .await
     }
 
     /// Треки альбома (все тома подряд)
     pub async fn get_album_tracks(&self, album_id: &str) -> Result<Vec<Track>, ApiError> {
-        let album: AlbumWithTracks = self.get_result(&format!("/albums/{}/with-tracks", album_id)).await?;
+        let album: AlbumWithTracks = self
+            .get_result(&format!("/albums/{}/with-tracks", album_id))
+            .await?;
         Ok(album.volumes.into_iter().flatten().collect())
     }
 
     /// Треки плейлиста
     pub async fn get_playlist_tracks(&self, uid: &str, kind: &str) -> Result<Vec<Track>, ApiError> {
-        let playlist: PlaylistWithTracks = self.get_result(&format!("/users/{}/playlists/{}", uid, kind)).await?;
-        Ok(playlist.tracks.into_iter().filter_map(|t| t.track).collect())
+        let playlist: PlaylistWithTracks = self
+            .get_result(&format!("/users/{}/playlists/{}", uid, kind))
+            .await?;
+        Ok(playlist
+            .tracks
+            .into_iter()
+            .filter_map(|t| t.track)
+            .collect())
     }
 
     /// Плейлисты пользователя
     pub async fn get_user_playlists(&self, uid: &str) -> Result<Vec<Playlist>, ApiError> {
-        self.get_result(&format!("/users/{}/playlists/list", uid)).await
+        self.get_result(&format!("/users/{}/playlists/list", uid))
+            .await
     }
 
     /// Любимые альбомы пользователя
     pub async fn get_liked_albums(&self, uid: &str) -> Result<Vec<Album>, ApiError> {
-        let items: Vec<LikedAlbumItem> = self.get_result(&format!("/users/{}/likes/albums?rich=true", uid)).await?;
+        let items: Vec<LikedAlbumItem> = self
+            .get_result(&format!("/users/{}/likes/albums?rich=true", uid))
+            .await?;
         Ok(items.into_iter().map(|i| i.album).collect())
     }
 
     /// Страница артиста: популярные треки и альбомы
     pub async fn get_artist_brief(&self, artist_id: &str) -> Result<ArtistBrief, ApiError> {
-        self.get_result(&format!("/artists/{}/brief-info", artist_id)).await
+        self.get_result(&format!("/artists/{}/brief-info", artist_id))
+            .await
     }
 
     /// Похожие на трек
     pub async fn get_similar_tracks(&self, track_id: &str) -> Result<Vec<Track>, ApiError> {
-        let similar: SimilarTracks = self.get_result(&format!("/tracks/{}/similar", track_id)).await?;
+        let similar: SimilarTracks = self
+            .get_result(&format!("/tracks/{}/similar", track_id))
+            .await?;
         Ok(similar.similar_tracks)
     }
 
@@ -641,9 +866,16 @@ impl YandexMusicClient {
                 return Ok(uid.clone());
             }
         }
-        let uid = self.get_account_status().await?.account.map(|a| a.uid).unwrap_or_default();
+        let uid = self
+            .get_account_status()
+            .await?
+            .account
+            .map(|a| a.uid)
+            .unwrap_or_default();
         if uid.is_empty() {
-            return Err(ApiError::InvalidResponse("не удалось определить UID пользователя".into()));
+            return Err(ApiError::InvalidResponse(
+                "не удалось определить UID пользователя".into(),
+            ));
         }
         if let Ok(mut c) = self.cached_uid.lock() {
             *c = Some(uid.clone());
@@ -654,17 +886,15 @@ impl YandexMusicClient {
     /// Получение статуса аккаунта пользователя (включая UID)
     pub async fn get_account_status(&self) -> Result<AccountStatus, ApiError> {
         let url = format!("{}/account/status", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(self.headers()).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+            return Err(ApiError::InvalidResponse(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         let api_response: YandexApiResponse<AccountStatus> = resp.json().await?;
@@ -674,21 +904,23 @@ impl YandexMusicClient {
     /// Получение любимых треков («Мне нравится»)
     pub async fn get_liked_tracks(&self, uid: &str) -> Result<Vec<Track>, ApiError> {
         let url = format!("{}/users/{}/likes/tracks", self.base_url, uid);
-        let resp = self
-            .client
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await?;
+        let resp = self.client.get(&url).headers(self.headers()).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::InvalidResponse(format!("HTTP {}: {}", status, body)));
+            return Err(ApiError::InvalidResponse(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         let liked_resp: YandexApiResponse<LikedTracksResult> = resp.json().await?;
-        let track_items = liked_resp.result.library.map(|l| l.tracks).unwrap_or_default();
+        let track_items = liked_resp
+            .result
+            .library
+            .map(|l| l.tracks)
+            .unwrap_or_default();
         if track_items.is_empty() {
             return Ok(Vec::new());
         }
@@ -727,13 +959,20 @@ impl YandexMusicClient {
             let sent = self
                 .client
                 .get(url)
-                .header("User-Agent", "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)")
+                .header(
+                    "User-Agent",
+                    "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
+                )
                 .send()
                 .await;
             match sent {
                 Ok(r) if r.status().is_success() => return LrclibFetch::Found(r),
-                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => return LrclibFetch::NotFound,
-                _ => tokio::time::sleep(std::time::Duration::from_millis(700 * (attempt + 1))).await,
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                    return LrclibFetch::NotFound;
+                }
+                _ => {
+                    tokio::time::sleep(std::time::Duration::from_millis(700 * (attempt + 1))).await
+                }
             }
         }
         LrclibFetch::Failed
@@ -785,16 +1024,44 @@ impl YandexMusicClient {
 
         if let Some(response) = resp {
             if let Ok(data) = response.json::<LrclibResponse>().await {
-                if let Some(synced) = data.synced_lyrics {
-                    let trimmed = synced.trim();
-                    if usable_synced(trimmed) {
-                        return Ok(Some(trimmed.to_string()));
+                // `/api/get` отвечает и на нечёткий запрос: чужую запись под своим названием
+                // показывать нельзя, поэтому сверяем название, исполнителя и длительность
+                let record_matches = data
+                    .track_name
+                    .as_deref()
+                    .is_none_or(|n| crate::api::lrclib::same_song_title(n, clean_title))
+                    && data
+                        .artist_name
+                        .as_deref()
+                        .is_none_or(|n| crate::api::lrclib::same_artist_name(n, clean_artist))
+                    && match (data.duration, duration_secs) {
+                        (Some(got), Some(want)) => (got - want as f64).abs() <= 4.0,
+                        _ => true,
                     }
+                    && !crate::api::lrclib::looks_like_foreign_song(
+                        data.synced_lyrics.as_deref().unwrap_or(""),
+                        duration_secs,
+                    );
+                if !record_matches {
+                    println!(
+                        "[lyrics] LRCLIB /api/get: «{}» / «{}» ({} с) — не тот трек",
+                        data.track_name.as_deref().unwrap_or("?"),
+                        data.artist_name.as_deref().unwrap_or("?"),
+                        data.duration.unwrap_or(0.0)
+                    );
                 }
-                if let Some(plain) = data.plain_lyrics {
-                    let trimmed = plain.trim();
-                    if !trimmed.is_empty() {
-                        plain_fallback = Some(trimmed.to_string());
+                if record_matches {
+                    if let Some(synced) = data.synced_lyrics {
+                        let trimmed = synced.trim();
+                        if usable_synced(trimmed) {
+                            return Ok(Some(trimmed.to_string()));
+                        }
+                    }
+                    if let Some(plain) = data.plain_lyrics {
+                        let trimmed = plain.trim();
+                        if !trimmed.is_empty() {
+                            plain_fallback = Some(trimmed.to_string());
+                        }
                     }
                 }
             }
@@ -802,16 +1069,29 @@ impl YandexMusicClient {
 
         // Точное совпадение дало только обычный текст: ищем запись с таймингами (в базе она бывает
         // отдельно, иногда с перепутанными названием и исполнителем)
-        if let Some(synced) = self.lrclib_search_synced(clean_artist, clean_title, duration_secs).await {
+        if let Some(synced) = self
+            .lrclib_search_synced(clean_artist, clean_title, duration_secs)
+            .await
+        {
             return Ok(Some(synced));
         }
         Ok(plain_fallback)
     }
 
     /// Поиск в LRCLIB записи с синхронизированным текстом той же длительности (±3 с)
-    async fn lrclib_search_synced(&self, artist: &str, title: &str, duration_secs: Option<u64>) -> Option<String> {
-        let url = format!("https://lrclib.net/api/search?q={}", urlencoding_encode(&format!("{title} {artist}")));
-        let LrclibFetch::Found(resp) = self.lrclib_get(&url).await else { return None };
+    async fn lrclib_search_synced(
+        &self,
+        artist: &str,
+        title: &str,
+        duration_secs: Option<u64>,
+    ) -> Option<String> {
+        let url = format!(
+            "https://lrclib.net/api/search?q={}",
+            urlencoding_encode(&format!("{title} {artist}"))
+        );
+        let LrclibFetch::Found(resp) = self.lrclib_get(&url).await else {
+            return None;
+        };
         let items: Vec<serde_json::Value> = resp.json().await.ok()?;
         let (title_n, artist_n) = (normalize_name(title), normalize_name(artist));
         // исполнители у нас через запятую, в LRCLIB бывает один из них: хватает совпадения по первому
@@ -833,7 +1113,8 @@ impl YandexMusicClient {
             let field = |k: &str| normalize_name(v[k].as_str().unwrap_or(""));
             let (t, a) = (field("trackName"), field("artistName"));
             let raw = v["artistName"].as_str().unwrap_or("").to_lowercase();
-            (t == title_n && same_artist(&a, &raw)) || (!artist_n.is_empty() && t == artist_n && a == title_n)
+            (t == title_n && same_artist(&a, &raw))
+                || (!artist_n.is_empty() && t == artist_n && a == title_n)
         };
         items
             .iter()
@@ -842,13 +1123,31 @@ impl YandexMusicClient {
                 (Some(want), Some(got)) => (got - want as f64).abs() <= 3.0,
                 _ => true,
             })
-            .find_map(|v| v["syncedLyrics"].as_str().map(str::trim).filter(|t| usable_synced(t)).map(String::from))
+            .filter(|v| {
+                !crate::api::lrclib::looks_like_foreign_song(
+                    v["syncedLyrics"].as_str().unwrap_or(""),
+                    duration_secs,
+                )
+            })
+            .find_map(|v| {
+                v["syncedLyrics"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|t| usable_synced(t))
+                    .map(String::from)
+            })
     }
 
     /// Ссылка на превью-клип трека из `/supplement` (поле `clips[0].previewUrl`); у многих треков клипа нет
     pub async fn get_track_clip_url(&self, track_id: &str) -> Option<String> {
         let url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
-        let resp = self.client.get(&url).headers(self.headers()).send().await.ok()?;
+        let resp = self
+            .client
+            .get(&url)
+            .headers(self.headers())
+            .send()
+            .await
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }
@@ -886,7 +1185,13 @@ impl YandexMusicClient {
         // 1. Текст из /tracks/{track_id}/supplement (без подписи)
         if yandex_plain.is_none() {
             let supp_url = format!("{}/tracks/{}/supplement", self.base_url, track_id);
-            if let Ok(resp) = self.client.get(&supp_url).headers(self.headers()).send().await {
+            if let Ok(resp) = self
+                .client
+                .get(&supp_url)
+                .headers(self.headers())
+                .send()
+                .await
+            {
                 if resp.status().is_success() {
                     if let Ok(supp) = resp.json::<YandexApiResponse<TrackSupplement>>().await {
                         if let Some(full) = supp.result.lyrics.and_then(|l| l.full_lyrics) {
@@ -1074,13 +1379,25 @@ fn normalize_name(s: &str) -> String {
     let no_brackets: String = s
         .chars()
         .filter(|c| match c {
-            '(' | '[' => { depth += 1; false }
-            ')' | ']' => { depth = depth.saturating_sub(1); false }
+            '(' | '[' => {
+                depth += 1;
+                false
+            }
+            ')' | ']' => {
+                depth = depth.saturating_sub(1);
+                false
+            }
             _ => depth == 0,
         })
         .collect();
     let head = no_brackets.split(" - ").next().unwrap_or("");
-    head.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+    head.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Простое URL кодирование строки
@@ -1117,15 +1434,43 @@ mod tests {
     async fn lyrics_coverage_live() {
         let client = YandexMusicClient::new(crate::api::auth::load_token());
         let (mut total, mut synced) = (0, 0);
-        for q in ["Три дня дождя", "Radiohead", "Katy Perry", "Скриптонит", "Imagine Dragons", "Монеточка"] {
-            let tracks = client.search(q).await.unwrap().tracks.map(|t| t.results).unwrap_or_default();
+        for q in [
+            "Три дня дождя",
+            "Radiohead",
+            "Katy Perry",
+            "Скриптонит",
+            "Imagine Dragons",
+            "Монеточка",
+        ] {
+            let tracks = client
+                .search(q)
+                .await
+                .unwrap()
+                .tracks
+                .map(|t| t.results)
+                .unwrap_or_default();
             for t in tracks.iter().take(8) {
                 let dur = t.duration_ms.map(|d| d / 1000);
-                let got = client.get_lrclib_lyrics(&t.artists_string(), &t.title, dur).await.ok().flatten();
+                let got = client
+                    .get_lrclib_lyrics(&t.artists_string(), &t.title, dur)
+                    .await
+                    .ok()
+                    .flatten();
                 let ok = got.as_deref().is_some_and(|x| !parse_lrc(x).is_empty());
                 total += 1;
                 synced += ok as u32;
-                if !ok { println!("БЕЗ ТАЙМИНГОВ: {} — {} ({})", t.artists_string(), t.title, if got.is_some() { "есть обычный текст" } else { "текста нет" }); }
+                if !ok {
+                    println!(
+                        "БЕЗ ТАЙМИНГОВ: {} — {} ({})",
+                        t.artists_string(),
+                        t.title,
+                        if got.is_some() {
+                            "есть обычный текст"
+                        } else {
+                            "текста нет"
+                        }
+                    );
+                }
             }
         }
         println!("LIVE coverage: {synced} из {total}");
@@ -1136,7 +1481,11 @@ mod tests {
     #[ignore]
     async fn lyrics_swapped_live() {
         let client = YandexMusicClient::new(crate::api::auth::load_token());
-        let text = client.get_lrclib_lyrics("Три дня дождя", "Сотни гортензий", Some(169)).await.unwrap().unwrap();
+        let text = client
+            .get_lrclib_lyrics("Три дня дождя", "Сотни гортензий", Some(169))
+            .await
+            .unwrap()
+            .unwrap();
         println!("LIVE swapped: synced_lines={}", parse_lrc(&text).len());
         assert!(!parse_lrc(&text).is_empty());
     }
@@ -1146,10 +1495,24 @@ mod tests {
     #[ignore]
     async fn colors_live() {
         let client = YandexMusicClient::new(crate::api::auth::load_token());
-        for q in ["Сплин Линия жизни", "Серега Пират Я поднимаю свою голову вверх"] {
-            let t = client.search(q).await.unwrap().tracks.map(|t| t.results).unwrap_or_default();
+        for q in [
+            "Сплин Линия жизни",
+            "Серега Пират Я поднимаю свою голову вверх",
+        ] {
+            let t = client
+                .search(q)
+                .await
+                .unwrap()
+                .tracks
+                .map(|t| t.results)
+                .unwrap_or_default();
             if let Some(t) = t.first() {
-                println!("LIVE {} — {}: {:?}", t.artists_string(), t.title, t.derived_colors);
+                println!(
+                    "LIVE {} — {}: {:?}",
+                    t.artists_string(),
+                    t.title,
+                    t.derived_colors
+                );
             }
         }
     }
@@ -1171,15 +1534,27 @@ mod tests {
     #[ignore]
     async fn lyrics_live() {
         let client = YandexMusicClient::new(crate::api::auth::load_token());
-        let supp = client.get_track_lyrics("5705627", "Deftones", "Rosemary", Some(413)).await;
+        let supp = client
+            .get_track_lyrics("5705627", "Deftones", "Rosemary", Some(413))
+            .await;
         match supp {
-            Ok(Some(text)) => println!("LIVE lyrics: synced_lines={} first={:?}", parse_lrc(&text).len(), text.lines().next()),
+            Ok(Some(text)) => println!(
+                "LIVE lyrics: synced_lines={} first={:?}",
+                parse_lrc(&text).len(),
+                text.lines().next()
+            ),
             Ok(None) => println!("LIVE lyrics: none"),
             Err(e) => println!("LIVE lyrics error: {e}"),
         }
-        let lr = client.get_lrclib_lyrics("Deftones", "Rosemary", Some(413)).await;
+        let lr = client
+            .get_lrclib_lyrics("Deftones", "Rosemary", Some(413))
+            .await;
         match lr {
-            Ok(Some(text)) => println!("LIVE lrclib: synced_lines={} first={:?}", parse_lrc(&text).len(), text.lines().next()),
+            Ok(Some(text)) => println!(
+                "LIVE lrclib: synced_lines={} first={:?}",
+                parse_lrc(&text).len(),
+                text.lines().next()
+            ),
             Ok(None) => println!("LIVE lrclib: none"),
             Err(e) => println!("LIVE lrclib error: {e}"),
         }
@@ -1187,12 +1562,40 @@ mod tests {
 
     #[test]
     fn quality_picks_expected_stream() {
-        let mk = |codec: &str, kbps| DownloadInfo { codec: codec.into(), bitrate_in_kbps: kbps, download_info_url: String::new(), direct: false };
-        let infos = vec![mk("mp3", 192), mk("aac", 256), mk("mp3", 64), mk("mp3", 128)];
-        assert_eq!(pick_download_info(&infos, "best").unwrap().bitrate_in_kbps, 192);
-        assert_eq!(pick_download_info(&infos, "economy").unwrap().bitrate_in_kbps, 64);
-        assert_eq!(pick_download_info(&infos, "balanced").unwrap().bitrate_in_kbps, 128);
-        assert_eq!(pick_download_info(&[mk("mp3", 192)], "economy").unwrap().bitrate_in_kbps, 192);
+        let mk = |codec: &str, kbps| DownloadInfo {
+            codec: codec.into(),
+            bitrate_in_kbps: kbps,
+            download_info_url: String::new(),
+            direct: false,
+        };
+        let infos = vec![
+            mk("mp3", 192),
+            mk("aac", 256),
+            mk("mp3", 64),
+            mk("mp3", 128),
+        ];
+        assert_eq!(
+            pick_download_info(&infos, "best").unwrap().bitrate_in_kbps,
+            192
+        );
+        assert_eq!(
+            pick_download_info(&infos, "economy")
+                .unwrap()
+                .bitrate_in_kbps,
+            64
+        );
+        assert_eq!(
+            pick_download_info(&infos, "balanced")
+                .unwrap()
+                .bitrate_in_kbps,
+            128
+        );
+        assert_eq!(
+            pick_download_info(&[mk("mp3", 192)], "economy")
+                .unwrap()
+                .bitrate_in_kbps,
+            192
+        );
     }
 
     use super::*;
@@ -1208,8 +1611,14 @@ mod tests {
         </download-info>
         "#;
 
-        assert_eq!(extract_xml_tag(sample_xml, "host"), Some("storage.mds.yandex.net"));
-        assert_eq!(extract_xml_tag(sample_xml, "path"), Some("/get-mp3/hash/state/track/456"));
+        assert_eq!(
+            extract_xml_tag(sample_xml, "host"),
+            Some("storage.mds.yandex.net")
+        );
+        assert_eq!(
+            extract_xml_tag(sample_xml, "path"),
+            Some("/get-mp3/hash/state/track/456")
+        );
         assert_eq!(extract_xml_tag(sample_xml, "ts"), Some("1728840000"));
         assert_eq!(extract_xml_tag(sample_xml, "s"), Some("secret123"));
         assert_eq!(extract_xml_tag(sample_xml, "nonexistent"), None);
@@ -1223,14 +1632,19 @@ mod tests {
 
     #[test]
     fn strip_lrc_tags_keeps_text() {
-        assert_eq!(strip_lrc_tags("[00:12.42] There is a nightcall\nplain"), "There is a nightcall\nplain");
+        assert_eq!(
+            strip_lrc_tags("[00:12.42] There is a nightcall\nplain"),
+            "There is a nightcall\nplain"
+        );
         assert!(parse_lrc(&strip_lrc_tags("[00:12.42] There is a nightcall")).is_empty());
     }
 
     #[test]
     fn one_line_lrc_is_not_usable() {
         assert!(!usable_synced("[00:12.42] There is a nightcall"));
-        assert!(usable_synced("[00:01.00] a\n[00:02.00] b\n[00:03.00] c\n[00:04.00] d"));
+        assert!(usable_synced(
+            "[00:01.00] a\n[00:02.00] b\n[00:03.00] c\n[00:04.00] d"
+        ));
     }
 
     #[test]

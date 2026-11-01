@@ -76,18 +76,29 @@ pub fn cover_url(uri: &str, size: u32) -> String {
 
 impl Artist {
     pub fn cover_url(&self, size: u32) -> Option<String> {
-        self.cover.as_ref()?.uri.as_deref().map(|u| cover_url(u, size))
+        self.cover
+            .as_ref()?
+            .uri
+            .as_deref()
+            .map(|u| cover_url(u, size))
     }
 }
 
 impl Album {
     pub fn cover_url(&self, size: u32) -> Option<String> {
-        self.cover_uri.as_ref().or(self.og_image.as_ref()).map(|u| cover_url(u, size))
+        self.cover_uri
+            .as_ref()
+            .or(self.og_image.as_ref())
+            .map(|u| cover_url(u, size))
     }
 
     /// Имена артистов через запятую
     pub fn artists_string(&self) -> String {
-        self.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+        self.artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -210,8 +221,17 @@ impl Track {
     /// Название для Pango-разметки: версия («Slowed») идёт следом приглушённым цветом
     pub fn title_markup(&self) -> String {
         let t = gtk4::glib::markup_escape_text(&self.title);
-        match self.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-            Some(v) => format!("{} <span alpha=\"55%\">{}</span>", t, gtk4::glib::markup_escape_text(v)),
+        match self
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            Some(v) => format!(
+                "{} <span alpha=\"55%\">{}</span>",
+                t,
+                gtk4::glib::markup_escape_text(v)
+            ),
             None => t.to_string(),
         }
     }
@@ -240,7 +260,10 @@ impl Track {
         if self.source == TrackSource::YouTubeMusic && self.id.len() == 11 {
             return Some(format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", self.id));
         }
-        self.cover_uri.as_ref().or(self.og_image.as_ref()).map(|u| cover_url(u, size))
+        self.cover_uri
+            .as_ref()
+            .or(self.og_image.as_ref())
+            .map(|u| cover_url(u, size))
     }
 
     /// Возвращает длительность в формате "MM:SS" или пустую строку, если неизвестна
@@ -377,7 +400,10 @@ impl<'de> Deserialize<'de> for RotorFeedbackType {
             "skip" => Ok(Self::Skip),
             "like" => Ok(Self::Like),
             "dislike" => Ok(Self::Dislike),
-            _ => Err(serde::de::Error::custom(format!("Unknown feedback type: {}", s))),
+            _ => Err(serde::de::Error::custom(format!(
+                "Unknown feedback type: {}",
+                s
+            ))),
         }
     }
 }
@@ -535,6 +561,14 @@ pub struct TrackLyricsResult {
 /// Ответ от открытой базы караоке LRCLIB (https://lrclib.net)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LrclibResponse {
+    /// Кому на самом деле принадлежит запись: `/api/get` ищет по нечёткому совпадению,
+    /// поэтому перед показом текста название и исполнителя надо сверить со своими
+    #[serde(rename = "trackName", alias = "track_name", default)]
+    pub track_name: Option<String>,
+    #[serde(rename = "artistName", alias = "artist_name", default)]
+    pub artist_name: Option<String>,
+    #[serde(default)]
+    pub duration: Option<f64>,
     #[serde(rename = "syncedLyrics", alias = "synced_lyrics")]
     pub synced_lyrics: Option<String>,
     #[serde(rename = "plainLyrics", alias = "plain_lyrics")]
@@ -563,10 +597,33 @@ pub fn fix_mojibake(text: &str) -> String {
     // единицы cp1252 в диапазоне 0x80–0x9F, которых нет в Latin-1
     fn byte_of(c: char) -> Option<u8> {
         let b = match c {
-            '€' => 0x80, '‚' => 0x82, 'ƒ' => 0x83, '„' => 0x84, '…' => 0x85, '†' => 0x86, '‡' => 0x87,
-            'ˆ' => 0x88, '‰' => 0x89, 'Š' => 0x8A, '‹' => 0x8B, 'Œ' => 0x8C, 'Ž' => 0x8E, '‘' => 0x91,
-            '’' => 0x92, '“' => 0x93, '”' => 0x94, '•' => 0x95, '–' => 0x96, '—' => 0x97, '˜' => 0x98,
-            '™' => 0x99, 'š' => 0x9A, '›' => 0x9B, 'œ' => 0x9C, 'ž' => 0x9E, 'Ÿ' => 0x9F,
+            '€' => 0x80,
+            '‚' => 0x82,
+            'ƒ' => 0x83,
+            '„' => 0x84,
+            '…' => 0x85,
+            '†' => 0x86,
+            '‡' => 0x87,
+            'ˆ' => 0x88,
+            '‰' => 0x89,
+            'Š' => 0x8A,
+            '‹' => 0x8B,
+            'Œ' => 0x8C,
+            'Ž' => 0x8E,
+            '‘' => 0x91,
+            '’' => 0x92,
+            '“' => 0x93,
+            '”' => 0x94,
+            '•' => 0x95,
+            '–' => 0x96,
+            '—' => 0x97,
+            '˜' => 0x98,
+            '™' => 0x99,
+            'š' => 0x9A,
+            '›' => 0x9B,
+            'œ' => 0x9C,
+            'ž' => 0x9E,
+            'Ÿ' => 0x9F,
             c if (c as u32) <= 0xFF => c as u32 as u8,
             _ => return None,
         };
@@ -613,8 +670,14 @@ mod tests {
     #[test]
     fn mojibake_is_repaired_per_line() {
         use super::fix_mojibake;
-        assert_eq!(fix_mojibake("But you can\u{e2}\u{20ac}\u{2122}t put your finger"), "But you can’t put your finger");
-        assert_eq!(fix_mojibake("But you can't put your finger"), "But you can't put your finger");
+        assert_eq!(
+            fix_mojibake("But you can\u{e2}\u{20ac}\u{2122}t put your finger"),
+            "But you can’t put your finger"
+        );
+        assert_eq!(
+            fix_mojibake("But you can't put your finger"),
+            "But you can't put your finger"
+        );
         // нормальные «â» и «Ã» не портим
         assert_eq!(fix_mojibake("Voilà, âge"), "Voilà, âge");
         assert_eq!(fix_mojibake("Привет"), "Привет");
@@ -712,7 +775,8 @@ mod tests {
     fn test_search_duplicate_keys() {
         // Яндекс отдаёт `albums` дважды: через Value (как в client.rs) разбор должен проходить
         let v: serde_json::Value =
-            serde_json::from_str(r#"{"result":{"albums":{"results":[]},"albums":{"results":[]}}}"#).unwrap();
+            serde_json::from_str(r#"{"result":{"albums":{"results":[]},"albums":{"results":[]}}}"#)
+                .unwrap();
         let r: YandexApiResponse<SearchResult> = serde_json::from_value(v).unwrap();
         assert!(r.result.albums.is_some());
     }

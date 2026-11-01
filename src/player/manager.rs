@@ -2205,7 +2205,25 @@ fn spawn_cover_and_lyrics(
     let duration = track.duration_ms.map(|d| d / 1000);
     let track_source = track.source;
     tokio::spawn(async move {
-        let text = if track_source == crate::api::models::TrackSource::YouTubeMusic || track_id.len() == 11 {
+        // Клиент YouTube Music нужен и для длительности, и для фолбэка на официальный текст
+        let ytm = crate::api::ytmusic::YtMusicClient::new();
+        let is_yt = track_source == crate::api::models::TrackSource::YouTubeMusic || track_id.len() == 11;
+
+        // Поиск без фильтра «Песни» не отдаёт длительность, а без неё нельзя отличить разметку
+        // от другой версии от текста совсем другой песни. Уточняем её у самого трека.
+        let duration = match duration {
+            Some(secs) => Some(secs),
+            None if is_yt => {
+                let secs = ytm.track_duration_secs(&track_id).await;
+                if let Some(secs) = secs {
+                    println!("[lyrics] Длительность «{}» уточнена: {} с", title, secs);
+                }
+                secs
+            }
+            None => None,
+        };
+
+        let text = if is_yt {
             static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
             let http = HTTP.get_or_init(|| {
                 reqwest::Client::builder()
@@ -2217,15 +2235,26 @@ fn spawn_cover_and_lyrics(
             // 1. Проверяем кэш: если в кэше есть синхронизированное караоке с таймкодами — отдаем мгновенно!
             let cache_path = crate::cache::lyrics_cache_path(&track_id);
             let mut cached_plain = None;
+            let mut had_stale_synced = false;
             if let Ok(cached) = std::fs::read_to_string(&cache_path) {
                 let trimmed = cached.trim();
-                if crate::api::lrclib::usable_synced(trimmed) {
+                if crate::api::lrclib::looks_like_foreign_song(trimmed, duration) {
+                    // В кэше текст другой песни (кэш ключуется одним id трека): такой не показываем
+                    // ни с таймкодами, ни без них — иначе под «Dear Diary,» висит чужой текст
+                    let _ = std::fs::remove_file(&cache_path);
+                    println!("[lyrics] Кэш {} отброшен: размечен под другой трек", track_id);
+                } else if crate::api::lrclib::usable_synced_at(trimmed, duration) {
                     if generation.load(Ordering::SeqCst) == epoch {
                         emit_all(&senders, PlayerUiEvent::LyricsUpdated(trimmed.to_string()));
                     }
                     return;
                 } else if !trimmed.is_empty() {
-                    cached_plain = Some(trimmed.to_string());
+                    // Разметка не от этого трека (текст верный, таймлайн длиннее) — таймкоды выбрасываем,
+                    // иначе подсветка уезжает от музыки. Сам файл не затираем: вдруг длительность врёт
+                    if crate::api::lrclib::usable_synced(trimmed) {
+                        had_stale_synced = true;
+                    }
+                    cached_plain = Some(crate::api::lrclib::demote_stale_synced(trimmed, duration));
                 }
             }
 
@@ -2234,43 +2263,71 @@ fn spawn_cover_and_lyrics(
             let lrclib_res = tokio::time::timeout(std::time::Duration::from_secs(8), lrclib_fut).await.ok().flatten();
 
             let mut final_text = None;
-            if let Some(lr_text) = lrclib_res {
+            if lrclib_res
+                .as_deref()
+                .is_some_and(|t| crate::api::lrclib::looks_like_foreign_song(t.trim(), duration))
+            {
+                println!("[lyrics] LRCLIB отдал текст другого трека — пропускаем");
+            } else if let Some(lr_text) = lrclib_res {
                 let trimmed = lr_text.trim();
-                if crate::api::lrclib::usable_synced(trimmed) {
+                if crate::api::lrclib::usable_synced_at(trimmed, duration) {
                     let _ = std::fs::write(&cache_path, trimmed);
                     final_text = Some(trimmed.to_string());
                 } else if !trimmed.is_empty() {
-                    final_text = Some(trimmed.to_string());
+                    final_text = Some(crate::api::lrclib::demote_stale_synced(trimmed, duration));
                 }
             }
 
             // 3. Если в LRCLIB нет синхронизированных таймкодов (или сервис временно недоступен) —
             // пробуем найти караоке в каталоге Яндекс Музыки!
-            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced(t)) {
+            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration)) {
                 let clean_title = crate::api::lrclib::clean_title_for_lyrics(&title);
                 let query = format!("{} {}", artist, clean_title);
                 if let Ok(search_res) = client.search(&query).await {
                     if let Some(tracks) = search_res.tracks {
-                        if let Some(y_track) = tracks.results.into_iter().next() {
+                        // Первый результат поиска вполне может быть другой песней того же
+                        // исполнителя — её текст нельзя выдавать за текст текущего трека
+                        let found = tracks.results.into_iter().next().filter(|t| {
+                            crate::api::lrclib::same_song_title(&t.title, &title)
+                                && crate::api::lrclib::same_artist_name(&t.artists_string(), &artist)
+                        });
+                        match found {
+                            Some(y_track) => {
+                            println!(
+                                "[lyrics] Яндекс: «{}» / {}",
+                                y_track.title,
+                                y_track.artists_string()
+                            );
                             if let Ok(Some(y_lyrics)) = client.get_track_lyrics(&y_track.id, &artist, &title, duration).await {
                                 let trimmed = y_lyrics.trim();
-                                if crate::api::lrclib::usable_synced(trimmed) {
+                                if crate::api::lrclib::looks_like_foreign_song(trimmed, duration) {
+                                    println!("[lyrics] Яндекс: разметка не от этого трека — пропускаем");
+                                } else
+                                if crate::api::lrclib::usable_synced_at(trimmed, duration) {
                                     let _ = std::fs::write(&cache_path, trimmed);
                                     final_text = Some(trimmed.to_string());
                                 }
                             }
+                            }
+                            None => println!(
+                                "[lyrics] Яндекс: подходящего трека не нашлось — фолбэк пропущен"
+                            ),
                         }
                     }
                 }
             }
 
             // 4. Если караоке с таймкодами не нашлось — фолбэк на официальный текст YouTube Music
-            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced(t)) {
-                let ytm = crate::api::ytmusic::YtMusicClient::new();
+            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration)) {
                 if let Some(yt_text) = ytm.get_yt_lyrics(&track_id).await {
                     let trimmed = yt_text.trim();
+                    println!("[lyrics] YouTube Music: официальный текст, {} симв.", trimmed.chars().count());
                     if !trimmed.is_empty() {
-                        let _ = std::fs::write(&cache_path, trimmed);
+                        // Отвергнутую разметку статикой не затираем: длительность могла быть неверной,
+                        // и при следующей проверке таймлайн ещё пригодится
+                        if !had_stale_synced {
+                            let _ = std::fs::write(&cache_path, trimmed);
+                        }
                         final_text = Some(trimmed.to_string());
                     }
                 }
@@ -2666,6 +2723,7 @@ mod like_tests {
             event_senders: Arc::new(Mutex::new(Vec::new())),
             cast: Arc::default(),
             prefetch: Arc::default(),
+            prefetch_inflight: Arc::default(),
             generation: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
         };

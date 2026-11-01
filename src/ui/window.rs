@@ -1112,6 +1112,8 @@ impl VolnaWindow {
             let active_label: Rc<RefCell<Option<Label>>> = Rc::default();
             let last_sec = Rc::new(std::cell::Cell::new(u64::MAX));
             let last_active = Rc::new(std::cell::Cell::new(usize::MAX));
+            // О чужих таймингах сообщаем один раз, а не 20 раз в секунду
+            let stale_logged = Rc::new(std::cell::Cell::new(false));
 
             {
                 let (sc, active) = (lyrics_scrolled.clone(), active_label.clone());
@@ -1224,7 +1226,20 @@ impl VolnaWindow {
                         // Синхронизация караоке и индикатор обратного отсчета 3..2..1
                         let lines = l_data.borrow();
                         let labels = l_labels.borrow();
-                        if !lines.is_empty() && lines.len() == labels.len() {
+                        // Страховка: если последняя строка размечена заметно дальше конца трека,
+                        // это текст другой песни — караоке по нему не ведём
+                        let stale_timeline = player_clone.duration_seconds().is_some_and(|d| {
+                            lines
+                                .last()
+                                .is_some_and(|l| crate::api::lrclib::timeline_too_long(l.time_ms, d))
+                        });
+                        if stale_timeline && !stale_logged.replace(true) {
+                            eprintln!(
+                                "[lyrics] Тайминги длиннее трека ({} с) — караоке отключено",
+                                player_clone.duration_seconds().unwrap_or(0)
+                            );
+                        }
+                        if !lines.is_empty() && lines.len() == labels.len() && !stale_timeline {
                             // Проверяем обратный отсчет ИСКЛЮЧИТЕЛЬНО перед первой строкой в начале песни
                             let next_line_info = match lines.iter().position(|l| l.time_ms > pos_ms) {
                                 Some(0) => Some(lines[0].time_ms),
