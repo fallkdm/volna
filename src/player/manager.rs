@@ -882,7 +882,12 @@ impl PlayerManager {
         let remaining = total.saturating_sub(idx + 1);
         let is_wave = self.state.lock().unwrap().wave;
         let refill_needed = self.wave_engine.lock().unwrap().refill_needed(total, idx);
-        if is_wave && (remaining <= 3 || refill_needed) {
+        // Seed Drift не ждёт исчерпания хвоста: иначе сид застревает на весь текущий
+        // батч, то есть на десятки треков. Только для YouTube Music: у Яндекса понятия
+        // «сид» нет, и лишние догрузки там ни к чему.
+        let drift_due = self.providers.current().provider_id() == ProviderId::YouTubeMusic
+            && self.wave_engine.lock().unwrap().seed_drift_due();
+        if is_wave && (remaining <= 3 || refill_needed || drift_due) {
             self.load_more_wave_tracks();
         }
 
@@ -1033,20 +1038,78 @@ impl PlayerManager {
                 if !provider.is_authenticated() {
                     return;
                 }
-                if let Ok(station_batch) = provider.get_station_tracks(&station_id, batch_id.as_deref()).await {
-                    if station_batch.tracks.is_empty() {
-                        return;
+
+                // Seed Drift: один и тот же «RDAMVM» сид бесконечно выдаёт всё более узкий
+                // поджанровый пузырь. Через каждые N сыгранных треков переезжаем на свежий
+                // сид — от того трека, который слушатель слышит сейчас.
+                let drift_due = {
+                    let mut engine = wave_engine_clone.lock().unwrap();
+                    let due = engine.seed_drift_due();
+                    if due {
+                        // Счётчик гасим до запроса: параллельные догрузки не должны
+                        // стартовать два разных сида на одном переходе.
+                        engine.mark_seed_started();
                     }
-                    let filtered = wave_engine_clone.lock().unwrap().filter_candidates(station_batch.tracks);
-                    let updated_queue = {
-                        let mut state = state_clone.lock().unwrap();
-                        state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
-                        let new_tracks = dedup_tracks(&state.queue, filtered);
-                        state.queue.extend(new_tracks);
-                        state.queue.clone()
-                    };
-                    emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                    due
+                };
+
+                let (anchor, spare_anchor) = {
+                    let state = state_clone.lock().unwrap();
+                    let anchor = state
+                        .current_track
+                        .as_ref()
+                        .or_else(|| state.queue.get(state.current_index))
+                        .map(|t| t.id.clone())
+                        .filter(|id| !id.is_empty());
+                    let spare = state.queue.last().map(|t| t.id.clone()).filter(|id| !id.is_empty());
+                    (anchor, spare)
+                };
+
+                let plan = plan_wave_fetch(&station_id, batch_id.as_deref(), drift_due, anchor.as_deref());
+                let mut station_batch = provider
+                    .get_station_tracks(&plan.station, plan.continuation.as_deref())
+                    .await
+                    .ok();
+
+                // Волна может выдохнуться: токен продолжения кончился либо всё отсеялось
+                // фильтрами. Раньше очередь в этот момент молча переставала расти.
+                let exhausted = station_batch.as_ref().is_none_or(|b| b.tracks.is_empty());
+                if exhausted {
+                    let alternative = spare_anchor.as_deref().filter(|id| Some(*id) != anchor.as_deref());
+                    if let Some(alt) = alternative {
+                        let retry = plan_wave_fetch(&station_id, None, false, Some(alt));
+                        station_batch = provider.get_station_tracks(&retry.station, None).await.ok();
+                        if station_batch.as_ref().is_some_and(|b| !b.tracks.is_empty()) {
+                            eprintln!("[wave] продолжение исчерпано — новый сид: {}", retry.station);
+                        }
+                    }
                 }
+
+                let Some(station_batch) = station_batch.filter(|b| !b.tracks.is_empty()) else {
+                    eprintln!("[wave] волна выдохлась: станция «{}» не дала новых треков", station_id);
+                    return;
+                };
+
+                if plan.new_seed {
+                    eprintln!("[wave] сид обновлён: {}", plan.station);
+                    wave_engine_clone.lock().unwrap().mark_seed_started();
+                }
+
+                let filtered = wave_engine_clone.lock().unwrap().filter_candidates(station_batch.tracks);
+                let updated_queue = {
+                    let mut state = state_clone.lock().unwrap();
+                    state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
+                    let new_tracks = dedup_tracks(&state.queue, filtered);
+                    if drift_due && !new_tracks.is_empty() {
+                        // Свежий сид заменяет ещё не сыгранный хвост старого микса:
+                        // иначе очередь растёт бесконечно и в ней копятся треки чужого сида.
+                        let keep = state.current_index + 1;
+                        state.queue.truncate(keep);
+                    }
+                    state.queue.extend(new_tracks);
+                    state.queue.clone()
+                };
+                emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
                 return;
             }
 
@@ -1169,6 +1232,8 @@ impl PlayerManager {
             }
         }
         self.set_wave(true);
+        // Новая станция — новый отсчёт до Seed Drift
+        self.wave_engine.lock().unwrap().mark_seed_started();
         self.set_wave_label(Some(label.clone()));
         let target = match (&first, station_id.split_once(':')) {
             (Some(t), Some(("track", _))) => Some(SourceTarget::Track(t.clone())),
@@ -1942,6 +2007,8 @@ impl PlayerManager {
             state.station_id = station_id.clone();
             state.restored = false;
         }
+        // Смена фильтра Ротора = новый автомикс, отсчёт дрейфа начинается заново
+        self.wave_engine.lock().unwrap().mark_seed_started();
         self.set_wave(true);
         // плашку с выбранным фильтром рисует сам интерфейс; для простой Волны плашка убирается
         if is_reset {
@@ -2544,6 +2611,106 @@ mod yt_track_selection_tests {
 
         let chosen = pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
         assert_eq!(chosen.id, "3");
+    }
+}
+
+/// Решение о том, что именно запросить у YouTube Music при догрузке Волны.
+#[derive(Debug, PartialEq, Eq)]
+struct WaveFetchPlan {
+    /// Аргумент `station_id` для провайдера: `user:onyourwave` либо `track:<id>`
+    station: String,
+    /// Токен продолжения текущего автомикса
+    continuation: Option<String>,
+    /// Запрос начинает новый автомикс (первый запрос, Seed Drift или пере-сидирование)
+    new_seed: bool,
+}
+
+/// План догрузки Волны для YouTube Music.
+///
+/// Пока есть токен продолжения и не пора меняться — тянем текущий автомикс.
+/// Иначе начинаем новый от трека-якоря (`track:<id>`), а если якоря нет —
+/// повторяем запрос станции (провайдер разрешит сид сам).
+fn plan_wave_fetch(
+    station_id: &str,
+    batch_id: Option<&str>,
+    drift_due: bool,
+    anchor: Option<&str>,
+) -> WaveFetchPlan {
+    let anchor = anchor.map(str::trim).filter(|id| !id.is_empty());
+    if !drift_due
+        && let Some(token) = batch_id.map(str::trim).filter(|token| !token.is_empty())
+    {
+        return WaveFetchPlan {
+            station: station_id.to_string(),
+            continuation: Some(token.to_string()),
+            new_seed: false,
+        };
+    }
+    match anchor {
+        Some(id) => WaveFetchPlan {
+            station: format!("track:{}", id),
+            continuation: None,
+            new_seed: true,
+        },
+        None => WaveFetchPlan {
+            station: station_id.to_string(),
+            continuation: None,
+            new_seed: true,
+        },
+    }
+}
+
+#[cfg(test)]
+mod wave_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn test_continuation_kept_while_mix_is_fresh() {
+        let plan = plan_wave_fetch("user:onyourwave", Some("tok_1"), false, Some("cur_id"));
+        assert_eq!(plan.station, "user:onyourwave");
+        assert_eq!(plan.continuation.as_deref(), Some("tok_1"));
+        assert!(!plan.new_seed);
+    }
+
+    #[test]
+    fn test_seed_drift_drops_continuation_and_anchors_on_current_track() {
+        let plan = plan_wave_fetch("user:onyourwave", Some("tok_1"), true, Some("cur_id"));
+        assert_eq!(plan.station, "track:cur_id");
+        assert_eq!(plan.continuation, None);
+        assert!(plan.new_seed);
+    }
+
+    #[test]
+    fn test_drift_without_anchor_repeats_station_request() {
+        let plan = plan_wave_fetch("user:onyourwave", Some("tok_1"), true, None);
+        assert_eq!(plan.station, "user:onyourwave");
+        assert_eq!(plan.continuation, None);
+        assert!(plan.new_seed);
+    }
+
+    #[test]
+    fn test_empty_continuation_does_not_get_sent() {
+        // Пустой токен в теле запроса означает « продолжения нет» — его нельзя отправлять
+        let plan = plan_wave_fetch("user:onyourwave", Some("   "), false, Some("cur_id"));
+        assert_eq!(plan.station, "track:cur_id");
+        assert_eq!(plan.continuation, None);
+        assert!(plan.new_seed);
+    }
+
+    #[test]
+    fn test_fresh_station_request_without_continuation_uses_anchor_when_present() {
+        let plan = plan_wave_fetch("user:onyourwave", None, false, Some(" cur_id "));
+        assert_eq!(plan.station, "track:cur_id", "якорь должен обрезаться по краям");
+        assert_eq!(plan.continuation, None);
+        assert!(plan.new_seed);
+    }
+
+    #[test]
+    fn test_blank_anchor_falls_back_to_station() {
+        let plan = plan_wave_fetch("user:onyourwave", None, false, Some("  "));
+        assert_eq!(plan.station, "user:onyourwave");
+        assert_eq!(plan.continuation, None);
+        assert!(plan.new_seed);
     }
 }
 

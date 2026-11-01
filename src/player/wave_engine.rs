@@ -5,6 +5,10 @@ use crate::api::ytmusic::parser::is_clean_music_track;
 /// Максимальное количество запоминаемых недавних треков
 const MAX_RECENT_HISTORY: usize = 100;
 
+/// Через сколько сыгранных с одного сида треков Волна переезжает на свежий сид.
+/// Слишком мало — дёрганое звучание, слишком много — поджанровый пузырь.
+pub const SEED_DRIFT_AFTER_TRACKS: usize = 12;
+
 /// Режимы работы алгоритмической волны
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaveMode {
@@ -31,6 +35,8 @@ pub struct WaveEngine {
     pub seed_artists: HashSet<String>,
     /// Режим работы волны
     pub mode: WaveMode,
+    /// Сколько треков сыграно с момента последней смены сида (для Seed Drift)
+    pub played_since_seed: usize,
 }
 
 impl Default for WaveEngine {
@@ -46,6 +52,7 @@ impl WaveEngine {
             recent_history: VecDeque::with_capacity(MAX_RECENT_HISTORY),
             seed_artists: HashSet::new(),
             mode: WaveMode::SmartMix,
+            played_since_seed: 0,
         }
     }
 
@@ -55,6 +62,7 @@ impl WaveEngine {
             recent_history: VecDeque::with_capacity(MAX_RECENT_HISTORY),
             seed_artists: HashSet::new(),
             mode,
+            played_since_seed: 0,
         }
     }
 
@@ -74,6 +82,17 @@ impl WaveEngine {
         while self.recent_history.len() > MAX_RECENT_HISTORY {
             self.recent_history.pop_front();
         }
+        self.played_since_seed = self.played_since_seed.saturating_add(1);
+    }
+
+    /// Пора ли переезжать на свежий сид (Seed Drift)
+    pub fn seed_drift_due(&self) -> bool {
+        self.played_since_seed >= SEED_DRIFT_AFTER_TRACKS
+    }
+
+    /// Волна перешла на новый сид — счётчик сыгранного начинается заново
+    pub fn mark_seed_started(&mut self) {
+        self.played_since_seed = 0;
     }
 
     /// Фильтрует список кандидатов для волны:
@@ -176,5 +195,40 @@ mod tests {
         assert!(!engine.refill_needed(5, 1));
         // 10 треков, индекс 0 -> осталось 9 треков -> false
         assert!(!engine.refill_needed(10, 0));
+    }
+
+    #[test]
+    fn test_seed_drift_counts_only_real_tracks() {
+        let mut engine = WaveEngine::new();
+        assert!(!engine.seed_drift_due());
+
+        // Пустые идентификаторы — это не сыгранные треки, счётчик не двигают
+        engine.record_played("");
+        engine.record_played("   ");
+        assert_eq!(engine.played_since_seed, 0);
+        assert!(!engine.seed_drift_due());
+
+        for i in 0..SEED_DRIFT_AFTER_TRACKS - 1 {
+            engine.record_played(&format!("t{}", i));
+        }
+        assert!(!engine.seed_drift_due(), "до порога переезжать рано");
+
+        engine.record_played("last_one");
+        assert!(engine.seed_drift_due(), "на пороге пора менять сид");
+    }
+
+    #[test]
+    fn test_mark_seed_started_resets_drift() {
+        let mut engine = WaveEngine::new();
+        for i in 0..SEED_DRIFT_AFTER_TRACKS + 5 {
+            engine.record_played(&format!("t{}", i));
+        }
+        assert!(engine.seed_drift_due());
+
+        engine.mark_seed_started();
+        assert!(!engine.seed_drift_due());
+        assert_eq!(engine.played_since_seed, 0);
+        // История сыгранного при смене сида не сбрасывается — иначе вернутся те же треки
+        assert_eq!(engine.recent_history.len(), SEED_DRIFT_AFTER_TRACKS + 5);
     }
 }
