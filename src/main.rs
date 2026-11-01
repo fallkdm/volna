@@ -54,6 +54,27 @@ fn main() {
                 let query = args[3..].join(" ");
                 serde_json::json!({ "cmd": "search_and_play", "query": query })
             }
+            "filter" => {
+                // волна cmd filter <mood|-> <language|-> <character|-> ; «-» = сбросить
+                let pick = |i: usize| -> Option<String> {
+                    args.get(i)
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty() && *s != "-")
+                        .map(String::from)
+                };
+                let mut cmd = serde_json::Map::new();
+                cmd.insert("cmd".into(), serde_json::json!("filter"));
+                if let Some(v) = pick(3) {
+                    cmd.insert("mood".into(), serde_json::json!(v));
+                }
+                if let Some(v) = pick(4) {
+                    cmd.insert("language".into(), serde_json::json!(v));
+                }
+                if let Some(v) = pick(5) {
+                    cmd.insert("character".into(), serde_json::json!(v));
+                }
+                serde_json::Value::Object(cmd)
+            }
             "set_cookie" => {
                 let cookie = args.get(3).cloned().unwrap_or_default();
                 serde_json::json!({ "cmd": "set_cookie", "cookie": cookie })

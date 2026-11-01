@@ -193,6 +193,19 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
             player.start_station(station_id, None, "Моя Волна".into());
             serde_json::json!({ "ok": true })
         }
+        "filter" => {
+            let mood = cmd_json.get("mood").and_then(|v| v.as_str()).map(String::from);
+            let language = cmd_json
+                .get("language")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let character = cmd_json
+                .get("character")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            player.apply_rotor_filter(mood, language, character);
+            serde_json::json!({ "ok": true })
+        }
         "search_and_play" => {
             if let Some(query) = cmd_json.get("query").and_then(|v| v.as_str()) {
                 let provider = player.providers.current();

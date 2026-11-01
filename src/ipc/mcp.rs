@@ -186,6 +186,27 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "volna_wave_filter",
+            "description": "Применить фильтры Волны. Язык: russian, not-russian, without-words. Характер: favorite, discover, popular. Настроение (только Яндекс): active, calm, fun, sad. Без параметров — полный сброс фильтров",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "language": {
+                        "type": "string",
+                        "enum": ["russian", "not-russian", "without-words"]
+                    },
+                    "character": {
+                        "type": "string",
+                        "enum": ["favorite", "discover", "popular"]
+                    },
+                    "mood": {
+                        "type": "string",
+                        "enum": ["active", "calm", "fun", "sad"]
+                    }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "volna_search_and_play",
             "description": "Поиск и воспроизведение трека по запросу",
             "inputSchema": {
@@ -254,6 +275,16 @@ async fn execute_tool_call(tool_name: &str, args: &serde_json::Value) -> serde_j
         "volna_start_wave" => {
             let station_id = args.get("station_id").and_then(|v| v.as_str());
             serde_json::json!({ "cmd": "start_wave", "station_id": station_id })
+        }
+        "volna_wave_filter" => {
+            let mut cmd = serde_json::Map::new();
+            cmd.insert("cmd".into(), serde_json::json!("filter"));
+            for key in ["language", "character", "mood"] {
+                if let Some(value) = args.get(key).and_then(|v| v.as_str()) {
+                    cmd.insert(key.into(), serde_json::json!(value));
+                }
+            }
+            serde_json::Value::Object(cmd)
         }
         "volna_search_and_play" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -360,7 +391,7 @@ mod tests {
         });
         let resp = handle_json_rpc(req).await.expect("tools/list must respond");
         let tools = resp["result"]["tools"].as_array().expect("tools must be array");
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"volna_status"));

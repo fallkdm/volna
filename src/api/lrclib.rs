@@ -337,6 +337,97 @@ async fn lrclib_search_synced_status(
         }))
 }
 
+/// Один запрос к LRCLIB без повторов и с коротким таймаутом.
+///
+/// Нужен фильтрам: полный `lrclib_get` при 429/5xx спит 0.7 + 1.4 с, и на пачке
+/// кандидатов это выедает весь бюджет Фазы 2.
+pub async fn lrclib_get_once(http: &reqwest::Client, url: &str) -> LrclibFetch {
+    match http
+        .get(url)
+        .header(
+            "User-Agent",
+            "VolnaMusicPlayer/1.0 (https://github.com/fallkdm/volna)",
+        )
+        .timeout(std::time::Duration::from_millis(1500))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => LrclibFetch::Found(r),
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => LrclibFetch::NotFound,
+        _ => LrclibFetch::Failed,
+    }
+}
+
+/// Быстрая проба текста для фильтров: без поиска и без повторов.
+pub async fn lookup_lyrics_fast(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+) -> LyricsLookup {
+    let clean_artist = artist.trim();
+    let clean_title = clean_title_for_lyrics(title);
+    if clean_artist.is_empty() || clean_title.is_empty() {
+        return LyricsLookup::WrongTrack;
+    }
+    let url = match duration_secs {
+        Some(secs) => format!(
+            "https://lrclib.net/api/get?artist_name={}&track_name={}&duration={}",
+            urlencoding_encode(clean_artist),
+            urlencoding_encode(&clean_title),
+            secs
+        ),
+        None => format!(
+            "https://lrclib.net/api/get?artist_name={}&track_name={}",
+            urlencoding_encode(clean_artist),
+            urlencoding_encode(&clean_title)
+        ),
+    };
+    let response = match lrclib_get_once(http, &url).await {
+        LrclibFetch::Found(r) => r,
+        LrclibFetch::NotFound => return LyricsLookup::NotFound,
+        LrclibFetch::Failed => return LyricsLookup::Failed,
+    };
+    let Ok(data) = response.json::<LrclibResponse>().await else {
+        return LyricsLookup::Failed;
+    };
+    let matches_request = |name: &Option<String>| {
+        name.as_deref()
+            .is_none_or(|n| same_song_title(n, &clean_title))
+    };
+    let artist_matches = data
+        .artist_name
+        .as_deref()
+        .is_none_or(|n| same_artist_name(n, clean_artist));
+    let duration_matches = match (data.duration, duration_secs) {
+        (Some(got), Some(want)) => (got - want as f64).abs() <= DURATION_TOLERANCE_SECS,
+        _ => true,
+    };
+    let record_matches = matches_request(&data.track_name)
+        && artist_matches
+        && duration_matches
+        && !looks_like_foreign_song(
+            data.synced_lyrics.as_deref().unwrap_or(""),
+            duration_secs,
+        );
+    if !record_matches {
+        return LyricsLookup::WrongTrack;
+    }
+    if let Some(synced) = data.synced_lyrics {
+        let trimmed = synced.trim();
+        if usable_synced_at(trimmed, duration_secs) {
+            return LyricsLookup::Found(trimmed.to_string());
+        }
+    }
+    if let Some(plain) = data.plain_lyrics {
+        let trimmed = plain.trim();
+        if !trimmed.is_empty() {
+            return LyricsLookup::Found(trimmed.to_string());
+        }
+    }
+    LyricsLookup::NotFound
+}
+
 /// Поиск текста с сохранением терминальности (для алгоритмических фильтров Волны).
 ///
 /// Отличается от `fetch_lrclib_lyrics` тем, что не схлопывает «нет текста»,

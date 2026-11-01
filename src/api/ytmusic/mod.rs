@@ -1071,8 +1071,8 @@ impl YtMusicClient {
             return LyricsLookup::Found(text.clone());
         }
 
-        // 4. LRCLib (синхронизированный текст и фолбэк)
-        let lr = crate::api::lrclib::lookup_lyrics(&self.http, &artist, &title, duration_secs).await;
+        // 4. LRCLib — быстрая однократная проба (фильтру хватает вердикта)
+        let lr = crate::api::lrclib::lookup_lyrics_fast(&self.http, &artist, &title, duration_secs).await;
         match lr {
             LyricsLookup::Found(text) => {
                 let _ = std::fs::write(&cache_path, &text);
