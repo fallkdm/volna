@@ -37,6 +37,8 @@ pub struct WaveEngine {
     pub mode: WaveMode,
     /// Сколько треков сыграно с момента последней смены сида (для Seed Drift)
     pub played_since_seed: usize,
+    /// Номер переезда на свежий сид: чётные/нечётные сиды берутся из разных мест очереди
+    pub drift_serial: u64,
 }
 
 impl Default for WaveEngine {
@@ -53,6 +55,7 @@ impl WaveEngine {
             seed_artists: HashSet::new(),
             mode: WaveMode::SmartMix,
             played_since_seed: 0,
+            drift_serial: 0,
         }
     }
 
@@ -63,6 +66,7 @@ impl WaveEngine {
             seed_artists: HashSet::new(),
             mode,
             played_since_seed: 0,
+            drift_serial: 0,
         }
     }
 
@@ -111,6 +115,16 @@ impl WaveEngine {
     /// Волна перешла на новый сид — счётчик сыгранного начинается заново
     pub fn mark_seed_started(&mut self) {
         self.played_since_seed = 0;
+    }
+
+    /// Отмечает переезд на свежий сид и возвращает его номер.
+    ///
+    /// Номер нужен, чтобы чередовать источники сида: нечётный переезд стартует не от
+    /// текущего трека, а от дальнего края очереди — иначе Волна ходит по кругу одного
+    /// и того же поджанрового пузыря.
+    pub fn note_seed_drift(&mut self) -> u64 {
+        self.drift_serial = self.drift_serial.wrapping_add(1);
+        self.drift_serial
     }
 
     /// Фильтрует список кандидатов для волны:

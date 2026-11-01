@@ -1163,7 +1163,7 @@ impl PlayerManager {
                     due
                 };
 
-                let (anchor, spare_anchor) = {
+                let (primary_anchor, spare_anchor) = {
                     let state = state_clone.lock().unwrap();
                     let anchor = state
                         .current_track
@@ -1173,6 +1173,21 @@ impl PlayerManager {
                         .filter(|id| !id.is_empty());
                     let spare = state.queue.last().map(|t| t.id.clone()).filter(|id| !id.is_empty());
                     (anchor, spare)
+                };
+
+                // Multi-seed: каждый второй переезд стартует не от текущего трека, а от
+                // дальнего края очереди — так в миксе чередуются два соседних пузыря.
+                let anchor = if drift_due {
+                    let serial = wave_engine_clone.lock().unwrap().note_seed_drift();
+                    let picked = pick_drift_anchor(serial, primary_anchor.as_deref(), spare_anchor.as_deref());
+                    eprintln!(
+                        "[wave] переезд #{}: сид от {}",
+                        serial,
+                        picked.as_deref().unwrap_or("станции")
+                    );
+                    picked
+                } else {
+                    primary_anchor.clone()
                 };
 
                 let plan = plan_wave_fetch(&station_id, batch_id.as_deref(), drift_due, anchor.as_deref());
@@ -1185,7 +1200,10 @@ impl PlayerManager {
                 // фильтрами. Раньше очередь в этот момент молча переставала расти.
                 let exhausted = station_batch.as_ref().is_none_or(|b| b.tracks.is_empty());
                 if exhausted {
-                    let alternative = spare_anchor.as_deref().filter(|id| Some(*id) != anchor.as_deref());
+                    let alternative = [primary_anchor.as_deref(), spare_anchor.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .find(|id| Some(*id) != anchor.as_deref());
                     if let Some(alt) = alternative {
                         let retry = plan_wave_fetch(&station_id, None, false, Some(alt));
                         station_batch = provider.get_station_tracks(&retry.station, None).await.ok();
@@ -2799,6 +2817,26 @@ fn plan_wave_fetch(
     }
 }
 
+/// Откуда брать сид на очередном Seed Drift.
+///
+/// Один и тот же якорь (текущий трек) быстро затягивает Волну в узкий поджанровый
+/// пузырь. Поэтому переезды чередуются: чётные — от того, что звучит сейчас,
+/// нечётные — от дальнего края очереди, который пришёл из другой порции провайдера.
+fn pick_drift_anchor(serial: u64, current: Option<&str>, spare: Option<&str>) -> Option<String> {
+    let clean = |id: Option<&str>| {
+        id.map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    };
+    let current = clean(current);
+    let spare = clean(spare);
+    if serial % 2 == 0 {
+        current.or(spare)
+    } else {
+        spare.filter(|id| Some(id) != current.as_ref()).or(current)
+    }
+}
+
 /// Что делать, когда текущий трек — последний в очереди.
 #[derive(Debug, PartialEq, Eq)]
 enum TailAdvance {
@@ -2886,6 +2924,50 @@ mod tail_advance_tests {
             tail_advance(true, true, true, true, true),
             TailAdvance::Advance
         );
+    }
+}
+
+#[cfg(test)]
+mod drift_anchor_tests {
+    use super::*;
+
+    #[test]
+    fn test_even_drift_starts_from_playing_track() {
+        assert_eq!(
+            pick_drift_anchor(0, Some("now"), Some("tail")).as_deref(),
+            Some("now")
+        );
+        assert_eq!(
+            pick_drift_anchor(2, Some("now"), Some("tail")).as_deref(),
+            Some("now")
+        );
+    }
+
+    #[test]
+    fn test_odd_drift_starts_from_queue_tail() {
+        // другой пузырь: якорь не совпадает с тем, что звучит
+        assert_eq!(
+            pick_drift_anchor(1, Some("now"), Some("tail")).as_deref(),
+            Some("tail")
+        );
+    }
+
+    #[test]
+    fn test_odd_drift_falls_back_to_playing_track() {
+        // хвост совпал с текущим треком или пуст — сид всё равно нужен
+        assert_eq!(
+            pick_drift_anchor(1, Some("now"), Some("now")).as_deref(),
+            Some("now")
+        );
+        assert_eq!(pick_drift_anchor(1, Some("now"), None).as_deref(), Some("now"));
+        assert_eq!(pick_drift_anchor(1, Some("now"), Some("  ")).as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn test_drift_anchor_survives_empty_ids() {
+        assert_eq!(pick_drift_anchor(0, None, Some("tail")).as_deref(), Some("tail"));
+        assert_eq!(pick_drift_anchor(0, Some(""), None), None);
+        assert_eq!(pick_drift_anchor(1, None, None), None);
     }
 }
 
