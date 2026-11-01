@@ -104,7 +104,18 @@ void main() {
         vec2 cs = u_clip_rect.zw - u_clip_rect.xy;
         float sc = max(u_size.x / cs.x, u_size.y / cs.y);
         vec2 uv = ((p - u_size * 0.5) / sc + u_clip_rect.xy + cs * 0.5) / u_clip_size;
-        vec3 v = texture(u_clip, uv).rgb;
+        vec3 center = texture(u_clip, uv).rgb;
+        // 480p-клип растягивается на весь экран: поднимаем локальный контраст
+        // (unsharp mask по 4 соседям) и добавляем мелкое зерно, чтобы не читалось «мыло»
+        vec2 texel = 1.0 / max(u_clip_size, vec2(1.0));
+        vec3 blur = (texture(u_clip, uv + vec2(texel.x, 0.0)).rgb
+                   + texture(u_clip, uv - vec2(texel.x, 0.0)).rgb
+                   + texture(u_clip, uv + vec2(0.0, texel.y)).rgb
+                   + texture(u_clip, uv - vec2(0.0, texel.y)).rgb) * 0.25;
+        vec3 v = clamp(center + (center - blur) * 0.55, 0.0, 1.0);
+        v = clamp((v - 0.5) * 1.04 + 0.5, 0.0, 1.0);
+        float grain = fract(sin(dot(gl_FragCoord.xy + u_time * 37.0, vec2(12.9898, 78.233))) * 43758.5453);
+        v += (grain - 0.5) * 0.022;
         // клип тонируем цветом трека: слой остаётся частью фона, а не отдельной картинкой
         col = mix(col, mix(v, v * (u_core * 1.6 + 0.2), 0.45), u_clip_alpha);
     }

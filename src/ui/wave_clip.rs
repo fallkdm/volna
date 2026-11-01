@@ -179,7 +179,7 @@ impl ClipController {
 
         let desc = format!(
             "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale add-borders=false ! \
-             video/x-raw,format=RGBA,pixel-aspect-ratio=1/1,width=[16,640],height=[16,640] ! \
+             video/x-raw,format=RGBA,pixel-aspect-ratio=1/1,width=[16,960],height=[16,960] ! \
              appsink name=sink sync=true max-buffers=2 drop=true",
             request.path.replace('\\', "\\\\").replace('"', "\\\"")
         );
@@ -304,7 +304,7 @@ impl ClipController {
         self.shared.set_kind(crate::player::ClipKind::YandexPreview);
         let desc = format!(
             "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale add-borders=false ! \
-             video/x-raw,format=RGBA,pixel-aspect-ratio=1/1,width=[16,640],height=[16,640] ! \
+             video/x-raw,format=RGBA,pixel-aspect-ratio=1/1,width=[16,960],height=[16,960] ! \
              appsink name=sink sync=true max-buffers=2 drop=true",
             path.replace('\\', "\\\\").replace('"', "\\\"")
         );
