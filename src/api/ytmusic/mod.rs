@@ -633,6 +633,26 @@ impl YtMusicClient {
 
     /// Загрузка понравившихся треков пользователя (через HTML LM или browse fallback)
     pub async fn get_liked_tracks(&self) -> Result<Vec<Track>, YtMusicError> {
+        // 0. Вход по OAuth: Google принимает Bearer-токен только у TV-клиента,
+        // и медиатека приходит плитками — это не зависит от куки и её ротации.
+        if self.refresh_token.read().await.is_some() {
+            let body = serde_json::json!({ "browseId": "FEmusic_liked_videos" });
+            if let Ok(json) = self
+                .post_innertube("browse", "TVHTML5", "7.20250101.10.00", body)
+                .await
+            {
+                let tracks = parser::parse_tv_tile_tracks(&json);
+                if !tracks.is_empty() {
+                    println!(
+                        "[ytmusic] Медиатека через TV-клиент (OAuth): {} треков",
+                        tracks.len()
+                    );
+                    *self.liked_total_count.write().await = Some(tracks.len() as u32);
+                    return Ok(tracks);
+                }
+            }
+        }
+
         // 1. Надежный запрос плейлиста LM через HTML с полной сохраненной кукой пользователя
         if let Ok(html) = self
             .fetch_ytmusic_html("https://music.youtube.com/playlist?list=LM")
