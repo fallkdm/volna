@@ -6,6 +6,15 @@ pub const CLIENT_ID: &str = "861556708454-d6t45nm8nvuktk182okjk20r9cq9pk07.apps.
 /// Секретный ключ клиента официального YouTube on TV приложения
 pub const CLIENT_SECRET: &str = "zxBYhnmFYyWQmFA4_fWahYWg";
 
+/// OAuth-клиент Google: сначала свой из настроек, иначе встроенный (Google его отозвал).
+pub fn oauth_client() -> (String, String) {
+    let (id, secret) = crate::api::auth::load_ytmusic_oauth_client();
+    match (id, secret) {
+        (Some(id), Some(secret)) => (id, secret),
+        _ => (CLIENT_ID.to_string(), CLIENT_SECRET.to_string()),
+    }
+}
+
 /// Ответ Google Device Flow при запросе кода подтверждения устройства
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct DeviceCodeResponse {
@@ -36,9 +45,10 @@ impl GoogleToken {
 pub async fn request_device_code(
     http: &reqwest::Client,
 ) -> Result<DeviceCodeResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (client_id, _) = oauth_client();
     let body = format!(
         "client_id={}&scope={}",
-        CLIENT_ID,
+        client_id,
         "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fyoutube"
     );
 
@@ -60,10 +70,11 @@ pub async fn poll_device_token(
     http: &reqwest::Client,
     device_code: &str,
 ) -> Result<Option<GoogleToken>, Box<dyn std::error::Error + Send + Sync>> {
+    let (client_id, client_secret) = oauth_client();
     let body = format!(
         "client_id={}&client_secret={}&device_code={}&grant_type={}",
-        CLIENT_ID,
-        CLIENT_SECRET,
+        client_id,
+        client_secret,
         device_code,
         "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
     );
@@ -118,10 +129,11 @@ pub async fn refresh_access_token(
     http: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<GoogleToken, Box<dyn std::error::Error + Send + Sync>> {
+    let (client_id, client_secret) = oauth_client();
     let body = format!(
         "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
-        CLIENT_ID,
-        CLIENT_SECRET,
+        client_id,
+        client_secret,
         refresh_token
     );
 

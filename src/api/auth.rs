@@ -31,6 +31,12 @@ pub struct AppConfig {
     /// Ключ API Last.fm (справка об исполнителях)
     #[serde(default)]
     pub lastfm_key: Option<String>,
+    /// Свой OAuth-клиент Google для входа в YouTube Music по коду (тип «TV and Limited Input»).
+    /// Пусто — используется встроенный, который Google уже отозвал.
+    #[serde(default)]
+    pub ytmusic_oauth_client_id: Option<String>,
+    #[serde(default)]
+    pub ytmusic_oauth_client_secret: Option<String>,
     /// Последний проигранный трек: при запуске показывается вместо заглушки
     #[serde(default)]
     pub last_track: Option<serde_json::Value>,
@@ -89,6 +95,8 @@ impl Default for AppConfig {
             genius_token: None,
             clips: false,
             lastfm_key: None,
+            ytmusic_oauth_client_id: None,
+            ytmusic_oauth_client_secret: None,
             last_track: None,
             discord_rpc: false,
             discord_client_id: None,
@@ -371,6 +379,37 @@ pub fn load_ytmusic_cookie() -> Option<String> {
 }
 
 /// Сохраняет полную куку YouTube Music (включая LOGIN_INFO для привязки к аккаунту и каналу пользователя)
+/// Свой OAuth-клиент Google из настроек (id, secret); пустые строки, если не задан.
+pub fn load_ytmusic_oauth_client() -> (Option<String>, Option<String>) {
+    match load_config() {
+        Ok(config) => (
+            config
+                .ytmusic_oauth_client_id
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+            config
+                .ytmusic_oauth_client_secret
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty()),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// Сохраняет свой OAuth-клиент Google (пустая строка — сбросить)
+pub fn save_ytmusic_oauth_client(id: Option<&str>, secret: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.ytmusic_oauth_client_id = id
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    config.ytmusic_oauth_client_secret = secret
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    save_config(&config)
+}
+
 pub fn save_ytmusic_cookie(cookie: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sanitized = crate::api::ytmusic::sanitize_cookie(cookie);
     let mut config = load_config().unwrap_or_default();

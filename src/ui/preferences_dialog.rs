@@ -2,8 +2,8 @@ use gtk4::prelude::*;
 use gtk4::{Box as GtkBox, Button, Entry, Image, Orientation};
 use libadwaita::prelude::*;
 use libadwaita::{
-    ActionRow, ComboRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup, PreferencesPage,
-    SpinRow, SwitchRow,
+    ActionRow, ComboRow, EntryRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup,
+    PreferencesPage, SpinRow, SwitchRow,
 };
 
 use crate::api::auth::{
@@ -465,6 +465,139 @@ pub fn show_ytmusic_auth_dialog(
     dialog.set_title("Вход в YouTube Music");
 
     let page = PreferencesPage::new();
+    let on_success = std::rc::Rc::new(on_success);
+
+    // Вход по коду Google: refresh-токен вместо куки из браузера.
+    // Кука живёт до первой ротации токенов Google, refresh-токен — месяцами.
+    let device_group = PreferencesGroup::new();
+    device_group.set_title("Вход по коду Google (рекомендуется)");
+    device_group.set_description(Some(
+        "Один раз подтвердите код на google.com/device. Приложение сохранит refresh-токен и будет обновлять доступ само — куки из браузера больше не нужны.",
+    ));
+    let device_row = ActionRow::builder()
+        .title("Войти без куки")
+        .subtitle("Код действует несколько минут, вход сохраняется надолго")
+        .build();
+    let device_btn = Button::with_label("Получить код");
+    device_btn.add_css_class("suggested-action");
+    device_btn.add_css_class("pill");
+    device_btn.set_valign(gtk4::Align::Center);
+    device_row.add_suffix(&device_btn);
+
+    // Свой OAuth-клиент Google: встроенный Google отозвал (invalid_client)
+    let client_id_row = EntryRow::builder()
+        .title("OAuth Client ID")
+        .build();
+    let client_secret_row = PasswordEntryRow::builder()
+        .title("OAuth Client Secret")
+        .build();
+    if let (Some(id), Some(secret)) = crate::api::auth::load_ytmusic_oauth_client() {
+        client_id_row.set_text(&id);
+        client_secret_row.set_text(&secret);
+    }
+    let oauth_hint = gtk4::Label::new(Some(
+        "Создайте OAuth-клиент типа «TVs and Limited Input devices» в Google Cloud, включите YouTube Data API v3 и вставьте его id/secret сюда. Это разовая настройка: дальше вход по коду работает без куки и без браузера.",
+    ));
+    oauth_hint.set_wrap(true);
+    oauth_hint.set_xalign(0.0);
+    oauth_hint.add_css_class("dim-label");
+
+    let device_status = gtk4::Label::new(None);
+    device_status.set_wrap(true);
+    device_status.set_xalign(0.0);
+    device_status.add_css_class("dim-label");
+    device_status.set_visible(false);
+    device_group.add(&device_row);
+    device_group.add(&client_id_row);
+    device_group.add(&client_secret_row);
+    device_group.add(&oauth_hint);
+    device_group.add(&device_status);
+
+    {
+        let player = player.clone();
+        let dialog_weak = dialog.downgrade();
+        let status = device_status.clone();
+        let on_success = on_success.clone();
+        let client_id_row = client_id_row.clone();
+        let client_secret_row = client_secret_row.clone();
+        device_btn.connect_clicked(move |btn| {
+            btn.set_sensitive(false);
+            // клиент сохраняем до запроса кода: он нужен и для refresh-токена
+            let _ = crate::api::auth::save_ytmusic_oauth_client(
+                Some(&client_id_row.text()),
+                Some(&client_secret_row.text()),
+            );
+            let player = player.clone();
+            let dialog_weak = dialog_weak.clone();
+            let status = status.clone();
+            let on_success = on_success.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let http = reqwest::Client::new();
+                let code = match crate::api::ytmusic::request_device_code(&http).await {
+                    Ok(code) => code,
+                    Err(e) => {
+                        status.set_text(&format!("Не удалось получить код: {e}"));
+                        status.set_visible(true);
+                        return;
+                    }
+                };
+                status.set_text(&format!(
+                    "Код: {}\nОткройте {} и введите его",
+                    code.user_code, code.verification_url
+                ));
+                status.set_visible(true);
+                let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+                    &code.verification_url,
+                    None::<&gtk4::gio::AppLaunchContext>,
+                );
+
+                let interval = code.interval.max(5);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    match crate::api::ytmusic::poll_device_token(&http, &code.device_code).await {
+                        Ok(Some(token)) => {
+                            let Some(refresh) = token.refresh_token.clone() else {
+                                status.set_text("Google не выдал refresh-токен, попробуйте ещё раз");
+                                return;
+                            };
+                            if let Err(e) = crate::api::auth::save_ytmusic_refresh_token(&refresh) {
+                                eprintln!("[ytmusic] не удалось сохранить refresh token: {e}");
+                            }
+                            // протухшая кука больше не нужна
+                            let _ = crate::api::auth::clear_ytmusic_cookie();
+                            let yt_client =
+                                crate::api::ytmusic::YtMusicClient::with_refresh_token(refresh);
+                            player.providers.register(
+                                std::sync::Arc::new(yt_client)
+                                    as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                            );
+                            on_success();
+                            player.emit(crate::player::PlayerUiEvent::StatusMessage(
+                                "Вход в YouTube Music по коду выполнен".to_string(),
+                            ));
+                            if player.providers.active_id()
+                                == crate::api::provider::ProviderId::YouTubeMusic
+                            {
+                                player.emit(crate::player::PlayerUiEvent::ProviderChanged(
+                                    crate::api::provider::ProviderId::YouTubeMusic,
+                                ));
+                            }
+                            if let Some(d) = dialog_weak.upgrade() {
+                                d.close();
+                            }
+                            return;
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            status.set_text(&format!("Не удалось войти: {e}"));
+                            return;
+                        }
+                    }
+                }
+            });
+        });
+    }
+    page.add(&device_group);
 
     let group = PreferencesGroup::new();
     group.set_title("Вход в YouTube Music");
@@ -546,7 +679,6 @@ pub fn show_ytmusic_auth_dialog(
     let player_clone = player.clone();
     let dialog_weak = dialog.downgrade();
     let cookie_row_clone = cookie_row.clone();
-    let on_success = std::rc::Rc::new(on_success);
 
     login_btn.connect_clicked(move |_| {
         let cookie_text = cookie_row_clone.text().to_string();

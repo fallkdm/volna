@@ -350,7 +350,17 @@ impl YtMusicClient {
             guard.clone()
         };
 
-        if let Some(cookie) = cookie_opt {
+        // Refresh-токен долговечнее куки: если он есть, авторизуемся им, и
+        // протухшая кука из браузера больше не может «сломать» медиатеку.
+        let has_refresh_token = self.refresh_token.read().await.is_some();
+        let bearer = if has_refresh_token {
+            self.get_valid_access_token().await
+        } else {
+            None
+        };
+        if let Some(token) = bearer {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        } else if let Some(cookie) = cookie_opt {
             let authuser = self.get_authuser().await;
             req = req
                 .header("Cookie", &cookie)
@@ -362,8 +372,6 @@ impl YtMusicClient {
                 let auth_header = auth::build_sapisid_hash(&sapisid, "https://music.youtube.com");
                 req = req.header("Authorization", auth_header);
             }
-        } else if let Some(token) = self.get_valid_access_token().await {
-            req = req.header("Authorization", format!("Bearer {}", token));
         }
 
         let resp = req.json(&req_body).send().await?.error_for_status()?;
@@ -936,15 +944,21 @@ impl YtMusicClient {
                     .header("X-Origin", *origin)
                     .header("Referer", format!("{}/", origin));
 
-                if let Some(cookie) = &cookie_opt {
+                let has_refresh_token = self.refresh_token.read().await.is_some();
+                let bearer = if has_refresh_token {
+                    self.get_valid_access_token().await
+                } else {
+                    None
+                };
+                if let Some(token) = bearer {
+                    req = req.header("Authorization", format!("Bearer {}", token));
+                } else if let Some(cookie) = &cookie_opt {
                     req = req.header("Cookie", cookie).header("X-Goog-AuthUser", *au);
 
                     if let Some(sapisid) = auth::extract_sapisid(cookie) {
                         let auth_header = auth::build_sapisid_hash(&sapisid, origin);
                         req = req.header("Authorization", auth_header);
                     }
-                } else if let Some(token) = self.get_valid_access_token().await {
-                    req = req.header("Authorization", format!("Bearer {}", token));
                 }
 
                 match req.json(&body).send().await {
