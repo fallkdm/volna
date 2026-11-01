@@ -350,10 +350,11 @@ impl YtMusicClient {
             guard.clone()
         };
 
-        // Refresh-токен долговечнее куки: если он есть, авторизуемся им, и
-        // протухшая кука из браузера больше не может «сломать» медиатеку.
-        let has_refresh_token = self.refresh_token.read().await.is_some();
-        let bearer = if has_refresh_token {
+        // Bearer принимает только TV-клиент: WEB_REMIX отвечает на него 400,
+        // поэтому поиск, радио и страницы артистов идут как гость (или по куке).
+        let bearer = if client_name.starts_with("TVHTML5")
+            && self.refresh_token.read().await.is_some()
+        {
             self.get_valid_access_token().await
         } else {
             None
@@ -1100,10 +1101,14 @@ impl YtMusicClient {
         let mut success = false;
         let mut last_error: Option<YtMusicError> = None;
 
-        let targets = [
+        let mut targets = vec![
             ("https://music.youtube.com", "WEB_REMIX", "1.20240101.01.00"),
             ("https://www.youtube.com", "WEB", "2.20240101.01.00"),
         ];
+        // при входе по OAuth оценка ставится TV-клиентом: WEB-клиенты токен не принимают
+        if self.refresh_token.read().await.is_some() {
+            targets.push(("https://music.youtube.com", "TVHTML5", "7.20250101.10.00"));
+        }
 
         let authusers = ["3", "0"];
 
@@ -1134,8 +1139,9 @@ impl YtMusicClient {
                     .header("X-Origin", *origin)
                     .header("Referer", format!("{}/", origin));
 
-                let has_refresh_token = self.refresh_token.read().await.is_some();
-                let bearer = if has_refresh_token {
+                let bearer = if client_name.starts_with("TVHTML5")
+                    && self.refresh_token.read().await.is_some()
+                {
                     self.get_valid_access_token().await
                 } else {
                     None
