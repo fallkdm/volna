@@ -125,6 +125,10 @@ pub struct WaveViewWidgets {
     mood_buttons: Rc<RefCell<Vec<Button>>>,
     /// Выбранные пункты фильтров (настроение, характер, язык)
     selection: Rc<RefCell<[Pick; 3]>>,
+    /// Плашка прогресса подбора Волны под фильтр (спиннер + текст)
+    loading_pill: GtkBox,
+    loading_spinner: gtk4::Spinner,
+    loading_label: Label,
     /// Текущий акцент плашки — сбрасывается вместе с фильтрами
     accent_color: Rc<RefCell<[f64; 3]>>,
 }
@@ -170,6 +174,24 @@ impl WaveViewWidgets {
                 btn.set_tooltip_text(None);
             } else {
                 btn.set_tooltip_text(Some("Доступно в Яндекс Музыке"));
+            }
+        }
+    }
+
+    /// Показывает или скрывает прогресс подбора Волны под фильтр.
+    ///
+    /// `Some(text)` — плашка со спиннером и текстом («Загружаю Волну по «…»…»),
+    /// `None` — скрыть. Спиннер анимируется, пока идёт загрузка.
+    pub fn set_wave_loading(&self, text: Option<&str>) {
+        match text {
+            Some(text) => {
+                self.loading_label.set_text(text);
+                self.loading_spinner.start();
+                self.loading_pill.set_visible(true);
+            }
+            None => {
+                self.loading_spinner.stop();
+                self.loading_pill.set_visible(false);
             }
         }
     }
@@ -358,6 +380,22 @@ pub fn create_wave_view(
     filter_pill.append(&pill_label);
     filter_pill.append(&pill_close);
 
+    // Плашка прогресса: «Загружаю Волну по «…»…» со спиннером
+    let loading_pill = GtkBox::new(Orientation::Horizontal, 8);
+    loading_pill.add_css_class("wave-loading-pill");
+    loading_pill.set_halign(Align::Center);
+    loading_pill.set_valign(Align::Start);
+    loading_pill.set_margin_top(62);
+    loading_pill.set_visible(false);
+    let loading_spinner = gtk4::Spinner::new();
+    loading_spinner.set_size_request(16, 16);
+    loading_spinner.set_valign(Align::Center);
+    let loading_label = Label::new(None);
+    loading_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    loading_label.set_max_width_chars(46);
+    loading_pill.append(&loading_spinner);
+    loading_pill.append(&loading_label);
+
     // Панель настройки Волны внутри окна: затемнение + карточка по центру экрана волны
     let popover = GtkBox::new(Orientation::Vertical, 0);
     popover.add_css_class("wave-scrim");
@@ -525,6 +563,9 @@ pub fn create_wave_view(
 
             let player_clone = player.clone();
             let accent_clone = accent_color.clone();
+            // После выбора фильтра меню закрываем: иначе плашка прогресса
+            // «Загружаю Волну по «…»…» остаётся за поповером
+            let pop_weak = popover.downgrade();
             let da_weak = drawing_area.downgrade();
             let (pill_label_clone, pill_clone, pill_close_clone) = (pill_label.clone(), filter_pill.clone(), pill_close.clone());
             let source_target_clone = source_target.clone();
@@ -578,6 +619,9 @@ pub fn create_wave_view(
                 shader_state_clone.borrow_mut().set_target_colors(core, deep, ridge);
 
                 player_clone.apply_rotor_filter(mood_val, lang_val, char_val);
+                if let Some(pop) = pop_weak.upgrade() {
+                    pop.set_visible(false);
+                }
             });
 
             section_flow.append(&btn);
@@ -665,6 +709,7 @@ pub fn create_wave_view(
 
     root_overlay.add_overlay(&content_box);
     root_overlay.add_overlay(&filter_pill);
+    root_overlay.add_overlay(&loading_pill);
     root_overlay.add_overlay(&popover);
 
     WaveViewWidgets {
@@ -687,6 +732,9 @@ pub fn create_wave_view(
         mood_buttons,
         selection,
         accent_color: accent_color.clone(),
+        loading_pill,
+        loading_spinner,
+        loading_label,
     }
 }
 

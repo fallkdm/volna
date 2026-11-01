@@ -76,6 +76,8 @@ pub enum PlayerUiEvent {
     StreamQuality(String),
     Seeked(u64),
     LoadingState(bool),
+    /// Подбор Волны под фильтр: `Some("…")` — показать прогресс, `None` — скрыть
+    WaveLoading(Option<String>),
     AuthRequired,
     UserLoggedIn(String),
     UserLoggedOut,
@@ -1636,6 +1638,7 @@ impl PlayerManager {
                     }
                     // за время загрузки пользователь мог запустить другую станцию
                     if me.state.lock().unwrap().station_id != station_id {
+                        me.emit(PlayerUiEvent::WaveLoading(None));
                         return;
                     }
                     me.state.lock().unwrap().batch_id = batch_id;
@@ -2350,6 +2353,11 @@ impl PlayerManager {
     pub fn tail_swap(&self, language: Option<String>, character: Option<String>) {
         let epoch = self.tail_swap_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.emit(PlayerUiEvent::LoadingState(true));
+        self.emit(PlayerUiEvent::WaveLoading(Some(wave_loading_text(
+            None,
+            language.as_deref(),
+            character.as_deref(),
+        ))));
 
         let me = self.clone();
         tokio::spawn(async move {
@@ -2507,6 +2515,8 @@ impl PlayerManager {
 
             // 4. Устаревший батч отбрасываем, но спиннер гасим всегда
             if me.tail_swap_epoch.load(Ordering::SeqCst) != epoch {
+                // Устаревший запуск не должен гасить плашку прогресса: её
+                // владелец — более новый TailSwap, он и снимет её сам.
                 emit_all(&me.event_senders, PlayerUiEvent::LoadingState(false));
                 return;
             }
@@ -2542,6 +2552,7 @@ impl PlayerManager {
                     "Не удалось найти треки под выбранный фильтр".to_string(),
                 ));
                 me.emit(PlayerUiEvent::LoadingState(false));
+                me.emit(PlayerUiEvent::WaveLoading(None));
                 return;
             }
 
@@ -2582,6 +2593,7 @@ impl PlayerManager {
                 me.next_track();
             }
             me.emit(PlayerUiEvent::LoadingState(false));
+            me.emit(PlayerUiEvent::WaveLoading(None));
             me.prefetch_next_track();
             eprintln!("[tail_swap] epoch={} хвост обновлён", epoch);
         });
@@ -2596,6 +2608,11 @@ impl PlayerManager {
         character: Option<String>,
     ) {
         let is_reset = mood.is_none() && language.is_none() && character.is_none();
+        self.emit(PlayerUiEvent::WaveLoading(Some(wave_loading_text(
+            mood.as_deref(),
+            language.as_deref(),
+            character.as_deref(),
+        ))));
         let client_clone = self.client.clone();
         let state_clone = self.state.clone();
         let senders = self.event_senders.clone();
@@ -2634,6 +2651,7 @@ impl PlayerManager {
                     emit_all(&senders, PlayerUiEvent::StatusMessage(
                         "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
                     ));
+                    emit_all(&senders, PlayerUiEvent::WaveLoading(None));
                     return;
                 }
             } else if !client.has_token() {
@@ -2641,6 +2659,7 @@ impl PlayerManager {
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
                     "Войдите в Яндекс ID для запуска персональной Волны".to_string(),
                 ));
+                emit_all(&senders, PlayerUiEvent::WaveLoading(None));
                 return;
             }
 
@@ -2706,6 +2725,7 @@ impl PlayerManager {
                         false
                     };
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    emit_all(&senders, PlayerUiEvent::WaveLoading(None));
                     emit_all(&senders, PlayerUiEvent::QueueUpdated(tracks.clone()));
 
                     if let Some(track) = first_track {
@@ -2771,6 +2791,7 @@ impl PlayerManager {
                 }
                 Err(e) => {
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    emit_all(&senders, PlayerUiEvent::WaveLoading(None));
                     emit_all(&senders, PlayerUiEvent::Error(e));
                 }
             }
@@ -3060,6 +3081,39 @@ fn track_key(t: &Track) -> String {
 /// самому. У Яндекса станцию считает сервер: он и так не присылает сыгранное, а фильтр
 /// лишь выбрасывал пришедшие треки (плюс гасил те, что пользователь слушал до Волны),
 /// из-за чего очередь не росла и догрузка считалась проваленной.
+/// Название фильтра для интерфейса (подпись кнопки окна «Настроить волну»)
+fn filter_label(
+    mood: Option<&str>,
+    language: Option<&str>,
+    character: Option<&str>,
+) -> Option<&'static str> {
+    match (language, character, mood) {
+        (Some("russian"), ..) => Some("🇷🇺 На русском"),
+        (Some("not-russian"), ..) => Some("🌐 Иностранный"),
+        (Some("without-words"), ..) => Some("🎵 Без слов"),
+        (None, Some("favorite"), _) => Some("❤️ Моё любимое"),
+        (None, Some("discover"), _) => Some("✨ Незнакомое"),
+        (None, Some("popular"), _) => Some("🔥 Популярное"),
+        (None, None, Some("active")) => Some("⚡ Энергичное"),
+        (None, None, Some("calm")) => Some("☕ Спокойное"),
+        (None, None, Some("fun")) => Some("🎉 Весёлое"),
+        (None, None, Some("sad")) => Some("🌧 Грустное"),
+        _ => None,
+    }
+}
+
+/// Текст прогресса для плашки: «Загружаю Волну по «…»…»
+fn wave_loading_text(
+    mood: Option<&str>,
+    language: Option<&str>,
+    character: Option<&str>,
+) -> String {
+    match filter_label(mood, language, character) {
+        Some(label) => format!("Загружаю Волну по «{}»…", label),
+        None => "Обновляю Волну…".to_string(),
+    }
+}
+
 /// Целевой размер принятого хвоста после TailSwap
 const TAIL_SWAP_QUOTA: usize = 6;
 

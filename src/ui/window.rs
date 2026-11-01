@@ -1966,6 +1966,14 @@ fn setup_event_listener(
                     island.artist_label.set_text("Яндекс Музыка");
                     island.cover_image.clear(); // пустая картинка = CSS-заглушка обложки
                 }
+                PlayerUiEvent::WaveLoading(text) => {
+                    wave_view.set_wave_loading(text.as_deref());
+                    if let Some(text) = text {
+                        let toast = Toast::new(&text);
+                        toast.set_use_markup(false);
+                        toast_overlay.add_toast(toast);
+                    }
+                }
                 PlayerUiEvent::StatusMessage(msg) => {
                     let toast = Toast::new(&msg);
                     toast.set_use_markup(false);

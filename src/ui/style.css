@@ -599,6 +599,18 @@ toast {
     color: white;
 }
 
+/* Плашка прогресса подбора Волны под фильтр */
+.wave-loading-pill {
+    background: rgba(0, 0, 0, 0.42);
+    border-radius: 9999px;
+    padding: 6px 16px;
+    color: white;
+    font-weight: 600;
+}
+.wave-loading-pill spinner {
+    color: white;
+}
+
 /* Плашка «E» (explicit) рядом с названием трека */
 .explicit-badge {
   font-size: 10px;
