@@ -1441,7 +1441,12 @@ pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                 load_artist_avatar(&page.cover, &a.name, None);
                 let real_artist_id = if a.id.is_empty() { artist_id } else { a.id.clone() };
                 page.set_source_target(SourceTarget::Artist(real_artist_id.clone()));
-                let photos: Vec<String> = brief.all_covers.iter().filter_map(|c| c.uri.clone()).collect();
+                let photos: Vec<String> = brief
+                    .all_covers
+                    .iter()
+                    .filter_map(|c| c.uri.clone())
+                    .map(|uri| crate::api::models::reachable_image_url(&uri))
+                    .collect();
                 page.set_photos(&photos);
 
                 // Если студийный аватар найден, добавляем его первой фотографией в галерею

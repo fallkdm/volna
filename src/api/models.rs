@@ -64,14 +64,31 @@ pub struct Playlist {
     pub og_image: Option<String>,
 }
 
+/// Нормализует URL картинки к доступному хосту.
+///
+/// `yt3.googleusercontent.com` в РФ не отвечает (TLS-таймаут), но те же файлы
+/// отдаёт `yt3.ggpht.com` — один и тот же CDN с другим именем.
+pub fn reachable_image_url(url: &str) -> String {
+    for prefix in ["https://", "http://"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            if let Some(path) = rest.strip_prefix("yt3.googleusercontent.com/") {
+                return format!("https://yt3.ggpht.com/{path}");
+            }
+            break;
+        }
+    }
+    url.to_string()
+}
+
 /// Формирует URL обложки из uri вида `avatars.yandex.net/.../%%` (например, 200, 400)
 pub fn cover_url(uri: &str, size: u32) -> String {
     let path = uri.replace("%%", &format!("{}x{}", size, size));
-    if path.starts_with("http://") || path.starts_with("https://") {
+    let path = if path.starts_with("http://") || path.starts_with("https://") {
         path
     } else {
         format!("https://{}", path)
-    }
+    };
+    reachable_image_url(&path)
 }
 
 impl Artist {
