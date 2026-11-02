@@ -1,0 +1,8 @@
+{
+  "error": "need_validation",
+  "error_description": "password is valid but 2-factor authentication is required",
+  "error_type": "need_validation",
+  "validation_type": "2fa_sms",
+  "phone_mask": "+7 *** *** 45 67",
+  "validation_sid": "987654321"
+}

@@ -1,0 +1,49 @@
+{
+  "response": {
+    "count": 3,
+    "items": [
+      {
+        "id": 456240123,
+        "owner_id": 1234567,
+        "artist": "Example Artist",
+        "title": "Direct MP3",
+        "subtitle": "Contract Mix",
+        "duration": 184,
+        "url": "https://audio.example.invalid/direct.mp3",
+        "lyrics_id": 4589201,
+        "is_explicit": true,
+        "album": {
+          "id": 123456,
+          "owner_id": 1234567,
+          "title": "Contract Album",
+          "thumb": {
+            "photo_68": "https://images.example.invalid/cover-68.jpg",
+            "photo_300": "https://images.example.invalid/cover-300.jpg",
+            "photo_600": "https://images.example.invalid/cover-600.jpg"
+          }
+        },
+        "main_artists": [
+          { "id": "1001", "name": "Example Artist" },
+          { "id": 1002, "name": "Second Artist" }
+        ]
+      },
+      {
+        "id": 456240124,
+        "owner_id": 1234567,
+        "artist": "HLS Artist",
+        "title": "HLS Stream",
+        "duration": 201,
+        "url": "https://audio.example.invalid/hls/index.m3u8"
+      },
+      {
+        "id": 456240125,
+        "owner_id": -2000001,
+        "artist": "Unavailable Artist",
+        "title": "Unavailable Track",
+        "duration": 99,
+        "album": null,
+        "main_artists": null
+      }
+    ]
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "response": {
+    "categories": [
+      {
+        "category_id": "mood",
+        "title": "Настроение",
+        "options": [
+          { "option_id": "fun", "title": "Радостно" },
+          { "option_id": "sad", "title": "Грустно" },
+          { "option_id": "active", "title": "Активно" },
+          { "option_id": "calm", "title": "Спокойно" }
+        ]
+      },
+      {
+        "category_id": "familiarity",
+        "title": "Характер",
+        "options": [
+          { "option_id": "favorite", "title": "Знакомое" },
+          { "option_id": "discover", "title": "Незнакомое" },
+          { "option_id": "new", "title": "Новинки" }
+        ]
+      },
+      {
+        "category_id": "language",
+        "title": "Язык",
+        "options": [
+          { "option_id": "russian", "title": "Русский" },
+          { "option_id": "not-russian", "title": "Иностранный" },
+          { "option_id": "without-words", "title": "Без слов" }
+        ]
+      },
+      {
+        "category_id": "genre",
+        "title": "Жанр",
+        "options": [
+          { "option_id": "pop", "title": "Поп" },
+          { "option_id": "rock", "title": "Рок" },
+          { "option_id": "hip_hop", "title": "Хип-хоп" },
+          { "option_id": "electronic", "title": "Электронная" }
+        ]
+      }
+    ]
+  }
+}

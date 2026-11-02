@@ -1,0 +1,20 @@
+{
+  "response": [
+    {
+      "id": 456240123,
+      "owner_id": 1234567,
+      "artist": "Example Artist",
+      "title": "Direct MP3",
+      "duration": 184,
+      "url": "https://audio.example.invalid/refreshed/direct.mp3"
+    },
+    {
+      "id": 456240124,
+      "owner_id": 1234567,
+      "artist": "HLS Artist",
+      "title": "HLS Stream",
+      "duration": 201,
+      "url": "https://audio.example.invalid/refreshed/index.m3u8"
+    }
+  ]
+}
