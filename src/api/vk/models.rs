@@ -266,6 +266,14 @@ pub struct VkPlaylistDto {
     pub photo: Option<VkThumbDto>,
 }
 
+/// Список плейлистов с общим количеством результатов.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct VkPlaylistListDto {
+    pub count: u64,
+    #[serde(default)]
+    pub items: Vec<VkPlaylistDto>,
+}
+
 /// Дерево настроек VK Mix.
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
 pub struct VkStreamMixSettingsDto {
