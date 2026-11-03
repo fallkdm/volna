@@ -6,15 +6,15 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, glib, Align, Box as GtkBox, Button, Image, Label, ListBox, Orientation, Overflow,
-    ScrolledWindow, Stack,
+    Align, Box as GtkBox, Button, Image, Label, ListBox, Orientation, Overflow, ScrolledWindow,
+    Stack, gdk, glib,
 };
-use libadwaita::prelude::*;
 use libadwaita::ActionRow;
+use libadwaita::prelude::*;
 
 use crate::api::models::{Album, Artist, Playlist, Track, TrackSource};
 use crate::api::provider::ProviderId;
-use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
+use crate::player::{PlaySource, PlayerManager, PlayerUiEvent, SourceTarget};
 
 thread_local! {
     static COVERS: RefCell<HashMap<String, gdk::Texture>> = RefCell::new(HashMap::new());
@@ -37,9 +37,15 @@ pub fn load_cover(image: &Image, url: Option<String>) {
     let client = client.clone();
     let weak = image.downgrade();
     glib::spawn_future_local(async move {
-        let Ok(resp) = client.get(&url).send().await else { return };
-        let Ok(bytes) = resp.bytes().await else { return };
-        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
+        let Ok(resp) = client.get(&url).send().await else {
+            return;
+        };
+        let Ok(bytes) = resp.bytes().await else {
+            return;
+        };
+        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else {
+            return;
+        };
         COVERS.with(|c| c.borrow_mut().insert(url, tex.clone()));
         if let Some(img) = weak.upgrade() {
             img.set_paintable(Some(&tex));
@@ -66,7 +72,9 @@ pub fn load_track_cover(image: &Image, track: &Track) {
     let preview_url = track.cover_url(100);
     load_cover(image, preview_url.clone());
 
-    let is_ytimg = preview_url.as_deref().map_or(false, |u| u.contains("ytimg.com"));
+    let is_ytimg = preview_url
+        .as_deref()
+        .map_or(false, |u| u.contains("ytimg.com"));
     let needs_studio = preview_url.is_none() || is_ytimg;
 
     if needs_studio {
@@ -144,7 +152,14 @@ fn ellipsized(text: &str, css: &str) -> Label {
 }
 
 /// Плитка: обложка, название, подпись. Клик вызывает `on_click`.
-pub fn tile(title: &str, subtitle: &str, url: Option<String>, size: i32, round: bool, on_click: impl Fn() + 'static) -> Button {
+pub fn tile(
+    title: &str,
+    subtitle: &str,
+    url: Option<String>,
+    size: i32,
+    round: bool,
+    on_click: impl Fn() + 'static,
+) -> Button {
     let col = GtkBox::new(Orientation::Vertical, 4);
     col.set_width_request(size);
     let cover = cover_image(size, url);
@@ -202,7 +217,13 @@ pub fn track_row(track: &Track, on_activate: impl Fn() + 'static) -> ActionRow {
 }
 
 /// Строка списка с обложкой и стрелкой справа (исполнитель, альбом, плейлист)
-pub fn item_row(title: &str, subtitle: &str, url: Option<String>, round: bool, on_activate: impl Fn() + 'static) -> ActionRow {
+pub fn item_row(
+    title: &str,
+    subtitle: &str,
+    url: Option<String>,
+    round: bool,
+    on_activate: impl Fn() + 'static,
+) -> ActionRow {
     let row = ActionRow::builder()
         .title(glib::markup_escape_text(title))
         .subtitle(glib::markup_escape_text(subtitle))
@@ -220,7 +241,12 @@ pub fn item_row(title: &str, subtitle: &str, url: Option<String>, round: bool, o
 }
 
 /// Строка исполнителя со скруглённой аватаркой и студийным разрешением 1:1 через Deezer/iTunes
-pub fn artist_row(artist_name: &str, subtitle: &str, fallback_url: Option<String>, on_activate: impl Fn() + 'static) -> ActionRow {
+pub fn artist_row(
+    artist_name: &str,
+    subtitle: &str,
+    fallback_url: Option<String>,
+    on_activate: impl Fn() + 'static,
+) -> ActionRow {
     let row = ActionRow::builder()
         .title(glib::markup_escape_text(artist_name))
         .subtitle(glib::markup_escape_text(subtitle))
@@ -382,7 +408,9 @@ impl DetailPage {
         info.append(&desc_btn);
         let offline_btn = Button::with_label("Загрузить");
         offline_btn.add_css_class("pill");
-        offline_btn.set_tooltip_text(Some("Сохранить треки в приложении для прослушивания без интернета"));
+        offline_btn.set_tooltip_text(Some(
+            "Сохранить треки в приложении для прослушивания без интернета",
+        ));
         offline_btn.set_visible(false);
         let wave_btn = Button::new();
         wave_btn.add_css_class("pill");
@@ -471,8 +499,15 @@ impl DetailPage {
 
         {
             let seq = Rc::new(std::cell::Cell::new(0u32));
-            let (p, tracks, target, list, empty, results, nav) =
-                (player.clone(), tracks.clone(), owner_target.clone(), list.clone(), empty.clone(), results.clone(), nav.clone());
+            let (p, tracks, target, list, empty, results, nav) = (
+                player.clone(),
+                tracks.clone(),
+                owner_target.clone(),
+                list.clone(),
+                empty.clone(),
+                results.clone(),
+                nav.clone(),
+            );
             search.connect_search_changed(move |e| {
                 let q = e.text().trim().to_string();
                 seq.set(seq.get() + 1);
@@ -482,15 +517,31 @@ impl DetailPage {
                 if q.is_empty() {
                     return;
                 }
-                let (p, tracks, target, list, empty, results, seq, nav) =
-                    (p.clone(), tracks.clone(), target.clone(), list.clone(), empty.clone(), results.clone(), seq.clone(), nav.clone());
+                let (p, tracks, target, list, empty, results, seq, nav) = (
+                    p.clone(),
+                    tracks.clone(),
+                    target.clone(),
+                    list.clone(),
+                    empty.clone(),
+                    results.clone(),
+                    seq.clone(),
+                    nav.clone(),
+                );
                 glib::spawn_future_local(async move {
                     let client = p.client.lock().unwrap().clone();
-                    let Ok(found) = client.search(&q).await else { return };
+                    let Ok(found) = client.search(&q).await else {
+                        return;
+                    };
                     if seq.get() != my {
                         return;
                     }
-                    for t in found.tracks.map(|s| s.results).unwrap_or_default().into_iter().take(8) {
+                    for t in found
+                        .tracks
+                        .map(|s| s.results)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(8)
+                    {
                         let row = ActionRow::builder()
                             .title(t.title_markup())
                             .subtitle(glib::markup_escape_text(&t.artists_string()))
@@ -501,12 +552,29 @@ impl DetailPage {
                         add.add_css_class("circular");
                         add.set_valign(Align::Center);
                         add.set_tooltip_text(Some("Добавить в плейлист"));
-                        let (p, tracks, target, list, empty, t, nav) =
-                            (p.clone(), tracks.clone(), target.clone(), list.clone(), empty.clone(), t.clone(), nav.clone());
+                        let (p, tracks, target, list, empty, t, nav) = (
+                            p.clone(),
+                            tracks.clone(),
+                            target.clone(),
+                            list.clone(),
+                            empty.clone(),
+                            t.clone(),
+                            nav.clone(),
+                        );
                         add.connect_clicked(move |b| {
-                            let Some((uid, kind)) = target.borrow().clone() else { return };
+                            let Some((uid, kind)) = target.borrow().clone() else {
+                                return;
+                            };
                             b.set_sensitive(false);
-                            let (p, tracks, list, empty, t, b, nav) = (p.clone(), tracks.clone(), list.clone(), empty.clone(), t.clone(), b.clone(), nav.clone());
+                            let (p, tracks, list, empty, t, b, nav) = (
+                                p.clone(),
+                                tracks.clone(),
+                                list.clone(),
+                                empty.clone(),
+                                t.clone(),
+                                b.clone(),
+                                nav.clone(),
+                            );
                             glib::spawn_future_local(async move {
                                 let client = p.client.lock().unwrap().clone();
                                 match client.add_track_to_playlist(&uid, &kind, &t).await {
@@ -516,7 +584,10 @@ impl DetailPage {
                                     }
                                     Err(e) => {
                                         b.set_sensitive(true);
-                                        p.emit(PlayerUiEvent::Error(format!("Не удалось добавить трек: {}", e)));
+                                        p.emit(PlayerUiEvent::Error(format!(
+                                            "Не удалось добавить трек: {}",
+                                            e
+                                        )));
                                     }
                                 }
                             });
@@ -548,26 +619,43 @@ impl DetailPage {
                 if child != bg.upcast_ref::<gtk4::Widget>() {
                     return None;
                 }
-                Some(gdk::Rectangle::new(0, -(adj.value() as i32) - AMBIENT_LIFT, ov.width(), AMBIENT_HEIGHT))
+                Some(gdk::Rectangle::new(
+                    0,
+                    -(adj.value() as i32) - AMBIENT_LIFT,
+                    ov.width(),
+                    AMBIENT_HEIGHT,
+                ))
             });
             let ov = page_overlay.clone();
-            scrolled.vadjustment().connect_value_changed(move |_| ov.queue_allocate());
+            scrolled
+                .vadjustment()
+                .connect_value_changed(move |_| ov.queue_allocate());
         }
         widget.append(&page_overlay);
 
         {
             let (p, t, src) = (player.clone(), tracks.clone(), source.clone());
-            play.connect_clicked(move |_| p.set_queue_and_play_from(t.borrow().clone(), 0, src.borrow().clone()));
+            play.connect_clicked(move |_| {
+                p.set_queue_and_play_from(t.borrow().clone(), 0, src.borrow().clone())
+            });
         }
 
         {
-            let (p, t, busy) = (player.clone(), tracks.clone(), Rc::new(std::cell::Cell::new(false)));
+            let (p, t, busy) = (
+                player.clone(),
+                tracks.clone(),
+                Rc::new(std::cell::Cell::new(false)),
+            );
             offline_btn.connect_clicked(move |b| {
                 if busy.get() {
                     return;
                 }
                 let list = t.borrow().clone();
-                let missing: Vec<Track> = list.iter().filter(|t| crate::cache::offline_audio_path(&t.id).is_none()).cloned().collect();
+                let missing: Vec<Track> = list
+                    .iter()
+                    .filter(|t| crate::cache::offline_audio_path(&t.id).is_none())
+                    .cloned()
+                    .collect();
                 if missing.is_empty() {
                     for t in &list {
                         crate::cache::remove_offline(&t.id);
@@ -583,7 +671,10 @@ impl DetailPage {
                     for (i, t) in missing.iter().enumerate() {
                         b.set_label(&format!("Загрузка {}/{}", i + 1, n));
                         if let Err(e) = client.save_track_offline(t).await {
-                            p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить «{}»: {}", t.title, e)));
+                            p.emit(PlayerUiEvent::Error(format!(
+                                "Не удалось сохранить «{}»: {}",
+                                t.title, e
+                            )));
                             break;
                         }
                     }
@@ -603,18 +694,66 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, video, video_shared, video_gen: Default::default(), listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+        Rc::new(Self {
+            widget,
+            cover,
+            kind,
+            title,
+            title_badge,
+            subtitle,
+            list,
+            tracks,
+            source: source.clone(),
+            photos: photos.clone(),
+            ambient_pic,
+            video,
+            video_shared,
+            video_gen: Default::default(),
+            listeners: listeners.clone(),
+            listeners_label: listeners_label.clone(),
+            player: player.clone(),
+            wave_btn,
+            wave,
+            extra,
+            link_handler,
+            link_albums: RefCell::default(),
+            about,
+            about_for: Rc::default(),
+            back,
+            nav,
+            owner_target,
+            owner_box,
+            empty,
+            desc_btn,
+            cover_btn,
+            offline_btn,
+            cover_handler: Default::default(),
+            heart_btn,
+            heart_handler: Default::default(),
+            desc_handler: Default::default(),
+            owner_btn,
+            on_removed: RefCell::default(),
+        })
     }
 
     /// Кнопка-описание у своего плейлиста: клик открывает редактирование
     fn set_description(self: &Rc<Self>, uid: &str, kind: &str, text: &str) {
-        self.desc_btn.set_label(if text.is_empty() { "Добавить описание…" } else { text });
+        self.desc_btn.set_label(if text.is_empty() {
+            "Добавить описание…"
+        } else {
+            text
+        });
         self.desc_btn.set_visible(true);
         // обработчик навешивается заново для каждого плейлиста
         if let Some(old) = self.desc_handler.take() {
             self.desc_btn.disconnect(old);
         }
-        let (page, uid, kind, text) = (self.clone(), uid.to_string(), kind.to_string(), text.to_string());
+        let (page, uid, kind, text) = (
+            self.clone(),
+            uid.to_string(),
+            kind.to_string(),
+            text.to_string(),
+        );
         let id = self.desc_btn.connect_clicked(move |b| {
             let dialog = libadwaita::AlertDialog::new(Some("Описание плейлиста"), None);
             let entry = gtk4::Entry::new();
@@ -633,9 +772,15 @@ impl DetailPage {
                 let new_text = entry.text().trim().to_string();
                 glib::spawn_future_local(async move {
                     let client = page.player.client.lock().unwrap().clone();
-                    match client.set_playlist_description(&uid, &kind, &new_text).await {
+                    match client
+                        .set_playlist_description(&uid, &kind, &new_text)
+                        .await
+                    {
                         Ok(()) => page.set_description(&uid, &kind, &new_text),
-                        Err(e) => page.player.emit(PlayerUiEvent::Error(format!("Не удалось сохранить описание: {}", e))),
+                        Err(e) => page.player.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось сохранить описание: {}",
+                            e
+                        ))),
                     }
                 });
             });
@@ -644,11 +789,21 @@ impl DetailPage {
     }
 
     /// Сердечко плейлиста: состояние берётся из «Нравится» пользователя
-    pub fn set_playlist_context(self: &Rc<Self>, me: String, uid: String, kind: String, liked: bool) {
+    pub fn set_playlist_context(
+        self: &Rc<Self>,
+        me: String,
+        uid: String,
+        kind: String,
+        liked: bool,
+    ) {
         let key = format!("{}:{}", uid, kind);
         self.heart_btn.set_label(heart_glyph(liked));
         self.heart_btn.set_visible(true);
-        if liked { self.heart_btn.add_css_class("liked-heart"); } else { self.heart_btn.remove_css_class("liked-heart"); }
+        if liked {
+            self.heart_btn.add_css_class("liked-heart");
+        } else {
+            self.heart_btn.remove_css_class("liked-heart");
+        }
         if let Some(old) = self.heart_handler.take() {
             self.heart_btn.disconnect(old);
         }
@@ -657,9 +812,15 @@ impl DetailPage {
             let like = !liked_now.get();
             liked_now.set(like);
             b.set_label(heart_glyph(like));
-            if like { b.add_css_class("liked-heart"); } else { b.remove_css_class("liked-heart"); }
+            if like {
+                b.add_css_class("liked-heart");
+            } else {
+                b.remove_css_class("liked-heart");
+            }
             let (me, key) = (me.clone(), key.clone());
-            run_api(&p, None, move |c, _| async move { c.set_playlist_like(&me, &key, like).await });
+            run_api(&p, None, move |c, _| async move {
+                c.set_playlist_like(&me, &key, like).await
+            });
         });
         self.heart_handler.set(Some(id));
     }
@@ -680,28 +841,49 @@ impl DetailPage {
                 filter.set_name(Some("Изображения"));
                 let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
                 filters.append(&filter);
-                let dialog = gtk4::FileDialog::builder().title("Обложка плейлиста").filters(&filters).build();
+                let dialog = gtk4::FileDialog::builder()
+                    .title("Обложка плейлиста")
+                    .filters(&filters)
+                    .build();
                 let window = b.root().and_downcast::<gtk4::Window>();
-                let Ok(file) = dialog.open_future(window.as_ref()).await else { return };
+                let Ok(file) = dialog.open_future(window.as_ref()).await else {
+                    return;
+                };
                 let Some(path) = file.path() else { return };
                 let Ok(data) = std::fs::read(&path) else {
-                    page.player.emit(PlayerUiEvent::Error("Не удалось прочитать файл".into()));
+                    page.player
+                        .emit(PlayerUiEvent::Error("Не удалось прочитать файл".into()));
                     return;
                 };
                 if data.len() > 10 * 1024 * 1024 {
-                    page.player.emit(PlayerUiEvent::Error("Файл больше 10 МБ".into()));
+                    page.player
+                        .emit(PlayerUiEvent::Error("Файл больше 10 МБ".into()));
                     return;
                 }
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "cover.jpg".into());
-                let mime = if name.to_lowercase().ends_with(".png") { "image/png" } else { "image/jpeg" };
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "cover.jpg".into());
+                let mime = if name.to_lowercase().ends_with(".png") {
+                    "image/png"
+                } else {
+                    "image/jpeg"
+                };
                 let client = page.player.client.lock().unwrap().clone();
-                match client.upload_playlist_cover(&uid, &kind, &name, mime, data).await {
+                match client
+                    .upload_playlist_cover(&uid, &kind, &name, mime, data)
+                    .await
+                {
                     Ok(url) => {
                         let url = url.map(|u| crate::api::models::cover_url(&u, 400));
                         load_cover(&page.cover, url);
-                        page.player.emit(PlayerUiEvent::StatusMessage("Обложка загружена".into()));
+                        page.player
+                            .emit(PlayerUiEvent::StatusMessage("Обложка загружена".into()));
                     }
-                    Err(e) => page.player.emit(PlayerUiEvent::Error(format!("Не удалось загрузить обложку: {}", e))),
+                    Err(e) => page.player.emit(PlayerUiEvent::Error(format!(
+                        "Не удалось загрузить обложку: {}",
+                        e
+                    ))),
                 }
             });
         });
@@ -718,7 +900,12 @@ impl DetailPage {
             if let Some(id) = uri.strip_prefix("artist:") {
                 open_artist(&p, &stack, &page, id.to_string());
             } else if let Some(id) = uri.strip_prefix("album:") {
-                let album = page.link_albums.borrow().iter().find(|a| a.id == id).cloned();
+                let album = page
+                    .link_albums
+                    .borrow()
+                    .iter()
+                    .find(|a| a.id == id)
+                    .cloned();
                 if let Some(album) = album {
                     open_album(&p, &stack, &page, &album);
                 }
@@ -731,7 +918,12 @@ impl DetailPage {
     }
 
     /// Меню своего плейлиста: переключатель приватности и удаление (с подтверждением)
-    pub fn set_owner_menu(self: &Rc<Self>, uid: String, kind: String, meta: crate::api::client::PlaylistMeta) {
+    pub fn set_owner_menu(
+        self: &Rc<Self>,
+        uid: String,
+        kind: String,
+        meta: crate::api::client::PlaylistMeta,
+    ) {
         let (private, description) = (meta.private, meta.description.clone());
         let date = meta.modified.get(..10).unwrap_or("");
         if !date.is_empty() && !meta.owner.is_empty() {
@@ -740,7 +932,10 @@ impl DetailPage {
             } else {
                 format!("{}.{}.{}", &date[8..10], &date[5..7], &date[..4])
             };
-            self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} обновил плейлист {}", meta.owner, when)));
+            self.subtitle.set_markup(&glib::markup_escape_text(&format!(
+                "{} обновил плейлист {}",
+                meta.owner, when
+            )));
         }
         *self.owner_target.borrow_mut() = Some((uid.clone(), kind.clone()));
         self.owner_box.set_visible(true);
@@ -788,7 +983,14 @@ impl DetailPage {
         self.owner_btn.set_visible(true);
 
         {
-            let (page, views, others, pop, uid, kind) = (self.clone(), views.clone(), others.clone(), pop.clone(), uid.clone(), kind.clone());
+            let (page, views, others, pop, uid, kind) = (
+                self.clone(),
+                views.clone(),
+                others.clone(),
+                pop.clone(),
+                uid.clone(),
+                kind.clone(),
+            );
             to_other.connect_clicked(move |_| {
                 clear_box(&others);
                 let back = menu_item("go-previous-symbolic", "Назад");
@@ -796,20 +998,33 @@ impl DetailPage {
                 back.connect_clicked(move |_| v.set_visible_child_name("main"));
                 others.append(&back);
                 views.set_visible_child_name("others");
-                let (page, others, pop, uid, kind) = (page.clone(), others.clone(), pop.clone(), uid.clone(), kind.clone());
+                let (page, others, pop, uid, kind) = (
+                    page.clone(),
+                    others.clone(),
+                    pop.clone(),
+                    uid.clone(),
+                    kind.clone(),
+                );
                 glib::spawn_future_local(async move {
                     let client = page.player.client.lock().unwrap().clone();
-                    let Ok(lists) = client.get_user_playlists(&uid).await else { return };
+                    let Ok(lists) = client.get_user_playlists(&uid).await else {
+                        return;
+                    };
                     for pl in lists.into_iter().filter(|l| l.kind != kind) {
                         let b = menu_item("view-list-symbolic", &pl.title);
-                        let (page, pop, uid, target) = (page.clone(), pop.clone(), uid.clone(), pl.kind.clone());
+                        let (page, pop, uid, target) =
+                            (page.clone(), pop.clone(), uid.clone(), pl.kind.clone());
                         b.connect_clicked(move |_| {
                             pop.popdown();
                             let tracks = page.tracks.borrow().clone();
                             let (uid, target) = (uid.clone(), target.clone());
-                            run_api(&page.player, Some("Треки добавлены в плейлист"), move |c, _| async move {
-                                c.add_tracks_to_playlist(&uid, &target, &tracks).await
-                            });
+                            run_api(
+                                &page.player,
+                                Some("Треки добавлены в плейлист"),
+                                move |c, _| async move {
+                                    c.add_tracks_to_playlist(&uid, &target, &tracks).await
+                                },
+                            );
                         });
                         others.append(&b);
                     }
@@ -821,7 +1036,9 @@ impl DetailPage {
             let (p, uid, kind) = (self.player.clone(), uid.clone(), kind.clone());
             switch.connect_active_notify(move |sw| {
                 let (uid, kind, private) = (uid.clone(), kind.clone(), sw.is_active());
-                run_api(&p, None, move |c, _| async move { c.set_playlist_private(&uid, &kind, private).await });
+                run_api(&p, None, move |c, _| async move {
+                    c.set_playlist_private(&uid, &kind, private).await
+                });
             });
         }
         {
@@ -847,7 +1064,10 @@ impl DetailPage {
                         let client = page.player.client.lock().unwrap().clone();
                         match client.rename_playlist(&uid, &kind, &name).await {
                             Ok(()) => page.title.set_text(&name),
-                            Err(e) => page.player.emit(PlayerUiEvent::Error(format!("Не удалось переименовать: {}", e))),
+                            Err(e) => page.player.emit(PlayerUiEvent::Error(format!(
+                                "Не удалось переименовать: {}",
+                                e
+                            ))),
                         }
                     });
                 });
@@ -857,7 +1077,8 @@ impl DetailPage {
             let (page, pop, uid, kind) = (self.clone(), pop.clone(), uid.clone(), kind.clone());
             wave.connect_clicked(move |_| {
                 pop.popdown();
-                page.player.play_playlist_wave(&uid, &kind, &page.title.text());
+                page.player
+                    .play_playlist_wave(&uid, &kind, &page.title.text());
             });
         }
         {
@@ -865,7 +1086,10 @@ impl DetailPage {
             share.connect_clicked(move |_| {
                 pop.popdown();
                 if let Some(d) = gdk::Display::default() {
-                    d.clipboard().set_text(&format!("https://music.yandex.ru/users/{}/playlists/{}", uid, kind));
+                    d.clipboard().set_text(&format!(
+                        "https://music.yandex.ru/users/{}/playlists/{}",
+                        uid, kind
+                    ));
                     p.emit(PlayerUiEvent::StatusMessage("Ссылка скопирована".into()));
                 }
             });
@@ -873,7 +1097,10 @@ impl DetailPage {
         let page = self.clone();
         delete.connect_clicked(move |b| {
             pop.popdown();
-            let dialog = libadwaita::AlertDialog::new(Some("Удалить плейлист?"), Some("Это действие нельзя отменить."));
+            let dialog = libadwaita::AlertDialog::new(
+                Some("Удалить плейлист?"),
+                Some("Это действие нельзя отменить."),
+            );
             dialog.add_response("cancel", "Отмена");
             dialog.add_response("delete", "Удалить");
             dialog.set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
@@ -892,7 +1119,10 @@ impl DetailPage {
                                 cb();
                             }
                         }
-                        Err(e) => page.player.emit(PlayerUiEvent::Error(format!("Не удалось удалить плейлист: {}", e))),
+                        Err(e) => page.player.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось удалить плейлист: {}",
+                            e
+                        ))),
                     }
                 });
             });
@@ -907,14 +1137,22 @@ impl DetailPage {
         self.video.play(path);
         let weak = Rc::downgrade(self);
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
-            let Some(page) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let Some(page) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             if page.video_gen.get() != token {
                 return glib::ControlFlow::Break;
             }
             if let Some(f) = page.video_shared.take_fresh() {
                 let ratio = page.ambient_pic.width().max(1) as f32 / AMBIENT_HEIGHT as f32;
                 let (aw, ah, glow) = ambient_frame(&f, ratio);
-                let glow = gdk::MemoryTexture::new(aw, ah, gdk::MemoryFormat::R8g8b8a8Premultiplied, &glib::Bytes::from_owned(glow), (aw * 4) as usize);
+                let glow = gdk::MemoryTexture::new(
+                    aw,
+                    ah,
+                    gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                    &glib::Bytes::from_owned(glow),
+                    (aw * 4) as usize,
+                );
                 page.ambient_pic.set_paintable(Some(&glow));
             }
             glib::ControlFlow::Continue
@@ -936,7 +1174,10 @@ impl DetailPage {
 
     /// Фото артиста для просмотра по клику на аватарку (если их больше одного)
     pub fn set_photos(&self, uris: &[String]) {
-        let urls: Vec<String> = uris.iter().map(|u| crate::api::models::cover_url(u, 1000)).collect();
+        let urls: Vec<String> = uris
+            .iter()
+            .map(|u| crate::api::models::cover_url(u, 1000))
+            .collect();
         if urls.len() > 1 {
             self.cover.set_cursor_from_name(Some("pointer"));
             self.cover.set_tooltip_text(Some("Все фото"));
@@ -953,7 +1194,8 @@ impl DetailPage {
 
     /// Плашка «N слушателей в месяц» на странице артиста
     pub fn set_listeners(&self, count: u64) {
-        self.listeners_label.set_text(&format!("{} слушателей в месяц", group_digits(count)));
+        self.listeners_label
+            .set_text(&format!("{} слушателей в месяц", group_digits(count)));
         self.listeners.set_visible(true);
     }
 
@@ -971,14 +1213,24 @@ impl DetailPage {
     pub fn set_subtitle_links(&self, artists: &[Artist], album: Option<&Album>, year: Option<u32>) {
         let parts: Vec<String> = artists
             .iter()
-            .map(|a| format!("<a href=\"artist:{}\">{}</a>", a.id, glib::markup_escape_text(&a.name)))
+            .map(|a| {
+                format!(
+                    "<a href=\"artist:{}\">{}</a>",
+                    a.id,
+                    glib::markup_escape_text(&a.name)
+                )
+            })
             .collect();
         let mut text = parts.join(", ");
         if let Some(al) = album {
             if !text.is_empty() {
                 text.push_str(" · ");
             }
-            text.push_str(&format!("<a href=\"album:{}\">{}</a>", al.id, glib::markup_escape_text(al.title.as_deref().unwrap_or(""))));
+            text.push_str(&format!(
+                "<a href=\"album:{}\">{}</a>",
+                al.id,
+                glib::markup_escape_text(al.title.as_deref().unwrap_or(""))
+            ));
             *self.link_albums.borrow_mut() = vec![al.clone()];
         } else if let Some(y) = year {
             if !text.is_empty() {
@@ -1039,7 +1291,10 @@ impl DetailPage {
 
         glib::spawn_future_local(async move {
             // сеть могла зависнуть: дольше 15 с не ждём
-            let found = tokio::time::timeout(std::time::Duration::from_secs(15), lookup).await.ok().flatten();
+            let found = tokio::time::timeout(std::time::Duration::from_secs(15), lookup)
+                .await
+                .ok()
+                .flatten();
             // пользователь мог уйти на другую страницу, пока шёл запрос
             if *about_for.borrow() != key {
                 return;
@@ -1062,7 +1317,11 @@ impl DetailPage {
             let source = Label::new(None);
             source.set_halign(Align::Start);
             source.add_css_class("dim-label");
-            let license = if summary.license.is_empty() { String::new() } else { format!(" · {}", summary.license) };
+            let license = if summary.license.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", summary.license)
+            };
             source.set_markup(&format!(
                 "<a href=\"{}\">{}</a>{}",
                 glib::markup_escape_text(&summary.url),
@@ -1097,8 +1356,13 @@ impl DetailPage {
                     }
                     btn.set_sensitive(false);
                     btn.set_label("Перевод…");
-                    let (btn, text, original, translated, showing) =
-                        (btn.clone(), text.clone(), original.clone(), translated.clone(), showing_translation.clone());
+                    let (btn, text, original, translated, showing) = (
+                        btn.clone(),
+                        text.clone(),
+                        original.clone(),
+                        translated.clone(),
+                        showing_translation.clone(),
+                    );
                     glib::spawn_future_local(async move {
                         let result = crate::api::translate::to_russian(&original).await;
                         btn.set_sensitive(true);
@@ -1127,7 +1391,14 @@ impl DetailPage {
         }
     }
 
-    pub fn show(&self, kind: &str, title: &str, subtitle: &str, cover_url: Option<String>, tracks: Vec<Track>) {
+    pub fn show(
+        &self,
+        kind: &str,
+        title: &str,
+        subtitle: &str,
+        cover_url: Option<String>,
+        tracks: Vec<Track>,
+    ) {
         self.kind.set_text(kind);
         self.title.set_text(title);
         self.stop_background_video();
@@ -1135,18 +1406,25 @@ impl DetailPage {
         self.cover.set_cursor(None::<&gdk::Cursor>);
         *self.source.borrow_mut() = source_label(kind, title).map(|label| {
             // у «Мне нравится» и «Загруженных» страницы нет, клик ведёт на вкладку Медиатека
-            PlaySource::new(label, (kind == "Коллекция").then_some(SourceTarget::Library))
+            PlaySource::new(
+                label,
+                (kind == "Коллекция").then_some(SourceTarget::Library),
+            )
         });
         self.listeners.set_visible(false);
         self.title_badge.set_visible(false);
-        self.subtitle.set_markup(&glib::markup_escape_text(subtitle));
+        self.subtitle
+            .set_markup(&glib::markup_escape_text(subtitle));
         self.link_albums.borrow_mut().clear();
         clear_box(&self.about);
         self.about.set_visible(false);
         self.about_for.borrow_mut().clear();
         self.cover.set_icon_name(Some("audio-x-generic-symbolic"));
         load_cover(&self.cover, cover_url.clone());
-        if cover_url.as_deref().map_or(false, |u| u.contains("ytimg.com")) {
+        if cover_url
+            .as_deref()
+            .map_or(false, |u| u.contains("ytimg.com"))
+        {
             let weak_cover = self.cover.downgrade();
             let a_str = subtitle.to_string();
             let t_str = title.to_string();
@@ -1173,7 +1451,12 @@ impl DetailPage {
             self.list.remove(&child);
         }
         for track in tracks.iter() {
-            let (p, t, id, src) = (self.player.clone(), self.tracks.clone(), track.id.clone(), self.source.clone());
+            let (p, t, id, src) = (
+                self.player.clone(),
+                self.tracks.clone(),
+                track.id.clone(),
+                self.source.clone(),
+            );
             // позицию ищем по id: добавление в плейлист сдвигает индексы
             let row = track_row(track, move || {
                 let i = t.borrow().iter().position(|x| x.id == id).unwrap_or(0);
@@ -1184,7 +1467,9 @@ impl DetailPage {
         }
         self.empty.set_visible(tracks.is_empty());
         self.offline_btn.set_label(offline_label(&tracks));
-        self.offline_btn.set_visible(!tracks.is_empty());
+        self.offline_btn.set_visible(
+            !tracks.is_empty() && !tracks.iter().any(|track| track.source == TrackSource::Vk),
+        );
         *self.tracks.borrow_mut() = tracks;
     }
 
@@ -1195,10 +1480,19 @@ impl DetailPage {
                 if self.tracks.borrow().iter().any(|t| t.id == track.id) {
                     return;
                 }
-                insert_track_row(&self.player, &self.nav, &self.tracks, &self.list, &self.empty, track);
+                insert_track_row(
+                    &self.player,
+                    &self.nav,
+                    &self.tracks,
+                    &self.list,
+                    &self.empty,
+                    track,
+                );
                 let count = self.tracks.borrow().len();
-                self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
-                self.offline_btn.set_visible(true);
+                self.subtitle
+                    .set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
+                self.offline_btn
+                    .set_visible(track.source != TrackSource::Vk);
             } else {
                 let pos = self.tracks.borrow().iter().position(|t| t.id == track.id);
                 if let Some(idx) = pos {
@@ -1207,7 +1501,8 @@ impl DetailPage {
                         self.list.remove(&row);
                     }
                     let count = self.tracks.borrow().len();
-                    self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
+                    self.subtitle
+                        .set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
                     if count == 0 {
                         self.empty.set_visible(true);
                         self.offline_btn.set_visible(false);
@@ -1226,13 +1521,25 @@ impl DetailPage {
 }
 
 /// Добавляет трек в начало списка страницы (как делает сервер при добавлении в плейлист)
-fn insert_track_row(p: &PlayerManager, nav: &NavCell, tracks: &Rc<RefCell<Vec<Track>>>, list: &ListBox, empty: &GtkBox, track: &Track) {
+fn insert_track_row(
+    p: &PlayerManager,
+    nav: &NavCell,
+    tracks: &Rc<RefCell<Vec<Track>>>,
+    list: &ListBox,
+    empty: &GtkBox,
+    track: &Track,
+) {
     tracks.borrow_mut().insert(0, track.clone());
     empty.set_visible(false);
     let (p2, t) = (p.clone(), tracks.clone());
     // индексы строк сдвинулись, поэтому позицию ищем по id
     let id = track.id.clone();
-    let source = nav.borrow().as_ref().and_then(|(_, w)| w.upgrade()).map(|pg| pg.source.clone()).unwrap_or_default();
+    let source = nav
+        .borrow()
+        .as_ref()
+        .and_then(|(_, w)| w.upgrade())
+        .map(|pg| pg.source.clone())
+        .unwrap_or_default();
     let row = track_row(track, move || {
         let i = t.borrow().iter().position(|x| x.id == id).unwrap_or(0);
         p2.set_queue_and_play_from(t.borrow().clone(), i, source.borrow().clone())
@@ -1245,7 +1552,10 @@ type NavCell = Rc<RefCell<Option<(Stack, std::rc::Weak<DetailPage>)>>>;
 
 /// Сердечко и «⋯» для строки на странице: переходы работают, если владелец задал стек (`set_nav`)
 fn row_actions(p: &PlayerManager, nav: &NavCell, track: &Track) -> GtkBox {
-    let target = nav.borrow().as_ref().and_then(|(s, w)| Some((s.clone(), w.upgrade()?)));
+    let target = nav
+        .borrow()
+        .as_ref()
+        .and_then(|(s, w)| Some((s.clone(), w.upgrade()?)));
     track_actions(p, target.as_ref().map(|(s, pg)| (s, pg)), track)
 }
 
@@ -1270,7 +1580,9 @@ pub fn open(
     let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
     glib::spawn_future_local(async move {
         let is_yt = match &source {
-            Source::Album(id) => id.starts_with("MPRE") || p.providers.active_id() == ProviderId::YouTubeMusic,
+            Source::Album(id) => {
+                id.starts_with("MPRE") || p.providers.active_id() == ProviderId::YouTubeMusic
+            }
             Source::Playlist(uid, _) => {
                 uid.starts_with("VL")
                     || uid.starts_with("PL")
@@ -1278,46 +1590,87 @@ pub fn open(
                     || p.providers.active_id() == ProviderId::YouTubeMusic
             }
         };
+        let is_vk = match &source {
+            Source::Album(id) => id.starts_with("vk:"),
+            Source::Playlist(uid, kind) => uid.starts_with("vk:") || kind.starts_with("vk:"),
+        };
+        let session = p.providers.session();
 
         let result: Result<Vec<Track>, String> = match &source {
             Source::Album(id) => {
-                if is_yt {
-                    p.yt_client.get_album_tracks(id).await.map_err(|e| e.to_string())
+                if is_vk {
+                    Err("Открытие альбомов VK пока не поддерживается".to_owned())
+                } else if is_yt {
+                    p.yt_client
+                        .get_album_tracks(id)
+                        .await
+                        .map_err(|e| e.to_string())
                 } else {
                     let client = p.client.lock().unwrap().clone();
                     client.get_album_tracks(id).await.map_err(|e| e.to_string())
                 }
             }
             Source::Playlist(uid, k) => {
-                if is_yt {
-                    p.yt_client.get_album_tracks(uid).await.map_err(|e| e.to_string())
+                if is_vk {
+                    let playlist = Playlist {
+                        uid: uid.clone(),
+                        kind: k.clone(),
+                        title: title.clone(),
+                        ..Default::default()
+                    };
+                    match p.providers.get(ProviderId::Vk) {
+                        Some(provider) => provider
+                            .get_playlist_tracks(&playlist)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("Требуется вход во ВКонтакте".to_owned()),
+                    }
+                } else if is_yt {
+                    p.yt_client
+                        .get_album_tracks(uid)
+                        .await
+                        .map_err(|e| e.to_string())
                 } else {
                     let client = p.client.lock().unwrap().clone();
-                    client.get_playlist_tracks(uid, k).await.map_err(|e| e.to_string())
+                    client
+                        .get_playlist_tracks(uid, k)
+                        .await
+                        .map_err(|e| e.to_string())
                 }
             }
         };
 
         ensure_liked(&p).await;
+        if !p.providers.is_current(session.id, session.generation) {
+            return;
+        }
         match result {
             Ok(tracks) => {
                 let cover_url = cover_url.or_else(|| tracks.first().and_then(|t| t.cover_url(400)));
                 page.show(kind, &title, &subtitle, cover_url, tracks);
                 match (&source, &album) {
-                    (Source::Album(_), Some(al)) => page.set_source_target(SourceTarget::Album(al.clone())),
-                    (Source::Playlist(uid, k), _) => page.set_source_target(SourceTarget::Playlist(Playlist {
-                        uid: uid.clone(),
-                        kind: k.clone(),
-                        title: title.clone(),
-                        ..Default::default()
-                    })),
+                    (Source::Album(_), Some(al)) => {
+                        page.set_source_target(SourceTarget::Album(al.clone()))
+                    }
+                    (Source::Playlist(uid, k), _) => {
+                        page.set_source_target(SourceTarget::Playlist(Playlist {
+                            uid: uid.clone(),
+                            kind: k.clone(),
+                            title: title.clone(),
+                            ..Default::default()
+                        }))
+                    }
                     _ => {}
                 }
                 if let Source::Playlist(uid, k) = &source {
-                    if !is_yt {
+                    if !is_yt && !is_vk {
                         let client = p.client.lock().unwrap().clone();
                         if let Ok(me) = client.get_uid().await {
-                            let liked = client.get_liked_playlist_keys(&me).await.unwrap_or_default().contains(&format!("{}:{}", uid, k));
+                            let liked = client
+                                .get_liked_playlist_keys(&me)
+                                .await
+                                .unwrap_or_default()
+                                .contains(&format!("{}:{}", uid, k));
                             page.set_playlist_context(me.clone(), uid.clone(), k.clone(), liked);
                             // меню «⋯» только у своих плейлистов
                             if me == *uid {
@@ -1336,7 +1689,10 @@ pub fn open(
                 }
                 stack.set_visible_child_name("detail");
             }
-            Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить «{}»: {}", title, e))),
+            Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                "Не удалось загрузить «{}»: {}",
+                title, e
+            ))),
         }
     });
 }
@@ -1365,16 +1721,26 @@ pub fn open_album(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, 
 }
 
 /// Плитка альбома: клик открывает страницу альбома
-pub fn album_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, album: &Album, size: i32) -> Button {
+pub fn album_tile(
+    player: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    album: &Album,
+    size: i32,
+) -> Button {
     let title = album.title.clone().unwrap_or_default();
     let sub = album_subtitle(album);
     let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
     let al = album.clone();
-    tile(&title, &sub, album.cover_url(300), size, false, move || open_album(&p, &stack, &page, &al))
+    tile(&title, &sub, album.cover_url(300), size, false, move || {
+        open_album(&p, &stack, &page, &al)
+    })
 }
 
 fn playlist_subtitle(pl: &Playlist) -> String {
-    pl.track_count.map(|n| format!("{} треков", n)).unwrap_or_default()
+    pl.track_count
+        .map(|n| format!("{} треков", n))
+        .unwrap_or_default()
 }
 
 /// Открывает страницу плейлиста
@@ -1393,13 +1759,32 @@ pub fn open_playlist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage
 }
 
 /// Плитка плейлиста: клик открывает страницу плейлиста
-pub fn playlist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, pl: &Playlist, size: i32) -> Button {
+pub fn playlist_tile(
+    player: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    pl: &Playlist,
+    size: i32,
+) -> Button {
     let (p, stack, page, playlist) = (player.clone(), stack.clone(), page.clone(), pl.clone());
-    tile(&pl.title, &playlist_subtitle(pl), pl.cover_url(300), size, false, move || open_playlist(&p, &stack, &page, &playlist))
+    tile(
+        &pl.title,
+        &playlist_subtitle(pl),
+        pl.cover_url(300),
+        size,
+        false,
+        move || open_playlist(&p, &stack, &page, &playlist),
+    )
 }
 
 /// Плитка артиста: клик открывает страницу артиста
-pub fn artist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, artist: &Artist, size: i32) -> Button {
+pub fn artist_tile(
+    player: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    artist: &Artist,
+    size: i32,
+) -> Button {
     let col = GtkBox::new(Orientation::Vertical, 4);
     col.set_width_request(size);
     let cover = cover_image(size, artist.cover_url(300));
@@ -1413,7 +1798,12 @@ pub fn artist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
     btn.set_child(Some(&col));
     btn.add_css_class("flat");
     btn.add_css_class("cover-tile");
-    let (p, stack, page, id) = (player.clone(), stack.clone(), page.clone(), artist.id.clone());
+    let (p, stack, page, id) = (
+        player.clone(),
+        stack.clone(),
+        page.clone(),
+        artist.id.clone(),
+    );
     btn.connect_clicked(move |_| {
         open_artist(&p, &stack, &page, id.clone());
     });
@@ -1421,15 +1811,27 @@ pub fn artist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
 }
 
 /// Страница артиста: популярные треки, альбомы и «Волна по артисту»
-pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, artist_id: String) {
+pub fn open_artist(
+    player: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    artist_id: String,
+) {
     let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
     glib::spawn_future_local(async move {
-        let is_yt = artist_id.starts_with("UC") || p.providers.active_id() == ProviderId::YouTubeMusic;
+        let is_yt =
+            artist_id.starts_with("UC") || p.providers.active_id() == ProviderId::YouTubeMusic;
         let brief_result: Result<crate::api::models::ArtistBrief, String> = if is_yt {
-            p.yt_client.get_artist(&artist_id).await.map_err(|e| e.to_string())
+            p.yt_client
+                .get_artist(&artist_id)
+                .await
+                .map_err(|e| e.to_string())
         } else {
             let client = p.client.lock().unwrap().clone();
-            client.get_artist_brief(&artist_id).await.map_err(|e| e.to_string())
+            client
+                .get_artist_brief(&artist_id)
+                .await
+                .map_err(|e| e.to_string())
         };
 
         match brief_result {
@@ -1439,16 +1841,26 @@ pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                 page.show("Исполнитель", &a.name, "", None, brief.popular_tracks);
                 page.set_round_cover(true);
                 load_artist_avatar(&page.cover, &a.name, None);
-                let real_artist_id = if a.id.is_empty() { artist_id } else { a.id.clone() };
+                let real_artist_id = if a.id.is_empty() {
+                    artist_id
+                } else {
+                    a.id.clone()
+                };
                 page.set_source_target(SourceTarget::Artist(real_artist_id.clone()));
-                let photos: Vec<String> = brief.all_covers.iter().filter_map(|c| c.uri.clone()).collect();
+                let photos: Vec<String> = brief
+                    .all_covers
+                    .iter()
+                    .filter_map(|c| c.uri.clone())
+                    .collect();
                 page.set_photos(&photos);
 
                 // Если студийный аватар найден, добавляем его первой фотографией в галерею
                 let weak_page = Rc::downgrade(&page);
                 let artist_name = a.name.clone();
                 glib::spawn_future_local(async move {
-                    if let Some(avatar_url) = crate::cache::cover_resolver::resolve_artist_avatar(&artist_name).await {
+                    if let Some(avatar_url) =
+                        crate::cache::cover_resolver::resolve_artist_avatar(&artist_name).await
+                    {
                         if let Some(pg) = weak_page.upgrade() {
                             let mut current = pg.photos.borrow().clone();
                             if !current.contains(&avatar_url) {
@@ -1462,7 +1874,11 @@ pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                     page.set_listeners(n);
                 }
                 // видео шапки: только https и хосты Яндекса, ссылка приходит из ответа сервера
-                if let Some(url) = brief.background_video_url.clone().filter(|u| trusted_video_url(u)) {
+                if let Some(url) = brief
+                    .background_video_url
+                    .clone()
+                    .filter(|u| trusted_video_url(u))
+                {
                     let (page, token) = (page.clone(), page.video_token());
                     glib::spawn_future_local(async move {
                         if let Some(path) = crate::cache::fetch_clip_cached(&url).await {
@@ -1485,7 +1901,10 @@ pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                 }
                 stack.set_visible_child_name("detail");
             }
-            Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить артиста: {}", e))),
+            Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                "Не удалось загрузить артиста: {}",
+                e
+            ))),
         }
     });
 }
@@ -1583,7 +2002,10 @@ where
                     p.emit(PlayerUiEvent::StatusMessage(m.into()));
                 }
             }
-            Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось выполнить действие: {}", e))),
+            Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                "Не удалось выполнить действие: {}",
+                e
+            ))),
         }
     });
 }
@@ -1602,7 +2024,11 @@ fn menu_item(icon: &str, text: &str) -> Button {
 }
 
 /// Сердечко и меню «⋯» справа от трека: волна по треку, дизлайк, плейлист, ссылка, переходы
-pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage>)>, track: &Track) -> GtkBox {
+pub fn track_actions(
+    player: &PlayerManager,
+    nav: Option<(&Stack, &Rc<DetailPage>)>,
+    track: &Track,
+) -> GtkBox {
     let bx = GtkBox::new(Orientation::Horizontal, 2);
     bx.set_valign(Align::Center);
 
@@ -1655,34 +2081,90 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
             f();
         });
         main.append(&b);
+        b
     };
 
     {
         let (p, t) = (player.clone(), track.clone());
-        add("media-playlist-consecutive-symbolic", "Волна по треку", Box::new(move || p.play_single_track(t.clone())));
+        let wave = add(
+            "media-playlist-consecutive-symbolic",
+            "Волна по треку",
+            Box::new(move || p.play_single_track(t.clone())),
+        );
+        // VK Mix не принимает ID отдельного трека как seed.
+        wave.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        let is_yt = t.source == TrackSource::YouTubeMusic || t.id.len() == 11 || p.providers.active_id() == ProviderId::YouTubeMusic;
-        add("dialog-error-symbolic", "Не нравится", Box::new(move || {
-            if is_yt {
-                let (p, t) = (p.clone(), t.clone());
-                glib::spawn_future_local(async move {
-                    if let Some(yt) = p.providers.get(ProviderId::YouTubeMusic) {
-                        let _ = yt.set_track_like(&t.id, false).await;
-                    }
-                    let _ = p.yt_client.dislike_track(&t.id).await;
-                    p.emit(PlayerUiEvent::StatusMessage("Трек скрыт из рекомендаций 👎".into()));
-                    let is_current = p.state.lock().unwrap().current_track.as_ref().map(|cur| cur.id == t.id).unwrap_or(false);
-                    if is_current {
-                        p.next_track();
-                    }
-                });
-            } else {
-                let id = t.id.clone();
-                run_api(&p, Some("Трек скрыт из рекомендаций 👎"), move |c, uid| async move { c.dislike_track(&uid, &id).await });
-            }
-        }));
+        let is_yt = t.source == TrackSource::YouTubeMusic
+            || t.id.len() == 11
+            || p.providers.active_id() == ProviderId::YouTubeMusic;
+        let is_vk = t.source == TrackSource::Vk;
+        add(
+            "dialog-error-symbolic",
+            "Не нравится",
+            Box::new(move || {
+                if is_vk {
+                    let (p, t) = (p.clone(), t.clone());
+                    glib::spawn_future_local(async move {
+                        let result = match p.providers.get(ProviderId::Vk) {
+                            Some(provider) => provider.set_track_dislike(&t.id).await,
+                            None => Err("Требуется вход во ВКонтакте".into()),
+                        };
+                        match result {
+                            Ok(()) => {
+                                p.emit(PlayerUiEvent::StatusMessage(
+                                    "Трек скрыт из рекомендаций 👎".into(),
+                                ));
+                                let is_current = p
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .current_track
+                                    .as_ref()
+                                    .map(|cur| cur.id == t.id)
+                                    .unwrap_or(false);
+                                if is_current {
+                                    p.next_track();
+                                }
+                            }
+                            Err(error) => p.emit(PlayerUiEvent::Error(format!(
+                                "Не удалось скрыть трек VK: {error}"
+                            ))),
+                        }
+                    });
+                } else if is_yt {
+                    let (p, t) = (p.clone(), t.clone());
+                    glib::spawn_future_local(async move {
+                        if let Some(yt) = p.providers.get(ProviderId::YouTubeMusic) {
+                            let _ = yt.set_track_like(&t.id, false).await;
+                        }
+                        let _ = p.yt_client.dislike_track(&t.id).await;
+                        p.emit(PlayerUiEvent::StatusMessage(
+                            "Трек скрыт из рекомендаций 👎".into(),
+                        ));
+                        let is_current = p
+                            .state
+                            .lock()
+                            .unwrap()
+                            .current_track
+                            .as_ref()
+                            .map(|cur| cur.id == t.id)
+                            .unwrap_or(false);
+                        if is_current {
+                            p.next_track();
+                        }
+                    });
+                } else {
+                    let id = t.id.clone();
+                    run_api(
+                        &p,
+                        Some("Трек скрыт из рекомендаций 👎"),
+                        move |c, uid| async move { c.dislike_track(&uid, &id).await },
+                    );
+                }
+            }),
+        );
     }
 
     // «Добавить в плейлист» открывает вторую страницу с плейлистами пользователя
@@ -1697,7 +2179,8 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
             back.connect_clicked(move |_| v.set_visible_child_name("main"));
             plists.append(&back);
             let create = menu_item("list-add-symbolic", "Создать плейлист");
-            let is_yt = t.source == TrackSource::YouTubeMusic || p.providers.active_id() == ProviderId::YouTubeMusic;
+            let is_yt = t.source == TrackSource::YouTubeMusic
+                || p.providers.active_id() == ProviderId::YouTubeMusic;
             {
                 let (p, t, pop) = (p.clone(), t.clone(), pop.clone());
                 create.connect_clicked(move |b| {
@@ -1709,18 +2192,27 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                         ask_playlist_name(b, move |name| {
                             glib::spawn_future_local(async move {
                                 match yt.create_playlist(&name, Some(&t_clone.id)).await {
-                                    Ok(_) => p_clone.emit(PlayerUiEvent::StatusMessage("Плейлист создан, трек добавлен".into())),
-                                    Err(e) => p_clone.emit(PlayerUiEvent::Error(format!("Ошибка создания плейлиста: {}", e))),
+                                    Ok(_) => p_clone.emit(PlayerUiEvent::StatusMessage(
+                                        "Плейлист создан, трек добавлен".into(),
+                                    )),
+                                    Err(e) => p_clone.emit(PlayerUiEvent::Error(format!(
+                                        "Ошибка создания плейлиста: {}",
+                                        e
+                                    ))),
                                 }
                             });
                         });
                     } else {
                         let (p, t) = (p.clone(), t.clone());
                         ask_playlist_name(b, move |name| {
-                            run_api(&p, Some("Плейлист создан, трек добавлен"), move |c, uid| async move {
-                                let kind = c.create_playlist(&uid, &name).await?;
-                                c.add_track_to_playlist(&uid, &kind, &t).await
-                            });
+                            run_api(
+                                &p,
+                                Some("Плейлист создан, трек добавлен"),
+                                move |c, uid| async move {
+                                    let kind = c.create_playlist(&uid, &name).await?;
+                                    c.add_track_to_playlist(&uid, &kind, &t).await
+                                },
+                            );
                         });
                     }
                 });
@@ -1746,18 +2238,31 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                                 let pop = pop.clone();
                                 b.connect_clicked(move |_| {
                                     pop.popdown();
-                                    let (yt, p_clone, pl_id, track_id) = (yt.clone(), p_clone.clone(), pl_id.clone(), track_id.clone());
+                                    let (yt, p_clone, pl_id, track_id) = (
+                                        yt.clone(),
+                                        p_clone.clone(),
+                                        pl_id.clone(),
+                                        track_id.clone(),
+                                    );
                                     glib::spawn_future_local(async move {
                                         match yt.add_track_to_playlist(&pl_id, &track_id).await {
-                                            Ok(()) => p_clone.emit(PlayerUiEvent::StatusMessage("Добавлено в плейлист".into())),
-                                            Err(e) => p_clone.emit(PlayerUiEvent::Error(format!("Не удалось добавить: {}", e))),
+                                            Ok(()) => p_clone.emit(PlayerUiEvent::StatusMessage(
+                                                "Добавлено в плейлист".into(),
+                                            )),
+                                            Err(e) => p_clone.emit(PlayerUiEvent::Error(format!(
+                                                "Не удалось добавить: {}",
+                                                e
+                                            ))),
                                         }
                                     });
                                 });
                                 plists.append(&b);
                             }
                         }
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить плейлисты: {}", e))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось загрузить плейлисты: {}",
+                            e
+                        ))),
                     }
                 } else {
                     let client = p.client.lock().unwrap().clone();
@@ -1769,152 +2274,230 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                         Ok(lists) => {
                             for pl in lists {
                                 let b = menu_item("view-list-symbolic", &pl.title);
-                                let (p, t, pop, kind) = (p.clone(), t.clone(), pop.clone(), pl.kind.clone());
+                                let (p, t, pop, kind) =
+                                    (p.clone(), t.clone(), pop.clone(), pl.kind.clone());
                                 b.connect_clicked(move |_| {
                                     pop.popdown();
                                     let t = t.clone();
                                     let kind = kind.clone();
-                                    run_api(&p, Some("Добавлено в плейлист"), move |c, uid| async move {
-                                        c.add_track_to_playlist(&uid, &kind, &t).await
-                                    });
+                                    run_api(
+                                        &p,
+                                        Some("Добавлено в плейлист"),
+                                        move |c, uid| async move {
+                                            c.add_track_to_playlist(&uid, &kind, &t).await
+                                        },
+                                    );
                                 });
                                 plists.append(&b);
                             }
                         }
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить плейлисты: {}", e))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось загрузить плейлисты: {}",
+                            e
+                        ))),
                     }
                 }
             });
         });
     }
+    to_pl.set_visible(track.source != TrackSource::Vk);
     main.append(&to_pl);
 
     {
         let (p, t) = (player.clone(), track.clone());
-        add("edit-copy-symbolic", "Скопировать ссылку", Box::new(move || {
-            let url = if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
-                format!("https://music.youtube.com/watch?v={}", t.id)
-            } else {
-                match t.albums.first() {
-                    Some(a) => format!("https://music.yandex.ru/album/{}/track/{}", a.id, t.id),
-                    None => format!("https://music.yandex.ru/track/{}", t.id),
-                }
-            };
-            if let Some(d) = gdk::Display::default() {
-                d.clipboard().set_text(&url);
-                p.emit(PlayerUiEvent::StatusMessage("Ссылка скопирована".into()));
-            }
-        }));
-    }
-    {
-        let (p, t) = (player.clone(), track.clone());
-        add("folder-download-symbolic", "Скачать", Box::new(move || {
-            p.emit(PlayerUiEvent::StatusMessage("Скачивание…".into()));
-            let (p, t) = (p.clone(), t.clone());
-            glib::spawn_future_local(async move {
-                if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
-                    match p.yt_client.download_track_file(&t).await {
-                        Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!("Сохранено: {}", path.display()))),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось скачать: {}", e))),
-                    }
+        add(
+            "edit-copy-symbolic",
+            "Скопировать ссылку",
+            Box::new(move || {
+                let url = if t.source == TrackSource::Vk {
+                    format!(
+                        "https://vk.com/audio{}",
+                        t.id.strip_prefix("vk:").unwrap_or(&t.id)
+                    )
+                } else if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+                    format!("https://music.youtube.com/watch?v={}", t.id)
                 } else {
-                    let client = p.client.lock().unwrap().clone();
-                    match client.download_track(&t).await {
-                        Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!("Сохранено: {}", path.display()))),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось скачать: {}", e))),
+                    match t.albums.first() {
+                        Some(a) => format!("https://music.yandex.ru/album/{}/track/{}", a.id, t.id),
+                        None => format!("https://music.yandex.ru/track/{}", t.id),
                     }
-                }
-            });
-        }));
-    }
-    {
-        let (p, t) = (player.clone(), track.clone());
-        add("folder-download-symbolic", "Сохранить офлайн (в приложении)", Box::new(move || {
-            if crate::cache::offline_audio_path(&t.id).is_some() {
-                crate::cache::remove_offline(&t.id);
-                p.emit(PlayerUiEvent::StatusMessage("Удалено из офлайна".into()));
-                return;
-            }
-            p.emit(PlayerUiEvent::StatusMessage("Загрузка для офлайна…".into()));
-            let (p, t) = (p.clone(), t.clone());
-            glib::spawn_future_local(async move {
-                if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
-                    match p.yt_client.save_track_offline(&t).await {
-                        Ok(()) => p.emit(PlayerUiEvent::StatusMessage("Трек сохранён для прослушивания без интернета".into())),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить: {}", e))),
-                    }
-                } else {
-                    let client = p.client.lock().unwrap().clone();
-                    match client.save_track_offline(&t).await {
-                        Ok(()) => p.emit(PlayerUiEvent::StatusMessage("Трек сохранён для прослушивания без интернета".into())),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить: {}", e))),
-                    }
-                }
-            });
-        }));
-    }
-    {
-        let (p, t) = (player.clone(), track.clone());
-        add("video-x-generic-symbolic", "Трейлер", Box::new(move || {
-            if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
-                let url = format!("https://www.youtube.com/watch?v={}", t.id);
-                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-            } else {
-                let (p, t) = (p.clone(), t.clone());
-                glib::spawn_future_local(async move {
-                    let client = p.client.lock().unwrap().clone();
-                    match client.get_clip_url_for_track(&t).await {
-                        // клип открывается в системном проигрывателе
-                        Some(url) => {
-                            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-                        }
-                        None => p.emit(PlayerUiEvent::StatusMessage("У трека нет трейлера".into())),
-                    }
-                });
-            }
-        }));
-    }
-    {
-        let (p, t) = (player.clone(), track.clone());
-        add("code-symbolic", "Скопировать HTML-код", Box::new(move || {
-            if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
-                let html = format!(
-                    r#"<iframe width="560" height="315" src="https://www.youtube-nocookie.com/embed/{}" title="{}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>"#,
-                    t.id, t.title
-                );
-                if let Some(d) = gdk::Display::default() {
-                    d.clipboard().set_text(&html);
-                    p.emit(PlayerUiEvent::StatusMessage("HTML-код YouTube скопирован".into()));
-                }
-            } else {
-                let album = t.albums.first().map(|a| a.id.clone()).unwrap_or_default();
-                let src = if album.is_empty() {
-                    format!("https://music.yandex.ru/iframe/track/{}", t.id)
-                } else {
-                    format!("https://music.yandex.ru/iframe/track/{}/{}", t.id, album)
                 };
                 if let Some(d) = gdk::Display::default() {
-                    d.clipboard().set_text(&format!(
+                    d.clipboard().set_text(&url);
+                    p.emit(PlayerUiEvent::StatusMessage("Ссылка скопирована".into()));
+                }
+            }),
+        );
+    }
+    {
+        let (p, t) = (player.clone(), track.clone());
+        let download = add(
+            "folder-download-symbolic",
+            "Скачать",
+            Box::new(move || {
+                p.emit(PlayerUiEvent::StatusMessage("Скачивание…".into()));
+                let (p, t) = (p.clone(), t.clone());
+                glib::spawn_future_local(async move {
+                    if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+                        match p.yt_client.download_track_file(&t).await {
+                            Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!(
+                                "Сохранено: {}",
+                                path.display()
+                            ))),
+                            Err(e) => {
+                                p.emit(PlayerUiEvent::Error(format!("Не удалось скачать: {}", e)))
+                            }
+                        }
+                    } else {
+                        let client = p.client.lock().unwrap().clone();
+                        match client.download_track(&t).await {
+                            Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!(
+                                "Сохранено: {}",
+                                path.display()
+                            ))),
+                            Err(e) => {
+                                p.emit(PlayerUiEvent::Error(format!("Не удалось скачать: {}", e)))
+                            }
+                        }
+                    }
+                });
+            }),
+        );
+        download.set_visible(track.source != TrackSource::Vk);
+    }
+    {
+        let (p, t) = (player.clone(), track.clone());
+        let offline = add(
+            "folder-download-symbolic",
+            "Сохранить офлайн (в приложении)",
+            Box::new(move || {
+                if crate::cache::offline_audio_path(&t.id).is_some() {
+                    crate::cache::remove_offline(&t.id);
+                    p.emit(PlayerUiEvent::StatusMessage("Удалено из офлайна".into()));
+                    return;
+                }
+                p.emit(PlayerUiEvent::StatusMessage("Загрузка для офлайна…".into()));
+                let (p, t) = (p.clone(), t.clone());
+                glib::spawn_future_local(async move {
+                    if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+                        match p.yt_client.save_track_offline(&t).await {
+                            Ok(()) => p.emit(PlayerUiEvent::StatusMessage(
+                                "Трек сохранён для прослушивания без интернета".into(),
+                            )),
+                            Err(e) => {
+                                p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить: {}", e)))
+                            }
+                        }
+                    } else {
+                        let client = p.client.lock().unwrap().clone();
+                        match client.save_track_offline(&t).await {
+                            Ok(()) => p.emit(PlayerUiEvent::StatusMessage(
+                                "Трек сохранён для прослушивания без интернета".into(),
+                            )),
+                            Err(e) => {
+                                p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить: {}", e)))
+                            }
+                        }
+                    }
+                });
+            }),
+        );
+        offline.set_visible(track.source != TrackSource::Vk);
+    }
+    {
+        let (p, t) = (player.clone(), track.clone());
+        let trailer = add(
+            "video-x-generic-symbolic",
+            "Трейлер",
+            Box::new(move || {
+                if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+                    let url = format!("https://www.youtube.com/watch?v={}", t.id);
+                    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                } else {
+                    let (p, t) = (p.clone(), t.clone());
+                    glib::spawn_future_local(async move {
+                        let client = p.client.lock().unwrap().clone();
+                        match client.get_clip_url_for_track(&t).await {
+                            // клип открывается в системном проигрывателе
+                            Some(url) => {
+                                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                            }
+                            None => {
+                                p.emit(PlayerUiEvent::StatusMessage("У трека нет трейлера".into()))
+                            }
+                        }
+                    });
+                }
+            }),
+        );
+        trailer.set_visible(track.source != TrackSource::Vk);
+    }
+    {
+        let (p, t) = (player.clone(), track.clone());
+        let html = add(
+            "code-symbolic",
+            "Скопировать HTML-код",
+            Box::new(move || {
+                if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+                    let html = format!(
+                        r#"<iframe width="560" height="315" src="https://www.youtube-nocookie.com/embed/{}" title="{}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>"#,
+                        t.id, t.title
+                    );
+                    if let Some(d) = gdk::Display::default() {
+                        d.clipboard().set_text(&html);
+                        p.emit(PlayerUiEvent::StatusMessage(
+                            "HTML-код YouTube скопирован".into(),
+                        ));
+                    }
+                } else {
+                    let album = t.albums.first().map(|a| a.id.clone()).unwrap_or_default();
+                    let src = if album.is_empty() {
+                        format!("https://music.yandex.ru/iframe/track/{}", t.id)
+                    } else {
+                        format!("https://music.yandex.ru/iframe/track/{}/{}", t.id, album)
+                    };
+                    if let Some(d) = gdk::Display::default() {
+                        d.clipboard().set_text(&format!(
                         "<iframe frameborder=\"0\" style=\"border:none;width:100%;height:100%;\" width=\"100%\" height=\"100%\" src=\"{}\"></iframe>",
                         src
                     ));
-                    p.emit(PlayerUiEvent::StatusMessage("HTML-код скопирован".into()));
+                        p.emit(PlayerUiEvent::StatusMessage("HTML-код скопирован".into()));
+                    }
                 }
-            }
-        }));
+            }),
+        );
+        html.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t, anchor) = (player.clone(), track.clone(), menu.clone());
-        add("dialog-information-symbolic", "О треке", Box::new(move || show_track_credits(&p, &anchor, &t)));
+        add(
+            "dialog-information-symbolic",
+            "О треке",
+            Box::new(move || show_track_credits(&p, &anchor, &t)),
+        );
     }
     // переходы нужны экрану со стеком страниц; без него (например, добавление в плейлист на лету) их нет
     if let (Some((stack, page)), Some(album)) = (nav, track.albums.first().cloned()) {
         let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
-        add("media-optical-symbolic", "Перейти к альбому", Box::new(move || open_album(&p, &stack, &page, &album)));
+        let album_nav = add(
+            "media-optical-symbolic",
+            "Перейти к альбому",
+            Box::new(move || open_album(&p, &stack, &page, &album)),
+        );
+        album_nav.set_visible(track.source != TrackSource::Vk);
     }
     if let (Some((stack, page)), Some(artist)) = (nav, track.artists.first()) {
-        let (p, stack, page, id) = (player.clone(), stack.clone(), page.clone(), artist.id.clone());
-        add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || open_artist(&p, &stack, &page, id.clone())));
+        let (p, stack, page, id) = (
+            player.clone(),
+            stack.clone(),
+            page.clone(),
+            artist.id.clone(),
+        );
+        add(
+            "avatar-default-symbolic",
+            "Перейти к исполнителю",
+            Box::new(move || open_artist(&p, &stack, &page, id.clone())),
+        );
     }
 
     bx.append(&menu);
@@ -1932,12 +2515,16 @@ pub fn ask_playlist_name(anchor: &impl IsA<gtk4::Widget>, on_ok: impl FnOnce(Str
     dialog.add_response("create", "Создать");
     dialog.set_response_appearance("create", libadwaita::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("create"));
-    dialog.choose(Some(anchor), None::<&gtk4::gio::Cancellable>, move |response| {
-        let name = entry.text().trim().to_string();
-        if response == "create" && !name.is_empty() {
-            on_ok(name);
-        }
-    });
+    dialog.choose(
+        Some(anchor),
+        None::<&gtk4::gio::Cancellable>,
+        move |response| {
+            let name = entry.text().trim().to_string();
+            if response == "create" && !name.is_empty() {
+                on_ok(name);
+            }
+        },
+    );
 }
 
 /// Плитка «Новый плейлист» с плюсом вместо обложки
@@ -1986,16 +2573,40 @@ fn show_track_credits(player: &PlayerManager, anchor: &impl IsA<gtk4::Widget>, t
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));
 
-    if track.source == TrackSource::YouTubeMusic || track.id.len() == 11 {
+    if track.source != TrackSource::Yandex {
         content.remove(&status);
         let duration = track.formatted_duration();
-        let album = track.albums.first().and_then(|a| a.title.as_deref()).unwrap_or("Сингл");
-        let link = format!("https://music.youtube.com/watch?v={}", track.id);
+        let album = track
+            .albums
+            .first()
+            .and_then(|a| a.title.as_deref())
+            .unwrap_or("Сингл");
+        let (service, link) = match track.source {
+            TrackSource::YouTubeMusic => (
+                "YouTube Music",
+                format!("https://music.youtube.com/watch?v={}", track.id),
+            ),
+            TrackSource::Vk => (
+                "ВКонтакте",
+                format!(
+                    "https://vk.com/audio{}",
+                    track.id.strip_prefix("vk:").unwrap_or(&track.id)
+                ),
+            ),
+            TrackSource::Yandex => unreachable!(),
+        };
         let items: [(&str, String); 6] = [
             ("Исполнитель", track.artists_string()),
             ("Альбом", album.to_string()),
-            ("Длительность", if duration.is_empty() { "—".to_string() } else { duration }),
-            ("Сервис", "YouTube Music".to_string()),
+            (
+                "Длительность",
+                if duration.is_empty() {
+                    "—".to_string()
+                } else {
+                    duration
+                },
+            ),
+            ("Сервис", service.to_string()),
             ("ID", track.id.clone()),
             ("Ссылка", link),
         ];
@@ -2052,7 +2663,11 @@ fn show_track_credits(player: &PlayerManager, anchor: &impl IsA<gtk4::Widget>, t
 
 /// Подпись кнопки загрузки: «Удалить загрузки», если все треки уже сохранены
 fn offline_label(tracks: &[Track]) -> &'static str {
-    if !tracks.is_empty() && tracks.iter().all(|t| crate::cache::offline_audio_path(&t.id).is_some()) {
+    if !tracks.is_empty()
+        && tracks
+            .iter()
+            .all(|t| crate::cache::offline_audio_path(&t.id).is_some())
+    {
         "Удалить загрузки"
     } else {
         "Загрузить"
@@ -2090,8 +2705,14 @@ mod source_tests {
 
     #[test]
     fn labels_and_digits() {
-        assert_eq!(source_label("Плейлист", "Попа").as_deref(), Some("Плейлист: Попа"));
-        assert_eq!(source_label("Исполнитель", "Три дня дождя").as_deref(), Some("Популярное: Три дня дождя"));
+        assert_eq!(
+            source_label("Плейлист", "Попа").as_deref(),
+            Some("Плейлист: Попа")
+        );
+        assert_eq!(
+            source_label("Исполнитель", "Три дня дождя").as_deref(),
+            Some("Популярное: Три дня дождя")
+        );
         assert_eq!(source_label("Что-то", "x"), None);
         assert_eq!(group_digits(5_510_287), "5\u{a0}510\u{a0}287");
         assert_eq!(group_digits(999), "999");
@@ -2100,7 +2721,9 @@ mod source_tests {
 
 /// Видео шапки принимается только по https с хоста Яндекса
 fn trusted_video_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
     let host = rest.split('/').next().unwrap_or("");
     host.ends_with(".yandex.net") || host.ends_with(".yandex.ru")
 }
@@ -2111,10 +2734,16 @@ mod video_url_tests {
 
     #[test]
     fn only_yandex_https_hosts_are_trusted() {
-        assert!(trusted_video_url("https://runtime.strm.yandex.ru/videos/a/b.mp4"));
-        assert!(trusted_video_url("https://video-preview.s3.yandex.net/x.mp4"));
+        assert!(trusted_video_url(
+            "https://runtime.strm.yandex.ru/videos/a/b.mp4"
+        ));
+        assert!(trusted_video_url(
+            "https://video-preview.s3.yandex.net/x.mp4"
+        ));
         assert!(!trusted_video_url("http://runtime.strm.yandex.ru/x.mp4"));
-        assert!(!trusted_video_url("https://evil.example.com/yandex.ru/x.mp4"));
+        assert!(!trusted_video_url(
+            "https://evil.example.com/yandex.ru/x.mp4"
+        ));
         assert!(!trusted_video_url("https://yandex.ru.evil.com/x.mp4"));
     }
 }
@@ -2130,7 +2759,11 @@ const AMBIENT_LIFT: i32 = 40;
 fn ambient_frame(f: &super::wave_clip::ClipFrame, ratio: f32) -> (i32, i32, Vec<u8>) {
     const W: usize = 112;
     let (sw, sh) = (f.width.max(1) as usize, f.height.max(1) as usize);
-    let (cw, ch) = if sw as f32 / sh as f32 > ratio { ((sh as f32 * ratio) as usize, sh) } else { (sw, (sw as f32 / ratio) as usize) };
+    let (cw, ch) = if sw as f32 / sh as f32 > ratio {
+        ((sh as f32 * ratio) as usize, sh)
+    } else {
+        (sw, (sw as f32 / ratio) as usize)
+    };
     let (cw, ch) = (cw.clamp(1, sw), ch.clamp(1, sh));
     let (x0, y0) = ((sw - cw) / 2, ((sh - ch) as f32 * 0.3) as usize);
     let h = ((W as f32 / ratio.max(0.1)) as usize).clamp(4, 112);
@@ -2143,10 +2776,17 @@ fn ambient_frame(f: &super::wave_clip::ClipFrame, ratio: f32) -> (i32, i32, Vec<
         // прозрачность: сверху плотно, нижние 55% растворяются; по бокам короткое растворение
         let fy = smooth((h - 1 - oy) as f32 / (h - 1).max(1) as f32 / 0.62);
         for ox in 0..W {
-            let fx = smooth(ox as f32 / W as f32 / 0.12) * smooth((W - 1 - ox) as f32 / W as f32 / 0.12);
+            let fx =
+                smooth(ox as f32 / W as f32 / 0.12) * smooth((W - 1 - ox) as f32 / W as f32 / 0.12);
             // среднее по блоку исходного кадра
-            let (bx0, bx1) = (x0 + ox * cw / W, (x0 + (ox + 1) * cw / W).max(x0 + ox * cw / W + 1));
-            let (by0, by1) = (y0 + oy * ch / h, (y0 + (oy + 1) * ch / h).max(y0 + oy * ch / h + 1));
+            let (bx0, bx1) = (
+                x0 + ox * cw / W,
+                (x0 + (ox + 1) * cw / W).max(x0 + ox * cw / W + 1),
+            );
+            let (by0, by1) = (
+                y0 + oy * ch / h,
+                (y0 + (oy + 1) * ch / h).max(y0 + oy * ch / h + 1),
+            );
             let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
             for y in (by0..by1.min(sh)).step_by(2) {
                 for x in (bx0..bx1.min(sw)).step_by(2) {
@@ -2160,7 +2800,12 @@ fn ambient_frame(f: &super::wave_clip::ClipFrame, ratio: f32) -> (i32, i32, Vec<
             let n = n.max(1) as f32;
             let a = fx * fy;
             let m = a * 0.88; // лёгкое затемнение: текст шапки читается, видео остаётся заметным
-            out.extend_from_slice(&[(r as f32 / n * m) as u8, (g as f32 / n * m) as u8, (b as f32 / n * m) as u8, (a * 255.0) as u8]);
+            out.extend_from_slice(&[
+                (r as f32 / n * m) as u8,
+                (g as f32 / n * m) as u8,
+                (b as f32 / n * m) as u8,
+                (a * 255.0) as u8,
+            ]);
         }
     }
     (W as i32, h as i32, out)
@@ -2173,13 +2818,20 @@ mod ambient_tests {
 
     #[test]
     fn background_is_small_and_fades_to_bottom_and_sides() {
-        let f = ClipFrame { width: 640, height: 860, data: vec![200; 640 * 860 * 4] };
+        let f = ClipFrame {
+            width: 640,
+            height: 860,
+            data: vec![200; 640 * 860 * 4],
+        };
         let (w, h, d) = ambient_frame(&f, 4.0);
         assert_eq!((w, h), (112, 28));
         let alpha = |x: usize, y: usize| d[(y * w as usize + x) * 4 + 3];
         assert!(alpha(56, 0) > 240, "верх в центре плотный");
         assert!(alpha(56, 27) < 5, "низ прозрачен");
-        assert!(alpha(0, 0) < 5 && alpha(111, 0) < 5, "края по бокам прозрачны");
+        assert!(
+            alpha(0, 0) < 5 && alpha(111, 0) < 5,
+            "края по бокам прозрачны"
+        );
         assert!(d[56 * 4] < 200, "кадр слегка затемнён");
     }
 }
@@ -2192,9 +2844,15 @@ fn load_picture(pic: &gtk4::Picture, url: String) {
     }
     let weak = pic.downgrade();
     glib::spawn_future_local(async move {
-        let Ok(resp) = reqwest::get(&url).await else { return };
-        let Ok(bytes) = resp.bytes().await else { return };
-        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
+        let Ok(resp) = reqwest::get(&url).await else {
+            return;
+        };
+        let Ok(bytes) = resp.bytes().await else {
+            return;
+        };
+        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else {
+            return;
+        };
         COVERS.with(|c| c.borrow_mut().insert(url, tex.clone()));
         if let Some(p) = weak.upgrade() {
             p.set_paintable(Some(&tex));
@@ -2233,7 +2891,10 @@ fn show_photo_gallery(anchor: &impl IsA<gtk4::Widget>, title: &str, urls: &[Stri
         b.set_margin_end(12);
         b
     };
-    let (prev, next) = (arrow("go-previous-symbolic", Align::Start), arrow("go-next-symbolic", Align::End));
+    let (prev, next) = (
+        arrow("go-previous-symbolic", Align::Start),
+        arrow("go-next-symbolic", Align::End),
+    );
     let overlay = gtk4::Overlay::new();
     overlay.set_child(Some(&carousel));
     overlay.add_overlay(&prev);
