@@ -1,3 +1,4 @@
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -83,10 +84,20 @@ impl VkAudioId {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct VkCaptchaChallenge {
+    pub sid: Option<String>,
+    pub image_url: Option<String>,
+}
+
+pub type VkCaptchaHandler =
+    Arc<dyn Fn(VkCaptchaChallenge, async_channel::Sender<String>) + Send + Sync + 'static>;
+
 pub struct VkClient {
     http: reqwest::Client,
     token: Zeroizing<String>,
     api_base: String,
+    captcha_handler: Arc<RwLock<Option<VkCaptchaHandler>>>,
 }
 
 impl VkClient {
@@ -118,7 +129,15 @@ impl VkClient {
             http,
             token,
             api_base: api_base.into(),
+            captcha_handler: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub fn set_captcha_handler(&self, handler: VkCaptchaHandler) {
+        *self
+            .captcha_handler
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(handler);
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -132,12 +151,20 @@ impl VkClient {
     ) -> Result<T, VkError> {
         let url = format!("{}/method/{method}", self.api_base);
         let mut attempt = 0;
+        let mut captcha_answer: Option<(Option<String>, String)> = None;
+        let mut captcha_handled = false;
 
         loop {
             let result = async {
                 let mut form = params.to_vec();
                 form.push(("access_token", self.token.as_str()));
                 form.push(("v", VK_API_VERSION));
+                if let Some((sid, key)) = captcha_answer.as_ref() {
+                    if let Some(sid) = sid.as_deref() {
+                        form.push(("captcha_sid", sid));
+                    }
+                    form.push(("captcha_key", key));
+                }
 
                 let response = self.http.post(&url).form(&form).send().await?;
                 let status = response.status();
@@ -151,6 +178,34 @@ impl VkClient {
                     attempt += 1;
                     let delay = Duration::from_millis(250 * 2_u64.pow(attempt - 1));
                     tokio::time::sleep(delay).await;
+                }
+                Err(VkError::Captcha { sid, image_url }) if !captcha_handled => {
+                    let handler = self
+                        .captcha_handler
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
+                    let Some(handler) = handler else {
+                        return Err(VkError::Captcha { sid, image_url });
+                    };
+                    let (respond, response) = async_channel::bounded(1);
+                    handler(
+                        VkCaptchaChallenge {
+                            sid: sid.clone(),
+                            image_url: image_url.clone(),
+                        },
+                        respond,
+                    );
+                    let answer =
+                        tokio::time::timeout(Duration::from_secs(300), response.recv()).await;
+                    match answer {
+                        Ok(Ok(key)) if !key.trim().is_empty() => {
+                            captcha_answer = Some((sid, key));
+                            captcha_handled = true;
+                            attempt = 0;
+                        }
+                        _ => return Err(VkError::Captcha { sid, image_url }),
+                    }
                 }
                 result => return result,
             }
@@ -464,6 +519,59 @@ mod tests {
         .expect_err("invalid HTTP response must fail");
         assert!(matches!(error, VkError::Http { .. }));
         assert!(!error.to_string().contains("not json"));
+    }
+
+    #[tokio::test]
+    async fn captcha_handler_resumes_the_original_api_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener must bind");
+        let address = listener.local_addr().expect("test address must exist");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test connection must arrive");
+                let body = if attempt == 0 {
+                    r#"{"error":{"error_code":14,"error_msg":"captcha","captcha_sid":"test-sid","captcha_img":"https://api.example.invalid/captcha.jpg"}}"#
+                } else {
+                    r#"{"response":{"count":0,"items":[]}}"#
+                };
+                requests.push(respond(stream, body).await);
+            }
+            requests
+        });
+
+        let client = VkClient::with_api_base("test-access-token", format!("http://{address}"))
+            .expect("test client must be created");
+        client.set_captcha_handler(Arc::new(|challenge, respond| {
+            assert_eq!(challenge.sid.as_deref(), Some("test-sid"));
+            respond
+                .try_send("test-answer".to_owned())
+                .expect("captcha answer must be sent");
+        }));
+
+        client
+            .get_liked_audio(0, 20)
+            .await
+            .expect("original call must succeed after captcha");
+        let requests = server.await.expect("test server must finish");
+        assert_eq!(requests.len(), 2);
+        let first_body = requests[0]
+            .split_once("\r\n\r\n")
+            .expect("first HTTP parts")
+            .1;
+        let second_body = requests[1]
+            .split_once("\r\n\r\n")
+            .expect("second HTTP parts")
+            .1;
+        assert!(!first_body.contains("captcha_key"));
+        assert!(second_body.contains("captcha_sid=test-sid"));
+        assert!(second_body.contains("captcha_key=test-answer"));
+        assert!(second_body.contains("offset=0"));
+        assert!(second_body.contains("count=20"));
     }
 
     #[tokio::test]

@@ -264,6 +264,8 @@ pub struct VkPlaylistDto {
     pub count: Option<u64>,
     #[serde(default)]
     pub photo: Option<VkThumbDto>,
+    #[serde(default)]
+    pub audios: Vec<VkAudioDto>,
 }
 
 /// Список плейлистов с общим количеством результатов.
