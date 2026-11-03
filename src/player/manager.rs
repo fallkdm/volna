@@ -1,14 +1,15 @@
+use async_channel::Sender;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use async_channel::Sender;
 
+use super::audio::AudioBackend;
+use super::wave_engine::WaveEngine;
 use crate::api::client::YandexMusicClient;
 use crate::api::models::{Album, Playlist, Track, TrackSource};
 use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId, StationChip};
 use crate::api::provider_manager::ProviderManager;
+use crate::api::vk::provider::VkProvider;
 use crate::api::ytmusic::YtMusicClient;
-use super::audio::AudioBackend;
-use super::wave_engine::WaveEngine;
 
 /// Режим повтора: нет, один трек, вся очередь (для Волны «вся очередь» недоступна)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -39,7 +40,10 @@ pub struct PlaySource {
 
 impl PlaySource {
     pub fn new(label: impl Into<String>, target: Option<SourceTarget>) -> Self {
-        Self { label: label.into(), target }
+        Self {
+            label: label.into(),
+            target,
+        }
     }
 }
 
@@ -79,6 +83,13 @@ pub enum PlayerUiEvent {
     UserLoggedOut,
     StatusMessage(String),
     Error(String),
+    /// VK отозвал авторизацию (API error 5): нужно повторить Direct Auth.
+    VkAuthRequired,
+    /// Обычный `audio.*`-запрос получил captcha; ответ вернёт ожидающий запрос в VK API.
+    VkCaptchaRequired {
+        image_url: Option<String>,
+        respond: async_channel::Sender<String>,
+    },
     /// Станция привязана (имя) или отвязана
     CastChanged(Option<String>),
     /// Откуда играет очередь: «Плейлист: …», «Альбом: …», «Популярное: …»; `None` — подписи нет
@@ -259,7 +270,10 @@ impl Prefetched {
 
 /// Достаёт `expire=<unix>` из query-строки ссылки (googlevideo и подобные).
 fn url_expire_unix(url: &str) -> Option<u64> {
-    url.split_once('?')?.1.split('&').find_map(|kv| kv.strip_prefix("expire=")?.parse().ok())
+    url.split_once('?')?
+        .1
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("expire=")?.parse().ok())
 }
 
 /// Ссылки на поток живут недолго (через несколько минут отвечают 410): заранее полученной верим 90 секунд
@@ -299,6 +313,41 @@ pub struct PlayerManager {
     crossfade: Arc<Mutex<(bool, u32)>>,
 }
 
+async fn resolve_stream_for_source(
+    providers: &ProviderManager,
+    client: &YandexMusicClient,
+    track_id: &str,
+    source: TrackSource,
+) -> Result<(String, String), String> {
+    match source {
+        TrackSource::YouTubeMusic => {
+            let provider = providers
+                .get(ProviderId::YouTubeMusic)
+                .ok_or_else(|| "Провайдер YouTube Music не найден".to_string())?;
+            provider
+                .get_stream_url(track_id)
+                .await
+                .map(|url| (url, "Opus 160".to_string()))
+                .map_err(|error| format!("Ошибка YouTube Music: {error}"))
+        }
+        TrackSource::Vk => {
+            let provider = providers
+                .get(ProviderId::Vk)
+                .ok_or_else(|| "Требуется вход во ВКонтакте".to_string())?;
+            let url = provider
+                .get_stream_url(track_id)
+                .await
+                .map_err(|error| format!("Ошибка VK Музыки: {error}"))?;
+            let label = if url.contains(".m3u8") { "HLS" } else { "MP3" };
+            Ok((url, label.to_string()))
+        }
+        TrackSource::Yandex => client
+            .get_track_direct_url(track_id)
+            .await
+            .map_err(|error| error.to_string()),
+    }
+}
+
 impl PlayerManager {
     /// Создает новый экземпляр менеджера
     pub fn new(
@@ -306,6 +355,7 @@ impl PlayerManager {
         event_senders: Vec<Sender<PlayerUiEvent>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let audio = Arc::new(AudioBackend::new()?);
+        let event_senders = Arc::new(Mutex::new(event_senders));
         let client_mutex = Arc::new(Mutex::new(client.clone()));
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let wave_engine = Arc::new(Mutex::new(WaveEngine::new()));
@@ -336,7 +386,24 @@ impl PlayerManager {
 
         let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
         let ytmusic_provider = Arc::new(yt_client) as Arc<dyn MusicProvider>;
-        let provider_manager = ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+        let provider_manager =
+            ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+        if let Some(token) = crate::api::vk::auth::load_vk_token() {
+            let owner_id = crate::api::auth::load_vk_user_id().unwrap_or(0);
+            if let Ok(vk) = VkProvider::new(token, owner_id) {
+                let senders = event_senders.clone();
+                vk.set_captcha_handler(Arc::new(move |challenge, respond| {
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::VkCaptchaRequired {
+                            image_url: challenge.image_url,
+                            respond,
+                        },
+                    );
+                }));
+                provider_manager.register(Arc::new(vk));
+            }
+        }
         let active_provider = crate::api::auth::load_active_provider();
         provider_manager.switch_provider(active_provider);
         let providers = Arc::new(provider_manager);
@@ -348,7 +415,7 @@ impl PlayerManager {
             yt_client: yt_client_arc,
             state,
             wave_engine,
-            event_senders: Arc::new(Mutex::new(event_senders)),
+            event_senders,
             cast: Arc::default(),
             prefetch: Arc::default(),
             prefetch_inflight: Arc::default(),
@@ -393,11 +460,32 @@ impl PlayerManager {
     /// Режим `VOLNA_DEMO=1|2|3` для скриншотов README: вымышленный исполнитель, свои тексты,
     /// обложка из `VOLNA_DEMO_COVER`, позиция из `VOLNA_DEMO_POS_MS`. Ни токена, ни сети, ни кэша пользователя
     fn start_demo(&self) {
-        let n: usize = std::env::var("VOLNA_DEMO").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let n: usize = std::env::var("VOLNA_DEMO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         let (title, artist, accent, average, wave_text) = match n {
-            2 => ("Neon Rain", "Night Courier", "#c95cff", "#5a2a7a", "#f0c8ff"),
-            3 => ("Slow Tide", "Harbor Lights", "#3fa8ff", "#1f4a73", "#bfe3ff"),
-            _ => ("Golden Hour", "Demo Artist", "#ff8a3d", "#7a3a14", "#ffd9b8"),
+            2 => (
+                "Neon Rain",
+                "Night Courier",
+                "#c95cff",
+                "#5a2a7a",
+                "#f0c8ff",
+            ),
+            3 => (
+                "Slow Tide",
+                "Harbor Lights",
+                "#3fa8ff",
+                "#1f4a73",
+                "#bfe3ff",
+            ),
+            _ => (
+                "Golden Hour",
+                "Demo Artist",
+                "#ff8a3d",
+                "#7a3a14",
+                "#ffd9b8",
+            ),
         };
         let track: Track = serde_json::from_value(serde_json::json!({
             "id": "demo", "title": title, "durationMs": 214_000,
@@ -411,11 +499,16 @@ impl PlayerManager {
             state.current_track = Some(track.clone());
         }
         let lrc = [
-            "Evening folds over the harbor wall", "Lamps come on one at a time",
-            "We walk the long way home", "Counting the ships by their light",
-            "Nothing is asked of us now", "The water keeps the time",
-            "Hold the last of the day", "Let it burn down slow",
-            "Carry it into the dark", "And we will know the way",
+            "Evening folds over the harbor wall",
+            "Lamps come on one at a time",
+            "We walk the long way home",
+            "Counting the ships by their light",
+            "Nothing is asked of us now",
+            "The water keeps the time",
+            "Hold the last of the day",
+            "Let it burn down slow",
+            "Carry it into the dark",
+            "And we will know the way",
         ]
         .iter()
         .enumerate()
@@ -423,7 +516,11 @@ impl PlayerManager {
         .collect::<Vec<_>>()
         .join("\n");
         self.emit(PlayerUiEvent::UserLoggedIn("demo".into()));
-        self.emit(PlayerUiEvent::TrackStarted { track, index: 0, total_queue: 1 });
+        self.emit(PlayerUiEvent::TrackStarted {
+            track,
+            index: 0,
+            total_queue: 1,
+        });
         if let Ok(path) = std::env::var("VOLNA_DEMO_COVER") {
             self.emit(PlayerUiEvent::CoverUpdated(path));
         }
@@ -437,7 +534,9 @@ impl PlayerManager {
 
     /// Показывает последний проигранный трек: заголовок, цвета, обложку и текст. Воспроизведение не стартует
     fn restore_last_track(&self) {
-        let Some(track) = crate::api::history::load_last_track() else { return };
+        let Some(track) = crate::api::history::load_last_track() else {
+            return;
+        };
         // последняя очередь (альбом, плейлист): после перезапуска Play продолжает её, а не включает Волну по треку
         if let Some((queue, index, source)) = crate::cache::load_session() {
             if queue.get(index).is_some_and(|t| t.id == track.id) {
@@ -453,9 +552,20 @@ impl PlayerManager {
                 };
                 self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
                 self.emit(PlayerUiEvent::SourceContext(source));
-                self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index, total_queue: total });
+                self.emit(PlayerUiEvent::TrackStarted {
+                    track: track.clone(),
+                    index,
+                    total_queue: total,
+                });
                 let client = self.client.lock().unwrap().clone();
-                spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
+                spawn_cover_and_lyrics(
+                    &self.event_senders,
+                    self.providers.clone(),
+                    client,
+                    &track,
+                    self.generation.load(Ordering::SeqCst),
+                    &self.generation,
+                );
                 return;
             }
         }
@@ -468,9 +578,20 @@ impl PlayerManager {
             state.sync_track_like_status(&track.id)
         };
         self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
-        self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index: 0, total_queue: 1 });
+        self.emit(PlayerUiEvent::TrackStarted {
+            track: track.clone(),
+            index: 0,
+            total_queue: 1,
+        });
         let client = self.client.lock().unwrap().clone();
-        spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation);
+        spawn_cover_and_lyrics(
+            &self.event_senders,
+            self.providers.clone(),
+            client,
+            &track,
+            self.generation.load(Ordering::SeqCst),
+            &self.generation,
+        );
     }
 
     /// Если на экране сохранённый трек, первое нажатие Play/вперёд/назад запускает его (с продолжением Волной по треку)
@@ -481,7 +602,13 @@ impl PlayerManager {
                 return false;
             }
             state.restored = false;
-            let session = (state.queue.len() > 1).then(|| (state.queue.clone(), state.current_index, state.play_source.clone()));
+            let session = (state.queue.len() > 1).then(|| {
+                (
+                    state.queue.clone(),
+                    state.current_index,
+                    state.play_source.clone(),
+                )
+            });
             (state.current_track.clone(), session)
         };
         match (session, track) {
@@ -509,9 +636,27 @@ impl PlayerManager {
         emit_all(&self.event_senders, event);
     }
 
+    /// Регистрирует VK после входа и подключает captcha к живому GTK-циклу.
+    pub fn register_vk_provider(&self, provider: VkProvider) {
+        let senders = self.event_senders.clone();
+        provider.set_captcha_handler(Arc::new(move |challenge, respond| {
+            emit_all(
+                &senders,
+                PlayerUiEvent::VkCaptchaRequired {
+                    image_url: challenge.image_url,
+                    respond,
+                },
+            );
+        }));
+        self.providers.register(Arc::new(provider));
+    }
+
     /// Переключает активного музыкального провайдера
     pub fn switch_provider(&self, id: ProviderId) {
         if self.providers.switch_provider(id) {
+            // Все поиски, обложки, тексты и отложенные запуски прошлой сессии устарели.
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.prefetch.lock().unwrap().take();
             let _ = crate::api::auth::save_active_provider(id);
             if let Ok(mut state) = self.state.lock() {
                 state.liked_loaded = false;
@@ -541,31 +686,62 @@ impl PlayerManager {
             return;
         }
 
-        // Если активен YouTube Music: загружаем понравившиеся треки из YouTube Music
-        let provider = self.providers.current();
-        if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
-            if let Ok(tracks) = provider.get_liked_tracks().await {
-                let ids: Vec<String> = tracks.into_iter().map(|t| t.id).filter(|id| !id.is_empty()).collect();
-                let current_liked = {
-                    let mut state = self.state.lock().unwrap();
-                    state.liked_loaded = true;
-                    state.merge_server_likes(ids);
-                    let track_id = state.current_track.as_ref().map(|t| t.id.clone());
-                    track_id.map(|id| state.sync_track_like_status(&id))
-                };
-                if let Some(liked) = current_liked {
-                    self.emit(PlayerUiEvent::LikeStateChanged(liked));
-                }
+        let session = self.providers.session();
+        let provider = session.provider;
+        if session.id != ProviderId::Yandex {
+            if !provider.is_authenticated() {
                 return;
             }
+            let tracks = match provider.get_liked_tracks().await {
+                Ok(tracks) => tracks,
+                Err(error) => {
+                    if session.id == ProviderId::Vk
+                        && error
+                            .downcast_ref::<crate::api::vk::client::VkError>()
+                            .is_some_and(crate::api::vk::client::VkError::is_auth)
+                    {
+                        self.emit(PlayerUiEvent::VkAuthRequired);
+                    }
+                    return;
+                }
+            };
+            if !self.providers.is_current(session.id, session.generation) {
+                return;
+            }
+            let ids: Vec<String> = tracks
+                .into_iter()
+                .map(|track| track.id)
+                .filter(|id| !id.is_empty())
+                .collect();
+            let current_liked = {
+                let mut state = self.state.lock().unwrap();
+                state.liked_loaded = true;
+                state.merge_server_likes(ids);
+                let track_id = state.current_track.as_ref().map(|track| track.id.clone());
+                track_id.map(|id| state.sync_track_like_status(&id))
+            };
+            if let Some(liked) = current_liked {
+                self.emit(PlayerUiEvent::LikeStateChanged(liked));
+            }
+            return;
         }
 
         let client = self.client.lock().unwrap().clone();
         if !client.has_token() {
             return;
         }
-        let Ok(uid) = client.get_uid().await else { return };
-        let Ok(ids) = client.get_liked_track_ids(&uid).await else { return };
+        let Ok(uid) = client.get_uid().await else {
+            return;
+        };
+        if !self.providers.is_current(session.id, session.generation) {
+            return;
+        }
+        let Ok(ids) = client.get_liked_track_ids(&uid).await else {
+            return;
+        };
+        if !self.providers.is_current(session.id, session.generation) {
+            return;
+        }
 
         let current_liked = {
             let mut state = self.state.lock().unwrap();
@@ -573,7 +749,7 @@ impl PlayerManager {
                 state.user_uid = Some(uid);
             }
             state.merge_server_likes(ids);
-            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
+            let track_id = state.current_track.as_ref().map(|track| track.id.clone());
             track_id.map(|id| state.sync_track_like_status(&id))
         };
         if let Some(liked) = current_liked {
@@ -593,8 +769,15 @@ impl PlayerManager {
             if client.has_token() {
                 match client.get_account_status().await {
                     Ok(acc) => {
-                        let uid = acc.account.as_ref().map(|a| a.uid.clone()).unwrap_or_default();
-                        let login = acc.account.as_ref().and_then(|a| a.login.clone())
+                        let uid = acc
+                            .account
+                            .as_ref()
+                            .map(|a| a.uid.clone())
+                            .unwrap_or_default();
+                        let login = acc
+                            .account
+                            .as_ref()
+                            .and_then(|a| a.login.clone())
                             .or_else(|| acc.account.as_ref().and_then(|a| a.full_name.clone()))
                             .unwrap_or_else(|| "Яндекс Пользователь".to_string());
 
@@ -610,9 +793,13 @@ impl PlayerManager {
                         }
 
                         emit_all(&senders, PlayerUiEvent::UserLoggedIn(login.clone()));
-                        emit_all(&senders, PlayerUiEvent::StatusMessage(
-                            format!("С возвращением, {}! Нажмите «Включить волну» 🌊", login)
-                        ));
+                        emit_all(
+                            &senders,
+                            PlayerUiEvent::StatusMessage(format!(
+                                "С возвращением, {}! Нажмите «Включить волну» 🌊",
+                                login
+                            )),
+                        );
 
                         // Единственный источник загрузки лайков со слиянием
                         me.ensure_liked_loaded().await;
@@ -624,10 +811,14 @@ impl PlayerManager {
                 }
             } else {
                 let provider = me.providers.current();
-                if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
-                    emit_all(&senders, PlayerUiEvent::StatusMessage(
-                        "Подключен Google (YouTube Music) 🔴".to_string(),
-                    ));
+                if provider.provider_id() != ProviderId::Yandex && provider.is_authenticated() {
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::StatusMessage(format!(
+                            "Подключен {}",
+                            provider.display_name()
+                        )),
+                    );
                     me.ensure_liked_loaded().await;
                 } else {
                     emit_all(&senders, PlayerUiEvent::AuthRequired);
@@ -666,8 +857,13 @@ impl PlayerManager {
             if state.is_transitioning {
                 return;
             }
-            state.current_track.as_ref().and_then(|t| t.duration_ms).map(|ms| ms as u64)
-        }.or_else(|| self.duration_seconds().map(|s| s * 1000));
+            state
+                .current_track
+                .as_ref()
+                .and_then(|t| t.duration_ms)
+                .map(|ms| ms as u64)
+        }
+        .or_else(|| self.duration_seconds().map(|s| s * 1000));
 
         let dur_ms = match dur_ms {
             Some(d) if d > fade_ms + 1000 => d,
@@ -735,28 +931,46 @@ impl PlayerManager {
 
     /// Играет ли музыка: на станции, если она привязана, иначе в приложении
     pub fn is_playing(&self) -> bool {
-        self.cast_playing().unwrap_or_else(|| self.audio.is_playing())
+        self.cast_playing()
+            .unwrap_or_else(|| self.audio.is_playing())
     }
 
     pub fn duration_seconds(&self) -> Option<u64> {
-        self.cast_duration_secs().or_else(|| self.audio.duration_seconds())
+        self.cast_duration_secs()
+            .or_else(|| self.audio.duration_seconds())
     }
 
     /// Запускает или переключает воспроизведение (Play/Pause)
     pub fn toggle_play(&self) {
-        if !self.is_playing() && self.providers.active_id() == ProviderId::YouTubeMusic {
+        let active_provider = self.providers.active_id();
+        if !self.is_playing() && active_provider != ProviderId::Yandex {
             let is_yandex_track = {
                 let state = self.state.lock().unwrap();
-                state.current_track.as_ref()
+                state
+                    .current_track
+                    .as_ref()
                     .or_else(|| state.queue.get(state.current_index))
-                    .map(|t| t.source == TrackSource::Yandex)
+                    .map(|track| track.source == TrackSource::Yandex)
                     .unwrap_or(false)
             };
             if is_yandex_track && !self.client.lock().unwrap().has_token() {
                 if let Ok(mut state) = self.state.lock() {
                     state.restored = false;
                 }
-                self.start_station("user:onyourwave".to_string(), None, "Моя Волна".to_string());
+                if active_provider == ProviderId::Vk {
+                    self.apply_wave_station(
+                        crate::api::vk::provider::VK_MIX_STATION_ID.to_string(),
+                        None,
+                        None,
+                        None,
+                    );
+                } else {
+                    self.start_station(
+                        "user:onyourwave".to_string(),
+                        None,
+                        "Моя Волна".to_string(),
+                    );
+                }
                 return;
             }
         }
@@ -782,6 +996,17 @@ impl PlayerManager {
                         "Загружаем персональную Волну... 🔴".to_string(),
                     ));
                     self.fetch_wave_tracks("onyourwave");
+                }
+            } else if provider.provider_id() == ProviderId::Vk {
+                if provider.is_authenticated() {
+                    self.apply_wave_station(
+                        crate::api::vk::provider::VK_MIX_STATION_ID.to_string(),
+                        None,
+                        None,
+                        None,
+                    );
+                } else {
+                    self.emit(PlayerUiEvent::AuthRequired);
                 }
             } else {
                 let has_token = self.client.lock().unwrap().has_token();
@@ -809,31 +1034,58 @@ impl PlayerManager {
 
     /// Обработчик естественного окончания воспроизведения трека (EndOfStream)
     pub fn on_track_finished(&self) {
-        let (station_id, track_id, total_secs, batch_id) = {
+        let (station_id, track, total_secs, batch_id) = {
             let state = self.state.lock().unwrap();
-            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
-            let total_secs = state
-                .current_track
+            let track = state.current_track.clone();
+            let total_secs = track
                 .as_ref()
-                .and_then(|t| t.duration_ms)
+                .and_then(|track| track.duration_ms)
                 .map(|ms| ms as f64 / 1000.0)
                 .unwrap_or(state.played_seconds);
             (
                 state.station_id.clone(),
-                track_id,
+                track,
                 total_secs,
                 state.batch_id.clone(),
             )
         };
 
-        if let Some(t_id) = track_id {
+        if let Some(track) = track {
             let client = self.client.clone();
+            let providers = self.providers.clone();
             tokio::spawn(async move {
-                let client_guard = client.lock().unwrap().clone();
-                if client_guard.has_token() {
-                    let _ = client_guard
-                        .feedback_track_finished(&station_id, &t_id, total_secs, batch_id)
-                        .await;
+                let track_id = track.id;
+                match track.source {
+                    TrackSource::YouTubeMusic | TrackSource::Vk => {
+                        let provider_id = match track.source {
+                            TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                            TrackSource::Vk => ProviderId::Vk,
+                            TrackSource::Yandex => unreachable!(),
+                        };
+                        if let Some(provider) = providers.get(provider_id) {
+                            let _ = provider
+                                .send_feedback(FeedbackEvent::TrackFinished {
+                                    track_id,
+                                    station_id,
+                                    duration_secs: total_secs.max(0.0) as u32,
+                                    batch_id,
+                                })
+                                .await;
+                        }
+                    }
+                    TrackSource::Yandex => {
+                        let client_guard = client.lock().unwrap().clone();
+                        if client_guard.has_token() {
+                            let _ = client_guard
+                                .feedback_track_finished(
+                                    &station_id,
+                                    &track_id,
+                                    total_secs,
+                                    batch_id,
+                                )
+                                .await;
+                        }
+                    }
                 }
             });
         }
@@ -842,14 +1094,21 @@ impl PlayerManager {
             let mut state = self.state.lock().unwrap();
             if state.crossfade_triggered {
                 state.crossfade_triggered = false;
-                eprintln!("[on_track_finished] автокроссфейд уже запущен, пропускаем повторный next_track");
+                eprintln!(
+                    "[on_track_finished] автокроссфейд уже запущен, пропускаем повторный next_track"
+                );
                 return;
             }
         }
 
         let (mode, wave, at_end, current) = {
             let state = self.state.lock().unwrap();
-            (state.repeat, state.wave, state.current_index + 1 >= state.queue.len(), state.current_track.clone())
+            (
+                state.repeat,
+                state.wave,
+                state.current_index + 1 >= state.queue.len(),
+                state.current_track.clone(),
+            )
         };
         match (mode, current) {
             (RepeatMode::One, Some(track)) => {
@@ -1088,10 +1347,15 @@ impl PlayerManager {
             }
         };
 
-        if let Some(path) = crate::cache::offline_audio_path(&next.id).or_else(|| crate::cache::cached_audio_path(&next.id)) {
+        if let Some(path) = crate::cache::offline_audio_path(&next.id)
+            .or_else(|| crate::cache::cached_audio_path(&next.id))
+        {
             let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
             self.audio.preroll_next_url(&uri);
-            eprintln!("[prefetch] «{}» уже на диске, preroll локального файла: {}", next.title, uri);
+            eprintln!(
+                "[prefetch] «{}» уже на диске, preroll локального файла: {}",
+                next.title, uri
+            );
             clear_inflight();
             return;
         }
@@ -1100,32 +1364,33 @@ impl PlayerManager {
         let audio = self.audio.clone();
         let client = self.client.lock().unwrap().clone();
         let providers = self.providers.clone();
-        let is_yt = next.source == TrackSource::YouTubeMusic;
+        let track_source = next.source;
+        let is_yt = track_source == TrackSource::YouTubeMusic;
         let track_id = next.id.clone();
         let track_title = next.title.clone();
 
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let stream_res: Result<(String, String), String> = if is_yt {
-                if let Some(yt) = providers.get(ProviderId::YouTubeMusic) {
-                    yt.get_stream_url(&track_id).await.map(|u| (u, "Opus 160".to_string())).map_err(|e| e.to_string())
-                } else {
-                    Err("YouTube Music недоступен".to_string())
-                }
-            } else {
-                client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
-            };
+            let stream_res =
+                resolve_stream_for_source(&providers, &client, &track_id, track_source).await;
 
             let (stream_url, label) = match stream_res {
                 Ok((url, lbl)) => (url, lbl),
                 Err(e) => {
-                    eprintln!("[prefetch] Ошибка получения URL для «{}»: {}", track_title, e);
+                    eprintln!(
+                        "[prefetch] Ошибка получения URL для «{}»: {}",
+                        track_title, e
+                    );
                     clear_inflight();
                     return;
                 }
             };
 
-            eprintln!("[prefetch] Ссылка для «{}» получена за {} мс", track_title, started.elapsed().as_millis());
+            eprintln!(
+                "[prefetch] Ссылка для «{}» получена за {} мс",
+                track_title,
+                started.elapsed().as_millis()
+            );
             *prefetch_arc.lock().unwrap() = Some(Prefetched {
                 track_id: track_id.clone(),
                 url: stream_url.clone(),
@@ -1136,7 +1401,11 @@ impl PlayerManager {
             audio.preroll_next_url(&stream_url);
 
             let ext = if is_yt { "opus" } else { "mp3" };
-            if let Some(path) = download_audio_to_cache(&stream_url, &track_id, ext).await {
+            // HLS-манифест нельзя сохранять как MP3: сегменты продолжает загружать GStreamer.
+            let is_hls = track_source == TrackSource::Vk && stream_url.contains(".m3u8");
+            if !is_hls
+                && let Some(path) = download_audio_to_cache(&stream_url, &track_id, ext).await
+            {
                 let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
                 // Слот теперь прогрет локальным файлом: обновляем и саму prefetch-ссылку, иначе
                 // play_track_stream отдаст в crossfade сетевой URL, тот не совпадёт с file://
@@ -1148,7 +1417,10 @@ impl PlayerManager {
                     }
                 }
                 audio.preroll_next_url(&local_uri);
-                eprintln!("[prefetch] «{}» скачан на диск и переведен в локальный preroll: {}", track_title, local_uri);
+                eprintln!(
+                    "[prefetch] «{}» скачан на диск и переведен в локальный preroll: {}",
+                    track_title, local_uri
+                );
             }
             clear_inflight();
         });
@@ -1192,8 +1464,9 @@ impl PlayerManager {
         };
 
         tokio::spawn(async move {
-            let provider = providers_clone.current();
-            if provider.provider_id() == ProviderId::YouTubeMusic {
+            let session = providers_clone.session();
+            let provider = session.provider;
+            if session.id == ProviderId::YouTubeMusic {
                 if !provider.is_authenticated() {
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     return;
@@ -1221,7 +1494,11 @@ impl PlayerManager {
                         .or_else(|| state.queue.get(state.current_index))
                         .map(|t| t.id.clone())
                         .filter(|id| !id.is_empty());
-                    let spare = state.queue.last().map(|t| t.id.clone()).filter(|id| !id.is_empty());
+                    let spare = state
+                        .queue
+                        .last()
+                        .map(|t| t.id.clone())
+                        .filter(|id| !id.is_empty());
                     (anchor, spare)
                 };
 
@@ -1229,7 +1506,11 @@ impl PlayerManager {
                 // дальнего края очереди — так в миксе чередуются два соседних пузыря.
                 let anchor = if drift_due {
                     let serial = wave_engine_clone.lock().unwrap().note_seed_drift();
-                    let picked = pick_drift_anchor(serial, primary_anchor.as_deref(), spare_anchor.as_deref());
+                    let picked = pick_drift_anchor(
+                        serial,
+                        primary_anchor.as_deref(),
+                        spare_anchor.as_deref(),
+                    );
                     eprintln!(
                         "[wave] переезд #{}: сид от {}",
                         serial,
@@ -1240,7 +1521,12 @@ impl PlayerManager {
                     primary_anchor.clone()
                 };
 
-                let plan = plan_wave_fetch(&station_id, batch_id.as_deref(), drift_due, anchor.as_deref());
+                let plan = plan_wave_fetch(
+                    &station_id,
+                    batch_id.as_deref(),
+                    drift_due,
+                    anchor.as_deref(),
+                );
                 let mut station_batch = provider
                     .get_station_tracks(&plan.station, plan.continuation.as_deref())
                     .await
@@ -1256,15 +1542,25 @@ impl PlayerManager {
                         .find(|id| Some(*id) != anchor.as_deref());
                     if let Some(alt) = alternative {
                         let retry = plan_wave_fetch(&station_id, None, false, Some(alt));
-                        station_batch = provider.get_station_tracks(&retry.station, None).await.ok();
+                        station_batch =
+                            provider.get_station_tracks(&retry.station, None).await.ok();
                         if station_batch.as_ref().is_some_and(|b| !b.tracks.is_empty()) {
-                            eprintln!("[wave] продолжение исчерпано — новый сид: {}", retry.station);
+                            eprintln!(
+                                "[wave] продолжение исчерпано — новый сид: {}",
+                                retry.station
+                            );
                         }
                     }
                 }
 
+                if !providers_clone.is_current(session.id, session.generation) {
+                    return;
+                }
                 let Some(station_batch) = station_batch.filter(|b| !b.tracks.is_empty()) else {
-                    eprintln!("[wave] волна выдохлась: станция «{}» не дала новых треков", station_id);
+                    eprintln!(
+                        "[wave] волна выдохлась: станция «{}» не дала новых треков",
+                        station_id
+                    );
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     me.mark_wave_refill_dead();
                     return;
@@ -1279,7 +1575,11 @@ impl PlayerManager {
                 let filtered = pick_candidates(true, &wave_engine_clone, station_batch.tracks);
                 let updated = {
                     let mut state = state_clone.lock().unwrap();
-                    state.batch_id = if station_batch.batch_id.is_empty() { None } else { Some(station_batch.batch_id) };
+                    state.batch_id = if station_batch.batch_id.is_empty() {
+                        None
+                    } else {
+                        Some(station_batch.batch_id)
+                    };
                     let new_tracks = dedup_tracks(&state.queue, filtered);
                     let mut dropped: Vec<String> = Vec::new();
                     if drift_due && !new_tracks.is_empty() {
@@ -1292,7 +1592,12 @@ impl PlayerManager {
                     let before = state.queue.len();
                     let added = new_tracks.len();
                     state.queue.extend(new_tracks);
-                    (state.queue.clone(), state.queue.len() > before, dropped, added)
+                    (
+                        state.queue.clone(),
+                        state.queue.len() > before,
+                        dropped,
+                        added,
+                    )
                 };
                 let (updated_queue, grew, dropped, added) = updated;
                 if !dropped.is_empty() {
@@ -1304,9 +1609,17 @@ impl PlayerManager {
                         state.wave_chips = station_batch.chips.clone();
                         state.wave_chips_station = wave_chips_key(&station_id);
                     }
-                    emit_all(&senders, PlayerUiEvent::WaveChips(station_batch.chips.clone()));
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::WaveChips(station_batch.chips.clone()),
+                    );
                 }
-                eprintln!("[wave] raw={} added={} queue={}", raw, added, updated_queue.len());
+                eprintln!(
+                    "[wave] raw={} added={} queue={}",
+                    raw,
+                    added,
+                    updated_queue.len()
+                );
                 emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
                 emit_all(&senders, PlayerUiEvent::LoadingState(false));
                 if grew {
@@ -1319,6 +1632,53 @@ impl PlayerManager {
                     if let Ok(mut state) = state_clone.lock() {
                         state.refill_failures += 1;
                     }
+                    me.mark_wave_refill_dead();
+                }
+                return;
+            }
+
+            if session.id == ProviderId::Vk {
+                if !provider.is_authenticated() {
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    return;
+                }
+                let batch = provider
+                    .get_station_tracks(&station_id, batch_id.as_deref())
+                    .await;
+                if !providers_clone.is_current(session.id, session.generation) {
+                    return;
+                }
+                let Ok(batch) = batch else {
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    me.mark_wave_refill_dead();
+                    return;
+                };
+                let filtered = pick_candidates(false, &wave_engine_clone, batch.tracks);
+                let (updated_queue, grew) = {
+                    let mut state = state_clone.lock().unwrap();
+                    state.batch_id = if batch.batch_id.is_empty() {
+                        None
+                    } else {
+                        Some(batch.batch_id)
+                    };
+                    let new_tracks = dedup_tracks(&state.queue, filtered);
+                    let before = state.queue.len();
+                    state.queue.extend(new_tracks);
+                    (state.queue.clone(), state.queue.len() > before)
+                };
+                if !batch.chips.is_empty() {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.wave_chips = batch.chips.clone();
+                        state.wave_chips_station = wave_chips_key(&station_id);
+                    }
+                    emit_all(&senders, PlayerUiEvent::WaveChips(batch.chips));
+                }
+                emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                if grew {
+                    state_clone.lock().unwrap().refill_failures = 0;
+                    me.finish_pending_advance();
+                } else {
                     me.mark_wave_refill_dead();
                 }
                 return;
@@ -1360,8 +1720,11 @@ impl PlayerManager {
                 match fetched {
                     Ok(station_tracks) => {
                         raw = station_tracks.sequence.len();
-                        let new_tracks: Vec<Track> =
-                            station_tracks.sequence.into_iter().map(|s| s.track).collect();
+                        let new_tracks: Vec<Track> = station_tracks
+                            .sequence
+                            .into_iter()
+                            .map(|s| s.track)
+                            .collect();
                         let mut state = state_clone.lock().unwrap();
                         state.batch_id = station_tracks.batch_id;
                         // Пост-фильтра здесь нет намеренно: станцию считает сервер,
@@ -1463,12 +1826,20 @@ impl PlayerManager {
 
     /// Запускает «Волну по плейлисту»
     pub fn play_playlist_wave(&self, uid: &str, kind: &str, title: &str) {
-        self.start_station(format!("playlist:{}_{}", uid, kind), None, format!("По плейлисту: {}", title));
+        self.start_station(
+            format!("playlist:{}_{}", uid, kind),
+            None,
+            format!("По плейлисту: {}", title),
+        );
     }
 
     /// Запускает «Волну по артисту»
     pub fn play_artist_wave(&self, artist_id: &str, artist_name: &str) {
-        self.start_station(format!("artist:{}", artist_id), None, format!("По артисту: {}", artist_name));
+        self.start_station(
+            format!("artist:{}", artist_id),
+            None,
+            format!("По артисту: {}", artist_name),
+        );
     }
 
     /// Запускает станцию Ротора (`track:ID`, `artist:ID`). Если задан `first`, он играет сразу,
@@ -1523,7 +1894,11 @@ impl PlayerManager {
             Some(t) => {
                 let is_liked = self.state.lock().map(|s| s.is_liked).unwrap_or(false);
                 self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
-                self.emit(PlayerUiEvent::TrackStarted { track: t.clone(), index: 0, total_queue: 1 });
+                self.emit(PlayerUiEvent::TrackStarted {
+                    track: t.clone(),
+                    index: 0,
+                    total_queue: 1,
+                });
                 self.play_track_stream(t);
             }
             None => self.emit(PlayerUiEvent::LoadingState(true)),
@@ -1531,42 +1906,59 @@ impl PlayerManager {
 
         let me = self.clone();
         tokio::spawn(async move {
-            let provider = me.providers.current();
-            let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+            let session = me.providers.session();
+            let provider = session.provider;
+            let is_yt = session.id == ProviderId::YouTubeMusic;
 
             let mut wave_chips: Vec<StationChip> = Vec::new();
-            let mut result: Result<(Vec<Track>, Option<String>), String> = if is_yt {
-                match provider.get_station_tracks(&station_id, None).await {
-                    Ok(batch) => {
-                        wave_chips = batch.chips.clone();
-                        let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
-                        Ok((batch.tracks, b_id))
+            let mut result: Result<(Vec<Track>, Option<String>), String> =
+                if session.id != ProviderId::Yandex {
+                    match provider.get_station_tracks(&station_id, None).await {
+                        Ok(batch) => {
+                            wave_chips = batch.chips.clone();
+                            let b_id = if batch.batch_id.is_empty() {
+                                None
+                            } else {
+                                Some(batch.batch_id)
+                            };
+                            Ok((batch.tracks, b_id))
+                        }
+                        Err(e) => Err(format!("Ошибка {}: {}", provider.display_name(), e)),
                     }
-                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
-                }
-            } else {
-                let client = me.client.lock().unwrap().clone();
-                if !client.has_token() {
-                    me.emit(PlayerUiEvent::AuthRequired);
-                    return;
-                }
-                match client.get_station_tracks(&station_id).await {
-                    Ok(station) => {
-                        let tracks: Vec<Track> = station.sequence.into_iter().map(|s| s.track).collect();
-                        Ok((tracks, station.batch_id))
+                } else {
+                    let client = me.client.lock().unwrap().clone();
+                    if !client.has_token() {
+                        me.emit(PlayerUiEvent::AuthRequired);
+                        return;
                     }
-                    Err(e) => Err(e.to_string()),
-                }
-            };
+                    match client.get_station_tracks(&station_id).await {
+                        Ok(station) => {
+                            let tracks: Vec<Track> =
+                                station.sequence.into_iter().map(|s| s.track).collect();
+                            Ok((tracks, station.batch_id))
+                        }
+                        Err(e) => Err(e.to_string()),
+                    }
+                };
+
+            if !me.providers.is_current(session.id, session.generation) {
+                return;
+            }
 
             // Фолбэк для YouTube Music, если треки не вернулись
             if is_yt {
                 if let Ok((ref tr, _)) = result {
                     if tr.is_empty() {
-                        if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
+                        if let Ok(batch) =
+                            provider.get_station_tracks("user:onyourwave", None).await
+                        {
                             if !batch.tracks.is_empty() {
                                 wave_chips = batch.chips.clone();
-                                let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                                let b_id = if batch.batch_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(batch.batch_id)
+                                };
                                 result = Ok((batch.tracks, b_id));
                             }
                         }
@@ -1615,7 +2007,10 @@ impl PlayerManager {
                         }
                     }
                 }
-                Err(e) => me.emit(PlayerUiEvent::Error(format!("Ошибка загрузки Волны: {}", e))),
+                Err(e) => me.emit(PlayerUiEvent::Error(format!(
+                    "Ошибка загрузки Волны: {}",
+                    e
+                ))),
             }
         });
     }
@@ -1626,7 +2021,12 @@ impl PlayerManager {
     }
 
     /// Запускает очередь и подписывает, откуда она (плейлист, альбом, топ артиста…)
-    pub fn set_queue_and_play_from(&self, tracks: Vec<Track>, start_index: usize, source: Option<PlaySource>) {
+    pub fn set_queue_and_play_from(
+        &self,
+        tracks: Vec<Track>,
+        start_index: usize,
+        source: Option<PlaySource>,
+    ) {
         if tracks.is_empty() {
             return;
         }
@@ -1716,7 +2116,10 @@ impl PlayerManager {
     }
 
     pub fn is_track_liked(&self, track_id: &str) -> bool {
-        self.state.lock().map(|s| s.liked_track_ids.contains(track_id)).unwrap_or(false)
+        self.state
+            .lock()
+            .map(|s| s.liked_track_ids.contains(track_id))
+            .unwrap_or(false)
     }
 
     /// Устанавливает или снимает отметку «Мне нравится» для трека, синхронизирует кэш и сервер
@@ -1724,14 +2127,23 @@ impl PlayerManager {
         let (station_id, batch_id, current_is_this, user_uid) = {
             let mut state = self.state.lock().unwrap();
             state.set_liked_local(&track.id, liked);
-            let current_is_this = state.current_track.as_ref().map(|t| t.id == track.id).unwrap_or(false);
+            let current_is_this = state
+                .current_track
+                .as_ref()
+                .map(|t| t.id == track.id)
+                .unwrap_or(false);
             if current_is_this {
                 state.is_liked = liked;
                 if liked {
                     state.is_disliked = false;
                 }
             }
-            (state.station_id.clone(), state.batch_id.clone(), current_is_this, state.user_uid.clone())
+            (
+                state.station_id.clone(),
+                state.batch_id.clone(),
+                current_is_this,
+                state.user_uid.clone(),
+            )
         };
 
         if current_is_this {
@@ -1758,6 +2170,14 @@ impl PlayerManager {
             || providers_clone.active_id() == ProviderId::YouTubeMusic;
 
         tokio::spawn(async move {
+            if track_source == TrackSource::Vk {
+                if let Some(vk) = providers_clone.get(ProviderId::Vk) {
+                    if let Err(error) = vk.set_track_like(&track_id, liked).await {
+                        eprintln!("[vk] Ошибка синхронизации лайка: {error}");
+                    }
+                }
+                return;
+            }
             if is_yt {
                 let yt_video_id = if track_id.len() == 11 {
                     Some(track_id.clone())
@@ -1775,8 +2195,12 @@ impl PlayerManager {
                 if let Some(vid) = yt_video_id {
                     if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
                         match yt.set_track_like(&vid, liked).await {
-                            Ok(_) => println!("[ytmusic] Лайк ({liked}) для {vid} успешно отправлен в Google YouTube Music"),
-                            Err(e) => eprintln!("[ytmusic] Ошибка отправки лайка ({liked}) для {vid}: {e}"),
+                            Ok(_) => println!(
+                                "[ytmusic] Лайк ({liked}) для {vid} успешно отправлен в Google YouTube Music"
+                            ),
+                            Err(e) => eprintln!(
+                                "[ytmusic] Ошибка отправки лайка ({liked}) для {vid}: {e}"
+                            ),
                         }
                     }
                 }
@@ -1793,7 +2217,9 @@ impl PlayerManager {
                     let _ = client_guard.set_track_like(&uid, &track_id, liked).await;
                 }
                 if liked {
-                    let _ = client_guard.feedback_like(&station_id, &track_id, batch_id).await;
+                    let _ = client_guard
+                        .feedback_like(&station_id, &track_id, batch_id)
+                        .await;
                 }
             }
         });
@@ -1809,9 +2235,13 @@ impl PlayerManager {
         if let Some(track) = current_track {
             let new_like = !self.is_track_liked(&track.id);
             if new_like {
-                self.emit(PlayerUiEvent::StatusMessage("Добавлено в «Мне нравится» ❤️".into()));
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Добавлено в «Мне нравится» ❤️".into(),
+                ));
             } else {
-                self.emit(PlayerUiEvent::StatusMessage("Удалено из «Мне нравится»".into()));
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Удалено из «Мне нравится»".into(),
+                ));
             }
             self.set_track_liked(&track, new_like);
         }
@@ -1849,7 +2279,9 @@ impl PlayerManager {
                     liked: false,
                 });
             }
-            self.emit(PlayerUiEvent::StatusMessage("Исключено из рекомендаций 👎".into()));
+            self.emit(PlayerUiEvent::StatusMessage(
+                "Исключено из рекомендаций 👎".into(),
+            ));
         }
 
         if let Some(t) = track {
@@ -1865,6 +2297,19 @@ impl PlayerManager {
                 || providers_clone.active_id() == ProviderId::YouTubeMusic;
 
             tokio::spawn(async move {
+                if track_source == TrackSource::Vk {
+                    if let Some(vk) = providers_clone.get(ProviderId::Vk) {
+                        if was_liked {
+                            let _ = vk.set_track_like(&track_id, false).await;
+                        }
+                        if new_dislike {
+                            if let Err(error) = vk.set_track_dislike(&track_id).await {
+                                eprintln!("[vk] Ошибка синхронизации дизлайка: {error}");
+                            }
+                        }
+                    }
+                    return;
+                }
                 if is_yt {
                     let yt_video_id = if track_id.len() == 11 {
                         Some(track_id.clone())
@@ -1886,8 +2331,12 @@ impl PlayerManager {
                             }
                             if new_dislike {
                                 match yt.set_track_dislike(&vid).await {
-                                    Ok(_) => println!("[ytmusic] Дизлайк для {vid} успешно отправлен в Google YouTube Music"),
-                                    Err(e) => eprintln!("[ytmusic] Ошибка отправки дизлайка для {vid}: {e}"),
+                                    Ok(_) => println!(
+                                        "[ytmusic] Дизлайк для {vid} успешно отправлен в Google YouTube Music"
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[ytmusic] Ошибка отправки дизлайка для {vid}: {e}"
+                                    ),
                                 }
                             } else {
                                 let _ = yt.set_track_like(&vid, false).await;
@@ -1910,7 +2359,9 @@ impl PlayerManager {
                             }
                             let _ = client_guard.dislike_track(&uid, &track_id).await;
                         }
-                        let _ = client_guard.feedback_dislike(&station_id, &track_id, batch_id).await;
+                        let _ = client_guard
+                            .feedback_dislike(&station_id, &track_id, batch_id)
+                            .await;
                     }
                 }
             });
@@ -1936,7 +2387,9 @@ impl PlayerManager {
         }
         self.emit(PlayerUiEvent::PlaybackToggled(false));
         self.emit(PlayerUiEvent::UserLoggedOut);
-        self.emit(PlayerUiEvent::StatusMessage("Вы вышли из аккаунта Яндекс Музыки".into()));
+        self.emit(PlayerUiEvent::StatusMessage(
+            "Вы вышли из аккаунта Яндекс Музыки".into(),
+        ));
     }
 
     /// Загружает прямую ссылку на трек, кэширует обложку и начинает воспроизведение через GStreamer
@@ -1950,10 +2403,23 @@ impl PlayerManager {
         let stale_gen = self.generation.clone();
         let stale_check = stale_gen.clone();
         let is_stale = move || stale_check.load(Ordering::SeqCst) != epoch;
-        eprintln!("[play] #{} {} — {} ({})", epoch, track.title, track.artists_string(), track.id);
+        eprintln!(
+            "[play] #{} {} — {} ({})",
+            epoch,
+            track.title,
+            track.artists_string(),
+            track.id
+        );
 
         let client = self.client.lock().unwrap().clone();
-        spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation);
+        spawn_cover_and_lyrics(
+            &self.event_senders,
+            self.providers.clone(),
+            client.clone(),
+            track,
+            epoch,
+            &self.generation,
+        );
         crate::api::history::save_last_track(track);
         crate::api::history::remember_played(&track.id);
         // Историю для пост-фильтра ведём только на стороне YouTube Music: у Яндекса
@@ -1986,7 +2452,11 @@ impl PlayerManager {
         if let Some((path, is_offline)) = cached_opt {
             let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
             emit_all(&senders, PlayerUiEvent::LoadingState(false));
-            let label = if is_offline { "Офлайн" } else { "Диск (0 мс)" };
+            let label = if is_offline {
+                "Офлайн"
+            } else {
+                "Диск (0 мс)"
+            };
             emit_all(&senders, PlayerUiEvent::StreamQuality(label.to_string()));
 
             if crossfade {
@@ -2020,39 +2490,57 @@ impl PlayerManager {
         let state_arc = self.state.clone();
         let mgr_clone = self.clone();
 
-        self.emit(PlayerUiEvent::Progress { current_sec: 0, total_sec: track.duration_ms.unwrap_or(0) / 1000 });
+        self.emit(PlayerUiEvent::Progress {
+            current_sec: 0,
+            total_sec: track.duration_ms.unwrap_or(0) / 1000,
+        });
         // prefetch здесь не запускаем: активный слот ещё не переключён, и преролл следующего
         // трека стёр бы уже прогретый слот текущего — кроссфейд остался бы без мгновенного старта.
         // Преролл следующего трека делает ветка успешного старта (и next_track).
 
         tokio::spawn(async move {
             let is_yt = track_source == TrackSource::YouTubeMusic;
-            let can_play = is_yt || client.has_token();
+            let can_play = match track_source {
+                TrackSource::YouTubeMusic => true,
+                TrackSource::Vk => providers_clone
+                    .get(ProviderId::Vk)
+                    .is_some_and(|provider| provider.is_authenticated()),
+                TrackSource::Yandex => client.has_token(),
+            };
 
             if can_play {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
                 let started = std::time::Instant::now();
                 // ссылка могла быть получена заранее, пока играл прежний трек
-                let ready = prefetch.lock().unwrap().take().filter(|p| p.track_id == track_id && p.is_fresh());
+                let ready = prefetch
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .filter(|p| p.track_id == track_id && p.is_fresh());
                 let hit = ready.is_some();
                 let result: Result<(String, String), String> = match ready {
                     Some(p) => Ok((p.url, p.label)),
                     None => {
-                        if is_yt {
-                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                match yt.get_stream_url(&track_id).await {
-                                    Ok(url) => Ok((url, "Opus 160".to_string())),
-                                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
-                                }
-                            } else {
-                                Err("Провайдер YouTube Music не найден".to_string())
-                            }
-                        } else {
-                            client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
-                        }
+                        resolve_stream_for_source(
+                            &providers_clone,
+                            &client,
+                            &track_id,
+                            track_source,
+                        )
+                        .await
                     }
                 };
-                eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "ошибка" });
+                eprintln!(
+                    "[play] #{} ссылка {} за {} мс ({})",
+                    epoch,
+                    if hit {
+                        "из предзагрузки"
+                    } else {
+                        "получена"
+                    },
+                    started.elapsed().as_millis(),
+                    if result.is_ok() { "ok" } else { "ошибка" }
+                );
                 if is_stale() {
                     eprintln!("[play] #{} устарел, поток не запускаем", epoch);
                     if let Ok(mut state) = state_arc.lock() {
@@ -2087,22 +2575,35 @@ impl PlayerManager {
                         let cache_tid = track_id.clone();
                         let cache_url = url.clone();
                         let cache_ext = if is_yt { "opus" } else { "mp3" };
-                        tokio::spawn(async move {
-                            download_audio_to_cache(&cache_url, &cache_tid, cache_ext).await;
-                        });
+                        if track_source != TrackSource::Vk || !cache_url.contains(".m3u8") {
+                            tokio::spawn(async move {
+                                download_audio_to_cache(&cache_url, &cache_tid, cache_ext).await;
+                            });
+                        }
 
                         // Предзагрузка следующего трека
                         mgr_clone.prefetch_next_track();
-                        if is_yt {
-                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
-                                    track_id: track_id.clone(),
-                                    station_id: station_id.clone(),
-                                    batch_id: batch_id.clone(),
-                                }).await;
+                        match track_source {
+                            TrackSource::YouTubeMusic | TrackSource::Vk => {
+                                if let Some(provider) = providers_clone.get(match track_source {
+                                    TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                                    TrackSource::Vk => ProviderId::Vk,
+                                    TrackSource::Yandex => unreachable!(),
+                                }) {
+                                    let _ = provider
+                                        .send_feedback(FeedbackEvent::TrackStarted {
+                                            track_id: track_id.clone(),
+                                            station_id: station_id.clone(),
+                                            batch_id: batch_id.clone(),
+                                        })
+                                        .await;
+                                }
                             }
-                        } else {
-                            let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
+                            TrackSource::Yandex => {
+                                let _ = client
+                                    .feedback_track_started(&station_id, &track_id, batch_id)
+                                    .await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -2110,7 +2611,14 @@ impl PlayerManager {
                             state.is_transitioning = false;
                         }
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
-                        emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка получения потока: {}", e)));
+                        if track_source == TrackSource::Vk && e.contains("Требуется повторный вход")
+                        {
+                            emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                        }
+                        emit_all(
+                            &senders,
+                            PlayerUiEvent::Error(format!("Ошибка получения потока: {}", e)),
+                        );
                     }
                 }
             } else {
@@ -2119,15 +2627,22 @@ impl PlayerManager {
                 let yt_opt = providers_clone.get(ProviderId::YouTubeMusic);
                 let yt_active = providers_clone.active_id() == ProviderId::YouTubeMusic;
                 let yt_has_cookie = crate::api::auth::load_ytmusic_cookie().is_some()
-                    || yt_opt.as_ref().map(|p| p.is_authenticated()).unwrap_or(false);
+                    || yt_opt
+                        .as_ref()
+                        .map(|p| p.is_authenticated())
+                        .unwrap_or(false);
 
                 if (yt_active || yt_has_cookie) && yt_opt.is_some() {
                     let yt = yt_opt.unwrap();
                     let query = format!("{} {}", track_title, track_artists);
                     emit_all(&senders, PlayerUiEvent::LoadingState(true));
-                    emit_all(&senders, PlayerUiEvent::StatusMessage(
-                        format!("Поиск студийного трека в YouTube Music: {}", query),
-                    ));
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::StatusMessage(format!(
+                            "Поиск студийного трека в YouTube Music: {}",
+                            query
+                        )),
+                    );
 
                     let candidates = match yt_client_clone.search_songs(&query).await {
                         Ok(songs) if !songs.is_empty() => songs,
@@ -2164,18 +2679,31 @@ impl PlayerManager {
                         crate::api::history::save_last_track(&track_to_play);
 
                         // Обновляем UI с новыми метаданными и обложкой YouTube Music
-                        emit_all(&senders, PlayerUiEvent::TrackStarted {
-                            track: track_to_play.clone(),
-                            index: current_idx,
-                            total_queue: total_q,
-                        });
-                        emit_all(&senders, PlayerUiEvent::Progress {
-                            current_sec: 0,
-                            total_sec: track_to_play.duration_ms.unwrap_or(0) / 1000,
-                        });
+                        emit_all(
+                            &senders,
+                            PlayerUiEvent::TrackStarted {
+                                track: track_to_play.clone(),
+                                index: current_idx,
+                                total_queue: total_q,
+                            },
+                        );
+                        emit_all(
+                            &senders,
+                            PlayerUiEvent::Progress {
+                                current_sec: 0,
+                                total_sec: track_to_play.duration_ms.unwrap_or(0) / 1000,
+                            },
+                        );
 
                         // Загружаем обложку и текст выбранного трека
-                        spawn_cover_and_lyrics(&senders, client.clone(), &track_to_play, epoch, &stale_gen);
+                        spawn_cover_and_lyrics(
+                            &senders,
+                            providers_clone.clone(),
+                            client.clone(),
+                            &track_to_play,
+                            epoch,
+                            &stale_gen,
+                        );
 
                         match yt.get_stream_url(&track_to_play.id).await {
                             Ok(url) => {
@@ -2187,7 +2715,10 @@ impl PlayerManager {
                                     return;
                                 }
                                 emit_all(&senders, PlayerUiEvent::LoadingState(false));
-                                emit_all(&senders, PlayerUiEvent::StreamQuality("Opus 160 (YT)".to_string()));
+                                emit_all(
+                                    &senders,
+                                    PlayerUiEvent::StreamQuality("Opus 160 (YT)".to_string()),
+                                );
 
                                 if crossfade {
                                     if was_playing {
@@ -2214,11 +2745,13 @@ impl PlayerManager {
                                 });
                                 mgr_clone.prefetch_next_track();
 
-                                let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
-                                    track_id: track_to_play.id.clone(),
-                                    station_id: station_id.clone(),
-                                    batch_id: batch_id.clone(),
-                                }).await;
+                                let _ = yt
+                                    .send_feedback(FeedbackEvent::TrackStarted {
+                                        track_id: track_to_play.id.clone(),
+                                        station_id: station_id.clone(),
+                                        batch_id: batch_id.clone(),
+                                    })
+                                    .await;
 
                                 return;
                             }
@@ -2234,9 +2767,12 @@ impl PlayerManager {
                 }
                 emit_all(&senders, PlayerUiEvent::LoadingState(false));
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
-                emit_all(&senders, PlayerUiEvent::StatusMessage(
-                    "Требуется авторизация для воспроизведения".to_string(),
-                ));
+                emit_all(
+                    &senders,
+                    PlayerUiEvent::StatusMessage(
+                        "Требуется авторизация для воспроизведения".to_string(),
+                    ),
+                );
             }
         });
     }
@@ -2266,22 +2802,28 @@ impl PlayerManager {
         character: Option<String>,
     ) {
         let provider = self.providers.current();
-        if provider.provider_id() == ProviderId::YouTubeMusic && !provider.is_authenticated() {
-            self.emit(PlayerUiEvent::StatusMessage(
-                "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
-            ));
+        let provider_id = provider.provider_id();
+        if provider_id != ProviderId::Yandex && !provider.is_authenticated() {
+            self.emit(PlayerUiEvent::StatusMessage(format!(
+                "Войдите в {} для запуска персональных рекомендаций",
+                provider.display_name()
+            )));
             return;
         }
 
-        let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+        let is_yt = provider_id == ProviderId::YouTubeMusic;
         let is_reset = mood.is_none() && language.is_none() && character.is_none();
-        let station_id = if is_yt && is_reset {
+        let station_id = if provider_id == ProviderId::Vk {
+            // Статические ID фильтров Ротора не являются ID VK Mix. Для VK используем
+            // базовый Mix, а серверные option_id приходят только из чипов apply_station_variant().
+            crate::api::vk::provider::VK_MIX_STATION_ID.to_string()
+        } else if is_yt && is_reset {
             self.state
                 .lock()
                 .unwrap()
                 .current_track
                 .as_ref()
-                .map(|t| format!("track:{}", t.id))
+                .map(|track| format!("track:{}", track.id))
                 .unwrap_or_else(|| "user:onyourwave".to_string())
         } else {
             "user:onyourwave".to_string()
@@ -2305,12 +2847,20 @@ impl PlayerManager {
             ));
             return;
         }
-        self.apply_wave_station(format!("variant:{}", playlist_id), None, None, None);
+        let station_id = if provider.provider_id() == ProviderId::Vk {
+            playlist_id
+        } else {
+            format!("variant:{playlist_id}")
+        };
+        self.apply_wave_station(station_id, None, None, None);
     }
 
     /// Возвращает сохранённые чипы вариантов волны
     pub fn wave_chips(&self) -> Vec<crate::api::provider::StationChip> {
-        self.state.lock().map(|s| s.wave_chips.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|s| s.wave_chips.clone())
+            .unwrap_or_default()
     }
 
     /// `playlistId` активного варианта станции, если Волна идёт от чипа
@@ -2432,66 +2982,99 @@ impl PlayerManager {
         let current_gen = self.generation.clone();
 
         tokio::spawn(async move {
-            let provider = providers_clone.current();
-            let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+            let session = providers_clone.session();
+            let provider = session.provider;
+            let provider_id = session.id;
+            let is_yt = provider_id == ProviderId::YouTubeMusic;
             let client = client_clone.lock().unwrap().clone();
 
-            if is_yt {
+            if provider_id != ProviderId::Yandex {
                 if !provider.is_authenticated() {
                     // Запрос не состоится: снимаем пометку «чипы в полёте», иначе после
                     // входа в аккаунт набор чипов для этой станции уже не дозапросится
                     if let Ok(mut state) = state_clone.lock() {
                         state.wave_chips_pending.clear();
                     }
-                    emit_all(&senders, PlayerUiEvent::StatusMessage(
-                        "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
-                    ));
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::StatusMessage(format!(
+                            "Войдите в {} для запуска персональных рекомендаций",
+                            provider.display_name()
+                        )),
+                    );
                     return;
                 }
             } else if !client.has_token() {
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
-                emit_all(&senders, PlayerUiEvent::StatusMessage(
-                    "Войдите в Яндекс ID для запуска персональной Волны".to_string(),
-                ));
+                emit_all(
+                    &senders,
+                    PlayerUiEvent::StatusMessage(
+                        "Войдите в Яндекс ID для запуска персональной Волны".to_string(),
+                    ),
+                );
                 return;
             }
 
             emit_all(&senders, PlayerUiEvent::LoadingState(true));
             // Чипы, которые сервис прислал вместе с этой порцией (для YT Music — кнопки над очередью)
             let mut wave_chips: Vec<StationChip> = Vec::new();
-            let mut fetch_res: Result<(Vec<Track>, Option<String>), String> = if is_yt {
-                match provider.get_station_tracks(&station_id, None).await {
-                    Ok(batch) => {
-                        wave_chips = batch.chips.clone();
-                        let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
-                        Ok((batch.tracks, b_id))
+            let mut fetch_res: Result<(Vec<Track>, Option<String>), String> =
+                if provider_id != ProviderId::Yandex {
+                    match provider.get_station_tracks(&station_id, None).await {
+                        Ok(batch) => {
+                            wave_chips = batch.chips.clone();
+                            let b_id = if batch.batch_id.is_empty() {
+                                None
+                            } else {
+                                Some(batch.batch_id)
+                            };
+                            Ok((batch.tracks, b_id))
+                        }
+                        Err(e) => Err(format!("Ошибка {}: {}", provider.display_name(), e)),
                     }
-                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
-                }
-            } else {
-                match client.get_station_tracks_with_params(
-                    &station_id,
-                    mood.as_deref(),
-                    language.as_deref(),
-                    character.as_deref(),
-                    None,
-                ).await {
-                    Ok(station_tracks) => {
-                        let tr: Vec<Track> = station_tracks.sequence.into_iter().map(|s| s.track).collect();
-                        Ok((tr, station_tracks.batch_id))
+                } else {
+                    match client
+                        .get_station_tracks_with_params(
+                            &station_id,
+                            mood.as_deref(),
+                            language.as_deref(),
+                            character.as_deref(),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(station_tracks) => {
+                            let tr: Vec<Track> = station_tracks
+                                .sequence
+                                .into_iter()
+                                .map(|s| s.track)
+                                .collect();
+                            Ok((tr, station_tracks.batch_id))
+                        }
+                        Err(e) => Err(format!("Ошибка загрузки Волны: {}", e)),
                     }
-                    Err(e) => Err(format!("Ошибка загрузки Волны: {}", e)),
-                }
-            };
+                };
+
+            if current_gen.load(Ordering::SeqCst) != epoch
+                || !providers_clone.is_current(session.id, session.generation)
+            {
+                return;
+            }
 
             // Фолбэк для YouTube Music, если треки не вернулись
             if is_yt {
                 if let Ok((ref tr, _)) = fetch_res {
                     if tr.is_empty() {
-                        if let Ok(batch) = provider.get_station_tracks("user:onyourwave", None).await {
+                        if let Ok(batch) =
+                            provider.get_station_tracks("user:onyourwave", None).await
+                        {
                             if !batch.tracks.is_empty() {
                                 wave_chips = batch.chips.clone();
-                                let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                                let b_id = if batch.batch_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(batch.batch_id)
+                                };
                                 fetch_res = Ok((batch.tracks, b_id));
                             }
                         }
@@ -2532,7 +3115,10 @@ impl PlayerManager {
                             state.queue = tracks.clone();
                             state.current_index = 0;
                             state.current_track = first_track.clone();
-                            first_track.as_ref().map(|t| state.sync_track_like_status(&t.id)).unwrap_or(false)
+                            first_track
+                                .as_ref()
+                                .map(|t| state.sync_track_like_status(&t.id))
+                                .unwrap_or(false)
                         } else {
                             false
                         }
@@ -2544,28 +3130,36 @@ impl PlayerManager {
 
                     if let Some(track) = first_track {
                         emit_all(&senders, PlayerUiEvent::LikeStateChanged(first_is_liked));
-                        emit_all(&senders, PlayerUiEvent::TrackStarted {
-                            track: track.clone(),
-                            index: 0,
-                            total_queue: tracks.len(),
-                        });
+                        emit_all(
+                            &senders,
+                            PlayerUiEvent::TrackStarted {
+                                track: track.clone(),
+                                index: 0,
+                                total_queue: tracks.len(),
+                            },
+                        );
 
                         // Обложка и текст первого трека Волны (в остальных случаях их грузит play_track_stream)
-                        spawn_cover_and_lyrics(&senders, client.clone(), &track, epoch, &current_gen);
+                        spawn_cover_and_lyrics(
+                            &senders,
+                            providers_clone.clone(),
+                            client.clone(),
+                            &track,
+                            epoch,
+                            &current_gen,
+                        );
                         crate::api::history::save_last_track(&track);
 
                         // Сразу запускаем воспроизведение первого трека Волны
                         let track_id = track.id.clone();
                         let b_id = batch_id.clone();
-                        let result: Result<(String, String), String> = if track.source == TrackSource::YouTubeMusic {
-                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                yt.get_stream_url(&track_id).await.map(|u| (u, "Opus 160".to_string())).map_err(|e| e.to_string())
-                            } else {
-                                Err("YouTube Music недоступен".to_string())
-                            }
-                        } else {
-                            client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
-                        };
+                        let result = resolve_stream_for_source(
+                            &providers_clone,
+                            &client,
+                            &track_id,
+                            track.source,
+                        )
+                        .await;
 
                         if current_gen.load(Ordering::SeqCst) != epoch {
                             return;
@@ -2581,20 +3175,40 @@ impl PlayerManager {
                                     audio_clone.set_volume(audio_clone.user_volume());
                                 }
                                 emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-                                if track.source == TrackSource::YouTubeMusic {
-                                    if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                        let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
-                                            track_id: track_id.clone(),
-                                            station_id: station_id.clone(),
-                                            batch_id: b_id,
-                                        }).await;
+                                match track.source {
+                                    TrackSource::YouTubeMusic | TrackSource::Vk => {
+                                        let provider_id = match track.source {
+                                            TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                                            TrackSource::Vk => ProviderId::Vk,
+                                            TrackSource::Yandex => unreachable!(),
+                                        };
+                                        if let Some(provider) = providers_clone.get(provider_id) {
+                                            let _ = provider
+                                                .send_feedback(FeedbackEvent::TrackStarted {
+                                                    track_id: track_id.clone(),
+                                                    station_id: station_id.clone(),
+                                                    batch_id: b_id,
+                                                })
+                                                .await;
+                                        }
                                     }
-                                } else {
-                                    let _ = client.feedback_track_started(&station_id, &track_id, b_id).await;
+                                    TrackSource::Yandex => {
+                                        let _ = client
+                                            .feedback_track_started(&station_id, &track_id, b_id)
+                                            .await;
+                                    }
                                 }
                             }
                             Err(e) => {
-                                emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка старта Волны: {}", e)));
+                                if track.source == TrackSource::Vk
+                                    && e.contains("Требуется повторный вход")
+                                {
+                                    emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                                }
+                                emit_all(
+                                    &senders,
+                                    PlayerUiEvent::Error(format!("Ошибка старта Волны: {}", e)),
+                                );
                             }
                         }
                     } else {
@@ -2605,6 +3219,10 @@ impl PlayerManager {
                 }
                 Err(e) => {
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    if provider_id == ProviderId::Vk && e.contains("Требуется повторный вход")
+                    {
+                        emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                    }
                     emit_all(&senders, PlayerUiEvent::Error(e));
                 }
             }
@@ -2613,7 +3231,11 @@ impl PlayerManager {
 }
 
 /// Скачивает аудиопоток в дисковый кэш (~/.cache/volna/audio/) и очищает старые треки по LRU
-async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option<std::path::PathBuf> {
+async fn download_audio_to_cache(
+    url: &str,
+    track_id: &str,
+    ext: &str,
+) -> Option<std::path::PathBuf> {
     let final_path = crate::cache::final_audio_cache_path(track_id, ext);
     if final_path.exists() {
         if let Ok(meta) = final_path.metadata() {
@@ -2645,6 +3267,7 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
 /// Если у трека текста нет, UI получает пустую строку: старый текст предыдущего трека не остаётся.
 fn spawn_cover_and_lyrics(
     senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
+    providers: Arc<ProviderManager>,
     client: YandexMusicClient,
     track: &Track,
     epoch: u64,
@@ -2655,14 +3278,20 @@ fn spawn_cover_and_lyrics(
         tokio::spawn(async move {
             if let Some(path) = crate::cache::fetch_cover_cached(&cover_url).await {
                 if generation.load(Ordering::SeqCst) == epoch {
-                    emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()),
+                    );
                 }
             }
         });
     }
 
     // Если это трек YouTube Music или обложка с i.ytimg.com — параллельно резолвим студийную обложку
-    let is_ytimg = track.cover_url(400).as_deref().map_or(true, |u| u.contains("ytimg.com"));
+    let is_ytimg = track
+        .cover_url(400)
+        .as_deref()
+        .map_or(true, |u| u.contains("ytimg.com"));
     if is_ytimg {
         let (senders, generation) = (senders.clone(), generation.clone());
         let (artist, title) = (track.artists_string(), track.title.clone());
@@ -2670,20 +3299,31 @@ fn spawn_cover_and_lyrics(
             if let Some(studio_url) = crate::cache::resolve_studio_cover(&artist, &title).await {
                 if let Some(path) = crate::cache::fetch_cover_cached(&studio_url).await {
                     if generation.load(Ordering::SeqCst) == epoch {
-                        emit_all(&senders, PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()));
+                        emit_all(
+                            &senders,
+                            PlayerUiEvent::CoverUpdated(path.to_string_lossy().to_string()),
+                        );
                     }
                 }
             }
         });
     }
 
-    if crate::api::auth::load_clips() {
-        let (senders, generation, client, clip_track) = (senders.clone(), generation.clone(), client.clone(), track.clone());
+    if crate::api::auth::load_clips() && track.source != TrackSource::Vk {
+        let (senders, generation, client, clip_track) = (
+            senders.clone(),
+            generation.clone(),
+            client.clone(),
+            track.clone(),
+        );
         tokio::spawn(async move {
             // свои клипы альбома важнее клипов Яндекса
             if let Some(path) = crate::cache::custom_clip_for(&clip_track) {
                 if generation.load(Ordering::SeqCst) == epoch {
-                    emit_all(&senders, PlayerUiEvent::ClipUpdated(Some(path.to_string_lossy().to_string())));
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::ClipUpdated(Some(path.to_string_lossy().to_string())),
+                    );
                 }
                 return;
             }
@@ -2695,25 +3335,37 @@ fn spawn_cover_and_lyrics(
             let path = match path {
                 Some(p) => {
                     let s = p.to_string_lossy().to_string();
-                    let still = tokio::task::spawn_blocking(move || crate::ui::wave_clip::is_static(&s)).await.unwrap_or(false);
+                    let still =
+                        tokio::task::spawn_blocking(move || crate::ui::wave_clip::is_static(&s))
+                            .await
+                            .unwrap_or(false);
                     (!still).then_some(p)
                 }
                 None => None,
             };
             if generation.load(Ordering::SeqCst) == epoch {
-                emit_all(&senders, PlayerUiEvent::ClipUpdated(path.map(|p| p.to_string_lossy().to_string())));
+                emit_all(
+                    &senders,
+                    PlayerUiEvent::ClipUpdated(path.map(|p| p.to_string_lossy().to_string())),
+                );
             }
         });
     }
 
     let (senders, generation) = (senders.clone(), generation.clone());
-    let (track_id, title, artist) = (track.id.clone(), track.title.clone(), track.artists_string());
+    let (track_id, title, artist) = (
+        track.id.clone(),
+        track.title.clone(),
+        track.artists_string(),
+    );
     let duration = track.duration_ms.map(|d| d / 1000);
     let track_source = track.source;
+    let track_for_lyrics = track.clone();
     tokio::spawn(async move {
         // Клиент YouTube Music нужен и для длительности, и для фолбэка на официальный текст
         let ytm = crate::api::ytmusic::YtMusicClient::new();
-        let is_yt = track_source == crate::api::models::TrackSource::YouTubeMusic || track_id.len() == 11;
+        let is_yt =
+            track_source == crate::api::models::TrackSource::YouTubeMusic || track_id.len() == 11;
 
         // Поиск без фильтра «Песни» не отдаёт длительность, а без неё нельзя отличить разметку
         // от другой версии от текста совсем другой песни. Уточняем её у самого трека.
@@ -2729,7 +3381,15 @@ fn spawn_cover_and_lyrics(
             None => None,
         };
 
-        let text = if is_yt {
+        let text = if track_source == TrackSource::Vk {
+            match providers.get(ProviderId::Vk) {
+                Some(provider) => provider
+                    .get_track_lyrics(&track_for_lyrics)
+                    .await
+                    .unwrap_or_default(),
+                None => String::new(),
+            }
+        } else if is_yt {
             static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
             let http = HTTP.get_or_init(|| {
                 reqwest::Client::builder()
@@ -2748,7 +3408,10 @@ fn spawn_cover_and_lyrics(
                     // В кэше текст другой песни (кэш ключуется одним id трека): такой не показываем
                     // ни с таймкодами, ни без них — иначе под «Dear Diary,» висит чужой текст
                     let _ = std::fs::remove_file(&cache_path);
-                    println!("[lyrics] Кэш {} отброшен: размечен под другой трек", track_id);
+                    println!(
+                        "[lyrics] Кэш {} отброшен: размечен под другой трек",
+                        track_id
+                    );
                 } else if crate::api::lrclib::usable_synced_at(trimmed, duration) {
                     if generation.load(Ordering::SeqCst) == epoch {
                         emit_all(&senders, PlayerUiEvent::LyricsUpdated(trimmed.to_string()));
@@ -2765,8 +3428,12 @@ fn spawn_cover_and_lyrics(
             }
 
             // 2. Сначала LRCLIB (синхронизированное караоке с таймкодами)
-            let lrclib_fut = crate::api::lrclib::fetch_lrclib_lyrics(http, &artist, &title, duration);
-            let lrclib_res = tokio::time::timeout(std::time::Duration::from_secs(8), lrclib_fut).await.ok().flatten();
+            let lrclib_fut =
+                crate::api::lrclib::fetch_lrclib_lyrics(http, &artist, &title, duration);
+            let lrclib_res = tokio::time::timeout(std::time::Duration::from_secs(8), lrclib_fut)
+                .await
+                .ok()
+                .flatten();
 
             let mut final_text = None;
             if lrclib_res
@@ -2786,7 +3453,10 @@ fn spawn_cover_and_lyrics(
 
             // 3. Если в LRCLIB нет синхронизированных таймкодов (или сервис временно недоступен) —
             // пробуем найти караоке в каталоге Яндекс Музыки!
-            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration)) {
+            if final_text
+                .as_ref()
+                .map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration))
+            {
                 let clean_title = crate::api::lrclib::clean_title_for_lyrics(&title);
                 let query = format!("{} {}", artist, clean_title);
                 if let Ok(search_res) = client.search(&query).await {
@@ -2795,25 +3465,36 @@ fn spawn_cover_and_lyrics(
                         // исполнителя — её текст нельзя выдавать за текст текущего трека
                         let found = tracks.results.into_iter().next().filter(|t| {
                             crate::api::lrclib::same_song_title(&t.title, &title)
-                                && crate::api::lrclib::same_artist_name(&t.artists_string(), &artist)
+                                && crate::api::lrclib::same_artist_name(
+                                    &t.artists_string(),
+                                    &artist,
+                                )
                         });
                         match found {
                             Some(y_track) => {
-                            println!(
-                                "[lyrics] Яндекс: «{}» / {}",
-                                y_track.title,
-                                y_track.artists_string()
-                            );
-                            if let Ok(Some(y_lyrics)) = client.get_track_lyrics(&y_track.id, &artist, &title, duration).await {
-                                let trimmed = y_lyrics.trim();
-                                if crate::api::lrclib::looks_like_foreign_song(trimmed, duration) {
-                                    println!("[lyrics] Яндекс: разметка не от этого трека — пропускаем");
-                                } else
-                                if crate::api::lrclib::usable_synced_at(trimmed, duration) {
-                                    let _ = std::fs::write(&cache_path, trimmed);
-                                    final_text = Some(trimmed.to_string());
+                                println!(
+                                    "[lyrics] Яндекс: «{}» / {}",
+                                    y_track.title,
+                                    y_track.artists_string()
+                                );
+                                if let Ok(Some(y_lyrics)) = client
+                                    .get_track_lyrics(&y_track.id, &artist, &title, duration)
+                                    .await
+                                {
+                                    let trimmed = y_lyrics.trim();
+                                    if crate::api::lrclib::looks_like_foreign_song(
+                                        trimmed, duration,
+                                    ) {
+                                        println!(
+                                            "[lyrics] Яндекс: разметка не от этого трека — пропускаем"
+                                        );
+                                    } else if crate::api::lrclib::usable_synced_at(
+                                        trimmed, duration,
+                                    ) {
+                                        let _ = std::fs::write(&cache_path, trimmed);
+                                        final_text = Some(trimmed.to_string());
+                                    }
                                 }
-                            }
                             }
                             None => println!(
                                 "[lyrics] Яндекс: подходящего трека не нашлось — фолбэк пропущен"
@@ -2824,10 +3505,16 @@ fn spawn_cover_and_lyrics(
             }
 
             // 4. Если караоке с таймкодами не нашлось — фолбэк на официальный текст YouTube Music
-            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration)) {
+            if final_text
+                .as_ref()
+                .map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration))
+            {
                 if let Some(yt_text) = ytm.get_yt_lyrics(&track_id).await {
                     let trimmed = yt_text.trim();
-                    println!("[lyrics] YouTube Music: официальный текст, {} симв.", trimmed.chars().count());
+                    println!(
+                        "[lyrics] YouTube Music: официальный текст, {} симв.",
+                        trimmed.chars().count()
+                    );
                     if !trimmed.is_empty() {
                         // Отвергнутую разметку статикой не затираем: длительность могла быть неверной,
                         // и при следующей проверке таймлайн ещё пригодится
@@ -2844,7 +3531,11 @@ fn spawn_cover_and_lyrics(
             // Трек из Яндекс Музыки
             let lookup = async {
                 if client.has_token() {
-                    client.get_track_lyrics(&track_id, &artist, &title, duration).await.ok().flatten()
+                    client
+                        .get_track_lyrics(&track_id, &artist, &title, duration)
+                        .await
+                        .ok()
+                        .flatten()
                 } else {
                     static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
                     let http = HTTP.get_or_init(|| {
@@ -2853,7 +3544,10 @@ fn spawn_cover_and_lyrics(
                             .build()
                             .unwrap_or_default()
                     });
-                    crate::api::lrclib::get_cached_or_fetch_lrclib(http, &track_id, &artist, &title, duration).await
+                    crate::api::lrclib::get_cached_or_fetch_lrclib(
+                        http, &track_id, &artist, &title, duration,
+                    )
+                    .await
                 }
             };
             tokio::time::timeout(std::time::Duration::from_secs(12), lookup)
@@ -2881,8 +3575,17 @@ fn next_repeat(mode: RepeatMode, wave: bool) -> RepeatMode {
 /// Один и тот же трек в Яндексе бывает в нескольких альбомах (сингл, сборка) под разными id:
 /// узнаём его по названию и исполнителям
 fn track_key(t: &Track) -> String {
-    let artists: Vec<String> = t.artists.iter().map(|a| a.name.trim().to_lowercase()).collect();
-    format!("{}|{}|{}", t.title.trim().to_lowercase(), t.version.as_deref().unwrap_or("").trim().to_lowercase(), artists.join(","))
+    let artists: Vec<String> = t
+        .artists
+        .iter()
+        .map(|a| a.name.trim().to_lowercase())
+        .collect();
+    format!(
+        "{}|{}|{}",
+        t.title.trim().to_lowercase(),
+        t.version.as_deref().unwrap_or("").trim().to_lowercase(),
+        artists.join(",")
+    )
 }
 
 /// Пост-фильтр «Моей Волны» — только для YouTube Music.
@@ -2902,7 +3605,9 @@ fn pick_candidates(is_yt: bool, engine: &Mutex<WaveEngine>, tracks: Vec<Track>) 
 /// Оставляет в `new` только треки, которых ещё нет в `existing` и среди самих `new`
 fn dedup_tracks(existing: &[Track], new: Vec<Track>) -> Vec<Track> {
     let mut seen: std::collections::HashSet<String> = existing.iter().map(track_key).collect();
-    new.into_iter().filter(|t| seen.insert(track_key(t))).collect()
+    new.into_iter()
+        .filter(|t| seen.insert(track_key(t)))
+        .collect()
 }
 
 /// Рассылает событие во все переданные каналы
@@ -3027,7 +3732,8 @@ mod yt_track_selection_tests {
             make_test_track("4", "Лесник", Some(192_000)),
         ];
 
-        let chosen = pick_best_yt_track(&candidates, "Лесник", Some(192_000)).expect("Track should be found");
+        let chosen = pick_best_yt_track(&candidates, "Лесник", Some(192_000))
+            .expect("Track should be found");
         assert_eq!(chosen.id, "4");
     }
 
@@ -3038,7 +3744,8 @@ mod yt_track_selection_tests {
             make_test_track("2", "Лесник", Some(192_000)),
         ];
 
-        let chosen = pick_best_yt_track(&candidates, "Лесник (Live)", Some(195_000)).expect("Track should be found");
+        let chosen = pick_best_yt_track(&candidates, "Лесник (Live)", Some(195_000))
+            .expect("Track should be found");
         assert_eq!(chosen.id, "1");
     }
 
@@ -3050,7 +3757,8 @@ mod yt_track_selection_tests {
             make_test_track("3", "Песня", Some(205_000)), // +5s  (в пределах 20s, ближе всех)
         ];
 
-        let chosen = pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
+        let chosen =
+            pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
         assert_eq!(chosen.id, "3");
     }
 
@@ -3062,7 +3770,8 @@ mod yt_track_selection_tests {
             make_test_track("3", "Песня", Some(200_000)),
         ];
 
-        let chosen = pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
+        let chosen =
+            pick_best_yt_track(&candidates, "Песня", Some(200_000)).expect("Track should be found");
         assert_eq!(chosen.id, "3");
     }
 }
@@ -3131,9 +3840,7 @@ fn plan_wave_fetch(
     anchor: Option<&str>,
 ) -> WaveFetchPlan {
     let anchor = anchor.map(str::trim).filter(|id| !id.is_empty());
-    if !drift_due
-        && let Some(token) = batch_id.map(str::trim).filter(|token| !token.is_empty())
-    {
+    if !drift_due && let Some(token) = batch_id.map(str::trim).filter(|token| !token.is_empty()) {
         return WaveFetchPlan {
             station: station_id.to_string(),
             continuation: Some(token.to_string()),
@@ -3301,13 +4008,22 @@ mod drift_anchor_tests {
             pick_drift_anchor(1, Some("now"), Some("now")).as_deref(),
             Some("now")
         );
-        assert_eq!(pick_drift_anchor(1, Some("now"), None).as_deref(), Some("now"));
-        assert_eq!(pick_drift_anchor(1, Some("now"), Some("  ")).as_deref(), Some("now"));
+        assert_eq!(
+            pick_drift_anchor(1, Some("now"), None).as_deref(),
+            Some("now")
+        );
+        assert_eq!(
+            pick_drift_anchor(1, Some("now"), Some("  ")).as_deref(),
+            Some("now")
+        );
     }
 
     #[test]
     fn test_drift_anchor_survives_empty_ids() {
-        assert_eq!(pick_drift_anchor(0, None, Some("tail")).as_deref(), Some("tail"));
+        assert_eq!(
+            pick_drift_anchor(0, None, Some("tail")).as_deref(),
+            Some("tail")
+        );
         assert_eq!(pick_drift_anchor(0, Some(""), None), None);
         assert_eq!(pick_drift_anchor(1, None, None), None);
     }
@@ -3353,7 +4069,10 @@ mod wave_fetch_tests {
     #[test]
     fn test_fresh_station_request_without_continuation_uses_anchor_when_present() {
         let plan = plan_wave_fetch("user:onyourwave", None, false, Some(" cur_id "));
-        assert_eq!(plan.station, "track:cur_id", "якорь должен обрезаться по краям");
+        assert_eq!(
+            plan.station, "track:cur_id",
+            "якорь должен обрезаться по краям"
+        );
         assert_eq!(plan.continuation, None);
         assert!(plan.new_seed);
     }
@@ -3401,14 +4120,22 @@ mod dedup_tests {
     fn track(id: &str, title: &str, artist: &str) -> Track {
         serde_json::from_value(serde_json::json!({
             "id": id, "title": title, "artists": [{"id": "1", "name": artist}]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]
     fn same_song_from_other_album_is_dropped() {
         let queue = vec![track("1", "Firework", "Katy Perry")];
-        let new = vec![track("2", "Firework ", "katy perry"), track("3", "Roar", "Katy Perry"), track("4", "Roar", "Katy Perry")];
-        let kept: Vec<_> = dedup_tracks(&queue, new).into_iter().map(|t| t.id).collect();
+        let new = vec![
+            track("2", "Firework ", "katy perry"),
+            track("3", "Roar", "Katy Perry"),
+            track("4", "Roar", "Katy Perry"),
+        ];
+        let kept: Vec<_> = dedup_tracks(&queue, new)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
         assert_eq!(kept, ["3"]);
     }
 }
@@ -3420,7 +4147,8 @@ mod pick_candidates_tests {
     fn track(id: &str, title: &str, artist: &str) -> Track {
         serde_json::from_value(serde_json::json!({
             "id": id, "title": title, "artists": [{"id": "1", "name": artist}]
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -3459,7 +4187,12 @@ mod pick_candidates_tests {
     #[test]
     fn empty_history_keeps_everything_on_both_sides() {
         let engine = Mutex::new(WaveEngine::new());
-        let make = || vec![track("1", "Roar", "Katy Perry"), track("2", "Firework", "Katy Perry")];
+        let make = || {
+            vec![
+                track("1", "Roar", "Katy Perry"),
+                track("2", "Firework", "Katy Perry"),
+            ]
+        };
         assert_eq!(pick_candidates(false, &engine, make()).len(), 2);
         assert_eq!(pick_candidates(true, &engine, make()).len(), 2);
     }
@@ -3479,8 +4212,14 @@ mod repeat_tests {
             }
             seen
         };
-        assert_eq!(cycle(false), [RepeatMode::One, RepeatMode::All, RepeatMode::Off]);
-        assert_eq!(cycle(true), [RepeatMode::One, RepeatMode::Off, RepeatMode::One]);
+        assert_eq!(
+            cycle(false),
+            [RepeatMode::One, RepeatMode::All, RepeatMode::Off]
+        );
+        assert_eq!(
+            cycle(true),
+            [RepeatMode::One, RepeatMode::Off, RepeatMode::One]
+        );
     }
 }
 
@@ -3609,7 +4348,8 @@ mod like_tests {
 
         let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
         let ytmusic_provider = Arc::new(YtMusicClient::new()) as Arc<dyn MusicProvider>;
-        let provider_manager = ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+        let provider_manager =
+            ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
         provider_manager.switch_provider(ProviderId::YouTubeMusic);
 
         let manager = PlayerManager {
