@@ -2,15 +2,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
-use libadwaita::prelude::*;
 use gtk4::{
-    glib, Align, Box as GtkBox, Button, Label, ListBox, Orientation, ScrolledWindow,
-    SelectionMode, Stack,
+    Align, Box as GtkBox, Button, Label, ListBox, Orientation, ScrolledWindow, SelectionMode,
+    Stack, glib,
 };
+use libadwaita::prelude::*;
 
-use super::collection::{album_tile, ask_playlist_name, clear_box, ensure_liked, new_playlist_tile, open_playlist, playlist_tile, section_title, tile_row, track_actions, track_row, DetailPage};
+use super::collection::{
+    DetailPage, album_tile, ask_playlist_name, clear_box, ensure_liked, new_playlist_tile,
+    open_playlist, playlist_tile, section_title, tile_row, track_actions, track_row,
+};
 use crate::api::models::Playlist;
-use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
+use crate::player::{PlaySource, PlayerManager, PlayerUiEvent, SourceTarget};
 
 pub struct LibraryViewWidgets {
     pub container: GtkBox,
@@ -97,11 +100,15 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
             let tracks = tracks.borrow().clone();
             let total_opt = *liked_total.borrow();
             let sub = match total_opt {
-                Some(total) if total > tracks.len() as u32 => format!("{} треков ({} доступно)", total, tracks.len()),
+                Some(total) if total > tracks.len() as u32 => {
+                    format!("{} треков ({} доступно)", total, tracks.len())
+                }
                 Some(total) if total > 0 => format!("{} треков", total),
                 _ => format!("{} треков", tracks.len()),
             };
-            let cover_url = if p.providers.current().provider_id() == crate::api::provider::ProviderId::YouTubeMusic {
+            let cover_url = if p.providers.current().provider_id()
+                == crate::api::provider::ProviderId::YouTubeMusic
+            {
                 Some("https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-songs-delhi-576.png".to_string())
             } else {
                 tracks.first().and_then(|t| t.cover_uri.clone())
@@ -151,17 +158,59 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     stack.set_visible_child_name("main");
 
     let reload_library: Rc<dyn Fn()> = {
-        let (p, stack, page, status, yt_login_btn) = (player.clone(), stack.clone(), page.clone(), status.clone(), yt_login_btn.clone());
-        let (liked_box, liked_count, liked_empty_msg, liked_list, liked_all, liked_tracks, liked_total) =
-            (liked_box.clone(), liked_count.clone(), liked_empty_msg.clone(), liked_list.clone(), liked_all.clone(), liked_tracks.clone(), liked_total.clone());
+        let (p, stack, page, status, yt_login_btn) = (
+            player.clone(),
+            stack.clone(),
+            page.clone(),
+            status.clone(),
+            yt_login_btn.clone(),
+        );
+        let (
+            liked_box,
+            liked_count,
+            liked_empty_msg,
+            liked_list,
+            liked_all,
+            liked_tracks,
+            liked_total,
+        ) = (
+            liked_box.clone(),
+            liked_count.clone(),
+            liked_empty_msg.clone(),
+            liked_list.clone(),
+            liked_all.clone(),
+            liked_tracks.clone(),
+            liked_total.clone(),
+        );
         let (playlists_box, playlists_row) = (playlists_box.clone(), playlists_row.clone());
         let (albums_box, albums_row) = (albums_box.clone(), albums_row.clone());
         let (offline_box, offline_list) = (offline_box.clone(), offline_list.clone());
 
         Rc::new(move || {
-            let (p, stack, page, status, yt_login_btn) = (p.clone(), stack.clone(), page.clone(), status.clone(), yt_login_btn.clone());
-            let (liked_box, liked_count, liked_empty_msg, liked_list, liked_all, liked_tracks, liked_total) =
-                (liked_box.clone(), liked_count.clone(), liked_empty_msg.clone(), liked_list.clone(), liked_all.clone(), liked_tracks.clone(), liked_total.clone());
+            let (p, stack, page, status, yt_login_btn) = (
+                p.clone(),
+                stack.clone(),
+                page.clone(),
+                status.clone(),
+                yt_login_btn.clone(),
+            );
+            let (
+                liked_box,
+                liked_count,
+                liked_empty_msg,
+                liked_list,
+                liked_all,
+                liked_tracks,
+                liked_total,
+            ) = (
+                liked_box.clone(),
+                liked_count.clone(),
+                liked_empty_msg.clone(),
+                liked_list.clone(),
+                liked_all.clone(),
+                liked_tracks.clone(),
+                liked_total.clone(),
+            );
             let (playlists_box, playlists_row) = (playlists_box.clone(), playlists_row.clone());
             let (albums_box, albums_row) = (albums_box.clone(), albums_row.clone());
             let (offline_box, offline_list) = (offline_box.clone(), offline_list.clone());
@@ -171,19 +220,31 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
             let saved = crate::cache::list_offline();
             for (i, track) in saved.iter().enumerate() {
                 let (p, queue) = (p.clone(), saved.clone());
-                let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play_from(queue.clone(), i, Some(PlaySource::new("Загруженные", Some(SourceTarget::Library)))) });
+                let row = track_row(track, {
+                    let (p, queue) = (p.clone(), queue.clone());
+                    move || {
+                        p.set_queue_and_play_from(
+                            queue.clone(),
+                            i,
+                            Some(PlaySource::new("Загруженные", Some(SourceTarget::Library))),
+                        )
+                    }
+                });
                 row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                 offline_list.append(&row);
             }
             offline_box.set_visible(!saved.is_empty());
 
             glib::spawn_future_local(async move {
-                let provider = p.providers.current();
-                let is_yandex = provider.provider_id() == crate::api::provider::ProviderId::Yandex;
-                let is_yt = provider.provider_id() == crate::api::provider::ProviderId::YouTubeMusic;
+                let session = p.providers.session();
+                let provider = session.provider;
+                let is_yandex = session.id == crate::api::provider::ProviderId::Yandex;
+                let is_yt = session.id == crate::api::provider::ProviderId::YouTubeMusic;
 
                 if is_yandex && !provider.is_authenticated() {
-                    status.set_text("Укажите токен Яндекс Музыки в настройках ⚙ для доступа к коллекции");
+                    status.set_text(
+                        "Укажите токен Яндекс Музыки в настройках ⚙ для доступа к коллекции",
+                    );
                     status.set_visible(true);
                     yt_login_btn.set_visible(false);
                     liked_box.set_visible(false);
@@ -192,10 +253,13 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     return;
                 }
 
-                if is_yt && !provider.is_authenticated() {
-                    status.set_text("Войдите в Google Аккаунт для доступа к вашей медиатеке YouTube Music 🔴");
+                if !is_yandex && !provider.is_authenticated() {
+                    status.set_text(&format!(
+                        "Войдите в {} для доступа к вашей медиатеке",
+                        provider.display_name()
+                    ));
                     status.set_visible(true);
-                    yt_login_btn.set_visible(true);
+                    yt_login_btn.set_visible(is_yt);
                     liked_box.set_visible(false);
                     playlists_box.set_visible(false);
                     albums_box.set_visible(false);
@@ -215,6 +279,9 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     provider.get_liked_total_count()
                 );
 
+                if !p.providers.is_current(session.id, session.generation) {
+                    return;
+                }
                 *liked_total.borrow_mut() = total_cnt_opt;
 
                 if let Ok(tracks) = liked_res {
@@ -222,7 +289,9 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     if !tracks.is_empty() {
                         liked_empty_msg.set_visible(false);
                         let count_str = match total_cnt_opt {
-                            Some(total) if total > tracks.len() as u32 => format!("{} треков ({} доступно)", total, tracks.len()),
+                            Some(total) if total > tracks.len() as u32 => {
+                                format!("{} треков ({} доступно)", total, tracks.len())
+                            }
                             Some(total) if total > 0 => format!("{} треков", total),
                             _ => format!("{} треков", tracks.len()),
                         };
@@ -231,7 +300,19 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                         liked_list.remove_all();
                         for (i, track) in tracks.iter().take(LIKED_PREVIEW).enumerate() {
                             let (p, queue) = (p.clone(), tracks.clone());
-                            let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play_from(queue.clone(), i, Some(PlaySource::new("Мне нравится", Some(SourceTarget::Library)))) });
+                            let row = track_row(track, {
+                                let (p, queue) = (p.clone(), queue.clone());
+                                move || {
+                                    p.set_queue_and_play_from(
+                                        queue.clone(),
+                                        i,
+                                        Some(PlaySource::new(
+                                            "Мне нравится",
+                                            Some(SourceTarget::Library),
+                                        )),
+                                    )
+                                }
+                            });
                             row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                             liked_list.append(&row);
                         }
@@ -256,27 +337,56 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
                 if let Ok(playlists) = playlists_res {
                     clear_box(&playlists_row);
-                    let uid = {
+                    let uid = if is_yandex {
                         let client = p.client.lock().unwrap().clone();
-                        client.get_uid().await.unwrap_or_else(|_| "user".to_string())
+                        client
+                            .get_uid()
+                            .await
+                            .unwrap_or_else(|_| "user".to_string())
+                    } else {
+                        String::new()
                     };
+                    if !p.providers.is_current(session.id, session.generation) {
+                        return;
+                    }
 
                     if is_yandex {
-                        let (p2, stack2, page2, row2, uid2) = (p.clone(), stack.clone(), page.clone(), playlists_row.clone(), uid.clone());
+                        let (p2, stack2, page2, row2, uid2) = (
+                            p.clone(),
+                            stack.clone(),
+                            page.clone(),
+                            playlists_row.clone(),
+                            uid.clone(),
+                        );
                         let new_tile = new_playlist_tile(TILE_SIZE, {
                             let anchor = playlists_row.clone();
                             move || {
-                                let (p, stack, page, row, uid) = (p2.clone(), stack2.clone(), page2.clone(), row2.clone(), uid2.clone());
+                                let (p, stack, page, row, uid) = (
+                                    p2.clone(),
+                                    stack2.clone(),
+                                    page2.clone(),
+                                    row2.clone(),
+                                    uid2.clone(),
+                                );
                                 ask_playlist_name(&anchor, move |name| {
                                     glib::spawn_future_local(async move {
                                         let client = p.client.lock().unwrap().clone();
                                         match client.create_playlist(&uid, &name).await {
                                             Ok(kind) => {
-                                                let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), og_image: None };
+                                                let pl = Playlist {
+                                                    uid: uid.clone(),
+                                                    kind,
+                                                    title: name,
+                                                    track_count: Some(0),
+                                                    og_image: None,
+                                                };
                                                 open_playlist(&p, &stack, &page, &pl);
                                                 fill_playlists(&p, &stack, &page, &row, &uid).await;
                                             }
-                                            Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось создать плейлист: {}", e))),
+                                            Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                                                "Не удалось создать плейлист: {}",
+                                                e
+                                            ))),
                                         }
                                     });
                                 });
@@ -320,7 +430,19 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
     let rx = player.subscribe();
     {
-        let (player, page, stack, liked_tracks, liked_count, liked_empty_msg, liked_list, liked_all, liked_box, liked_total, reload) = (
+        let (
+            player,
+            page,
+            stack,
+            liked_tracks,
+            liked_count,
+            liked_empty_msg,
+            liked_list,
+            liked_all,
+            liked_box,
+            liked_total,
+            reload,
+        ) = (
             player.clone(),
             page.clone(),
             stack.clone(),
@@ -355,7 +477,9 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                             liked_empty_msg.set_visible(false);
                             let total_opt = *liked_total.borrow();
                             let count_str = match total_opt {
-                                Some(total) if total > count as u32 => format!("{} треков ({} доступно)", total, count),
+                                Some(total) if total > count as u32 => {
+                                    format!("{} треков ({} доступно)", total, count)
+                                }
                                 Some(total) if total > 0 => format!("{} треков", total),
                                 _ => format!("{} треков", count),
                             };
@@ -363,13 +487,18 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                             liked_count.set_visible(true);
 
                             liked_list.remove_all();
-                            for (i, t) in liked_tracks.borrow().iter().take(LIKED_PREVIEW).enumerate() {
+                            for (i, t) in
+                                liked_tracks.borrow().iter().take(LIKED_PREVIEW).enumerate()
+                            {
                                 let (p, queue) = (player.clone(), liked_tracks.clone());
                                 let row = track_row(t, move || {
                                     p.set_queue_and_play_from(
                                         queue.borrow().clone(),
                                         i,
-                                        Some(PlaySource::new("Мне нравится", Some(SourceTarget::Library))),
+                                        Some(PlaySource::new(
+                                            "Мне нравится",
+                                            Some(SourceTarget::Library),
+                                        )),
                                     )
                                 });
                                 row.add_suffix(&track_actions(&player, Some((&stack, &page)), t));
@@ -380,7 +509,8 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                             liked_box.set_visible(true);
                         } else {
                             let provider = player.providers.current();
-                            let is_yt = provider.provider_id() == crate::api::provider::ProviderId::YouTubeMusic;
+                            let is_yt = provider.provider_id()
+                                == crate::api::provider::ProviderId::YouTubeMusic;
                             if is_yt && provider.is_authenticated() {
                                 liked_empty_msg.set_visible(true);
                                 liked_count.set_visible(false);
@@ -415,26 +545,53 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 }
 
 /// Плитка создания и плейлисты пользователя; после создания список перерисовывается
-async fn fill_playlists(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, row: &GtkBox, uid: &str) {
+async fn fill_playlists(
+    p: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    row: &GtkBox,
+    uid: &str,
+) {
     let client = p.client.lock().unwrap().clone();
     let playlists = client.get_user_playlists(uid).await.unwrap_or_default();
     clear_box(row);
-    let (p2, stack2, page2, row2, uid2) = (p.clone(), stack.clone(), page.clone(), row.clone(), uid.to_string());
+    let (p2, stack2, page2, row2, uid2) = (
+        p.clone(),
+        stack.clone(),
+        page.clone(),
+        row.clone(),
+        uid.to_string(),
+    );
     let new_tile = new_playlist_tile(TILE_SIZE, {
         let anchor = row.clone();
         move || {
-            let (p, stack, page, row, uid) = (p2.clone(), stack2.clone(), page2.clone(), row2.clone(), uid2.clone());
+            let (p, stack, page, row, uid) = (
+                p2.clone(),
+                stack2.clone(),
+                page2.clone(),
+                row2.clone(),
+                uid2.clone(),
+            );
             ask_playlist_name(&anchor, move |name| {
                 glib::spawn_future_local(async move {
                     let client = p.client.lock().unwrap().clone();
                     match client.create_playlist(&uid, &name).await {
                         Ok(kind) => {
                             // у нового плейлиста сразу открывается его страница
-                            let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), og_image: None };
+                            let pl = Playlist {
+                                uid: uid.clone(),
+                                kind,
+                                title: name,
+                                track_count: Some(0),
+                                og_image: None,
+                            };
                             open_playlist(&p, &stack, &page, &pl);
                             fill_playlists(&p, &stack, &page, &row, &uid).await
                         }
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось создать плейлист: {}", e))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось создать плейлист: {}",
+                            e
+                        ))),
                     }
                 });
             });

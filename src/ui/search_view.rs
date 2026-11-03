@@ -2,17 +2,18 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gtk4::prelude::*;
-use libadwaita::prelude::*;
-use libadwaita::ActionRow;
 use gtk4::{
-    glib, Align, Box as GtkBox, Button, FlowBox, Label, ListBox, Orientation, ScrolledWindow, SearchEntry,
-    SelectionMode, Stack, ToggleButton,
+    Align, Box as GtkBox, Button, FlowBox, Label, ListBox, Orientation, ScrolledWindow,
+    SearchEntry, SelectionMode, Stack, ToggleButton, glib,
 };
+use libadwaita::ActionRow;
+use libadwaita::prelude::*;
 
 use super::collection::{
-    album_tile, artist_row, artist_tile, clear_box, ensure_liked, item_row, open_album, open_artist, open_playlist, open_track, playlist_tile, section_title, track_actions, track_row, DetailPage,
+    DetailPage, album_tile, artist_row, artist_tile, clear_box, ensure_liked, item_row, open_album,
+    open_artist, open_playlist, open_track, playlist_tile, section_title, track_actions, track_row,
 };
-use crate::api::history::{clear_history_for, load_history_for, push_history_for, HistoryItem};
+use crate::api::history::{HistoryItem, clear_history_for, load_history_for, push_history_for};
 use crate::api::models::{Album, SearchResult, Track};
 use crate::api::provider::ProviderId;
 use crate::player::PlayerManager;
@@ -46,12 +47,20 @@ impl Section {
         root.append(&section_title(title));
         root.append(content);
         root.set_visible(false);
-        Self { root, has_items: Cell::new(false) }
+        Self {
+            root,
+            has_items: Cell::new(false),
+        }
     }
 }
 
 /// Строка истории: действие то же, что у результата поиска, и запись поднимается наверх
-fn history_row(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, item: &HistoryItem) -> ActionRow {
+fn history_row(
+    p: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    item: &HistoryItem,
+) -> ActionRow {
     let (p, stack, page, it) = (p.clone(), stack.clone(), page.clone(), item.clone());
     let provider = p.providers.active_id();
     match item {
@@ -66,24 +75,41 @@ fn history_row(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, item: &H
             row.add_suffix(&actions);
             row
         }
-        HistoryItem::Artist(a) => artist_row(&a.name, "Исполнитель", a.cover_url(100), move || {
-            push_history_for(provider, it.clone());
-            if let HistoryItem::Artist(a) = &it {
-                open_artist(&p, &stack, &page, a.id.clone());
-            }
-        }),
-        HistoryItem::Album(a) => item_row(a.title.as_deref().unwrap_or(""), &a.artists_string(), a.cover_url(100), false, move || {
-            push_history_for(provider, it.clone());
-            if let HistoryItem::Album(a) = &it {
-                open_album(&p, &stack, &page, a);
-            }
-        }),
-        HistoryItem::Playlist(pl) => item_row(&pl.title, "Плейлист", pl.cover_url(100), false, move || {
-            push_history_for(provider, it.clone());
-            if let HistoryItem::Playlist(pl) = &it {
-                open_playlist(&p, &stack, &page, pl);
-            }
-        }),
+        HistoryItem::Artist(a) => artist_row(
+            &a.name,
+            "Исполнитель",
+            a.cover_url(100),
+            move || {
+                push_history_for(provider, it.clone());
+                if let HistoryItem::Artist(a) = &it {
+                    open_artist(&p, &stack, &page, a.id.clone());
+                }
+            },
+        ),
+        HistoryItem::Album(a) => item_row(
+            a.title.as_deref().unwrap_or(""),
+            &a.artists_string(),
+            a.cover_url(100),
+            false,
+            move || {
+                push_history_for(provider, it.clone());
+                if let HistoryItem::Album(a) = &it {
+                    open_album(&p, &stack, &page, a);
+                }
+            },
+        ),
+        HistoryItem::Playlist(pl) => item_row(
+            &pl.title,
+            "Плейлист",
+            pl.cover_url(100),
+            false,
+            move || {
+                push_history_for(provider, it.clone());
+                if let HistoryItem::Playlist(pl) = &it {
+                    open_playlist(&p, &stack, &page, pl);
+                }
+            },
+        ),
     }
 }
 
@@ -122,10 +148,10 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
 
     let search_entry = SearchEntry::new();
     let initial_provider = player.providers.active_id();
-    search_entry.set_placeholder_text(Some(if initial_provider == ProviderId::YouTubeMusic {
-        "Поиск в YouTube Music…"
-    } else {
-        "Поиск в Яндекс Музыке…"
+    search_entry.set_placeholder_text(Some(match initial_provider {
+        ProviderId::YouTubeMusic => "Поиск в YouTube Music…",
+        ProviderId::Vk => "Поиск во ВКонтакте…",
+        ProviderId::Yandex => "Поиск в Яндекс Музыке…",
     }));
     search_entry.set_hexpand(true);
     main.append(&search_entry);
@@ -161,7 +187,13 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     let reb_self: Rc<std::cell::RefCell<Option<Rc<dyn Fn()>>>> = Rc::default();
     let reb_self_clone = reb_self.clone();
     let rebuild_history: Rc<dyn Fn()> = {
-        let (hb, p, stack, page, filter) = (history_box.clone(), player.clone(), stack.clone(), page.clone(), filter.clone());
+        let (hb, p, stack, page, filter) = (
+            history_box.clone(),
+            player.clone(),
+            stack.clone(),
+            page.clone(),
+            filter.clone(),
+        );
         Rc::new(move || {
             clear_box(&hb);
             let active_provider = p.providers.active_id();
@@ -170,7 +202,10 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
                 .into_iter()
                 .filter(|it| match (filter.get(), it) {
                     (0, _) => true,
-                    (1, HistoryItem::Track(_)) | (2, HistoryItem::Artist(_)) | (3, HistoryItem::Album(_)) | (4, HistoryItem::Playlist(_)) => true,
+                    (1, HistoryItem::Track(_))
+                    | (2, HistoryItem::Artist(_))
+                    | (3, HistoryItem::Album(_))
+                    | (4, HistoryItem::Playlist(_)) => true,
                     _ => false,
                 })
                 .collect();
@@ -244,16 +279,28 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     // Фильтр: 0 — всё, 1..=3 — одна секция
     let apply_filter = {
         let (filter, sections) = (filter.clone(), sections.clone());
-        let (tracks_list, artists_grid, albums_grid, playlists_grid) =
-            (tracks_list.clone(), artists_grid.clone(), albums_grid.clone(), playlists_grid.clone());
+        let (tracks_list, artists_grid, albums_grid, playlists_grid) = (
+            tracks_list.clone(),
+            artists_grid.clone(),
+            albums_grid.clone(),
+            playlists_grid.clone(),
+        );
         Rc::new(move || {
             for (i, s) in sections.iter().enumerate() {
                 let wanted = filter.get() == 0 || filter.get() == i + 1;
                 s.root.set_visible(wanted && s.has_items.get());
             }
             // «Все»: только верх выдачи по каждому разделу, полные списки в своих фильтрах
-            let limit = if filter.get() == 0 { Some(ALL_TRACKS_LIMIT) } else { None };
-            let tile_limit = if filter.get() == 0 { Some(ALL_TILES_LIMIT) } else { None };
+            let limit = if filter.get() == 0 {
+                Some(ALL_TRACKS_LIMIT)
+            } else {
+                None
+            };
+            let tile_limit = if filter.get() == 0 {
+                Some(ALL_TILES_LIMIT)
+            } else {
+                None
+            };
             let mut i = 0;
             while let Some(row) = tracks_list.row_at_index(i) {
                 row.set_visible(limit.map_or(true, |n| (i as usize) < n));
@@ -269,7 +316,12 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         })
     };
     for (i, b) in buttons.iter().enumerate() {
-        let (filter, apply, rebuild, entry) = (filter.clone(), apply_filter.clone(), rebuild_history.clone(), search_entry.clone());
+        let (filter, apply, rebuild, entry) = (
+            filter.clone(),
+            apply_filter.clone(),
+            rebuild_history.clone(),
+            search_entry.clone(),
+        );
         b.connect_toggled(move |b| {
             if b.is_active() {
                 filter.set(i);
@@ -311,8 +363,13 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
             history_box.set_visible(false);
             status_label.set_text(&format!("Поиск: «{}»...", query));
 
-            let (p, stack, page, sections, apply) =
-                (player.clone(), stack.clone(), page.clone(), sections.clone(), apply_filter.clone());
+            let (p, stack, page, sections, apply) = (
+                player.clone(),
+                stack.clone(),
+                page.clone(),
+                sections.clone(),
+                apply_filter.clone(),
+            );
             let (status, tracks_list, artists_grid, albums_grid, playlists_grid) = (
                 status_label.clone(),
                 tracks_list.clone(),
@@ -322,8 +379,9 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
             );
 
             glib::spawn_future_local(async move {
-                let provider = p.providers.current();
-                let is_yandex = provider.provider_id() == crate::api::provider::ProviderId::Yandex;
+                let session = p.providers.session();
+                let provider = session.provider;
+                let is_yandex = session.id == crate::api::provider::ProviderId::Yandex;
                 if is_yandex && !provider.is_authenticated() {
                     status.set_text("Укажите токен Яндекс Музыки в настройках ⚙ для поиска");
                     return;
@@ -331,13 +389,15 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
                 let result: SearchResult = match provider.search(&query).await {
                     Ok(r) => r,
                     Err(e) => {
-                        if seq.get() == my_seq {
+                        if seq.get() == my_seq
+                            && p.providers.is_current(session.id, session.generation)
+                        {
                             status.set_text(&format!("Ошибка поиска: {}", e));
                         }
                         return;
                     }
                 };
-                if seq.get() != my_seq {
+                if seq.get() != my_seq || !p.providers.is_current(session.id, session.generation) {
                     return;
                 }
 
@@ -353,7 +413,7 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
 
                 // Клик по треку: он играет, дальше «Волна по треку»
                 ensure_liked(&p).await;
-                if seq.get() != my_seq {
+                if seq.get() != my_seq || !p.providers.is_current(session.id, session.generation) {
                     return;
                 }
                 for track in &tracks {
@@ -368,19 +428,28 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
                 for artist in &artists {
                     let tile = artist_tile(&p, &stack, &page, artist, TILE_SIZE);
                     let (p2, a) = (p.clone(), artist.clone());
-                    tile.connect_clicked(move |_| push_history_for(p2.providers.active_id(), HistoryItem::Artist(a.clone())));
+                    tile.connect_clicked(move |_| {
+                        push_history_for(p2.providers.active_id(), HistoryItem::Artist(a.clone()))
+                    });
                     artists_grid.append(&tile);
                 }
                 for album in &albums {
                     let tile = album_tile(&p, &stack, &page, album, TILE_SIZE);
                     let (p2, a) = (p.clone(), album.clone());
-                    tile.connect_clicked(move |_| push_history_for(p2.providers.active_id(), HistoryItem::Album(a.clone())));
+                    tile.connect_clicked(move |_| {
+                        push_history_for(p2.providers.active_id(), HistoryItem::Album(a.clone()))
+                    });
                     albums_grid.append(&tile);
                 }
                 for pl in &playlists {
                     let tile = playlist_tile(&p, &stack, &page, pl, TILE_SIZE);
                     let (p2, pl) = (p.clone(), pl.clone());
-                    tile.connect_clicked(move |_| push_history_for(p2.providers.active_id(), HistoryItem::Playlist(pl.clone())));
+                    tile.connect_clicked(move |_| {
+                        push_history_for(
+                            p2.providers.active_id(),
+                            HistoryItem::Playlist(pl.clone()),
+                        )
+                    });
                     playlists_grid.append(&tile);
                 }
 
@@ -390,7 +459,11 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
                 sections[3].has_items.set(!playlists.is_empty());
                 apply();
 
-                if tracks.is_empty() && artists.is_empty() && albums.is_empty() && playlists.is_empty() {
+                if tracks.is_empty()
+                    && artists.is_empty()
+                    && albums.is_empty()
+                    && playlists.is_empty()
+                {
                     status.set_text("Ничего не найдено");
                 } else {
                     status.set_text(&format!(
@@ -400,7 +473,6 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
                         albums.len(),
                         playlists.len()
                     ));
-
                 }
             });
         });
@@ -416,10 +488,10 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 if let crate::player::PlayerUiEvent::ProviderChanged(id) = event {
-                    se.set_placeholder_text(Some(if id == ProviderId::YouTubeMusic {
-                        "Поиск в YouTube Music…"
-                    } else {
-                        "Поиск в Яндекс Музыке…"
+                    se.set_placeholder_text(Some(match id {
+                        ProviderId::YouTubeMusic => "Поиск в YouTube Music…",
+                        ProviderId::Vk => "Поиск во ВКонтакте…",
+                        ProviderId::Yandex => "Поиск в Яндекс Музыке…",
                     }));
                     let text = se.text().trim().to_string();
                     if !text.is_empty() {
@@ -451,5 +523,12 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         Rc::new(move |pl| open_playlist(&p, &stack, &page, &pl))
     };
 
-    SearchViewWidgets { container, show_artist, show_track, show_album, show_playlist, reload_history: rebuild_history }
+    SearchViewWidgets {
+        container,
+        show_artist,
+        show_track,
+        show_album,
+        show_playlist,
+        reload_history: rebuild_history,
+    }
 }
