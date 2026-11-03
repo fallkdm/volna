@@ -1,25 +1,25 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::time::Duration;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, Orientation, Overlay, Overflow, ScrolledWindow, PolicyType,
+    Align, Box as GtkBox, Button, Label, Orientation, Overflow, Overlay, PolicyType, ScrolledWindow,
 };
 use libadwaita::prelude::*;
 use libadwaita::{
     Application, ApplicationWindow, HeaderBar, Toast, ToastOverlay, ViewStack, ViewSwitcher,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
-use crate::api::models::{parse_lrc, LrcLine};
-use crate::api::provider::ProviderId;
-use crate::player::{PlayerManager, PlayerUiEvent, RepeatMode};
-use super::auth_dialog::show_auth_dialog;
-use super::floating_island::{create_floating_island, FloatingIslandWidgets};
+use super::auth_dialog::{show_auth_dialog, show_vk_api_captcha_dialog, show_vk_auth_dialog};
+use super::floating_island::{FloatingIslandWidgets, create_floating_island};
 use super::library_view::create_library_view;
 use super::preferences_dialog::{show_preferences_dialog, show_ytmusic_auth_dialog};
 use super::search_view::create_search_view;
-use super::wave_view::{create_wave_view, WaveViewWidgets};
+use super::wave_view::{WaveViewWidgets, create_wave_view};
+use crate::api::models::{LrcLine, parse_lrc};
+use crate::api::provider::ProviderId;
+use crate::player::{PlayerManager, PlayerUiEvent, RepeatMode};
 
 pub struct VolnaWindow {
     pub window: ApplicationWindow,
@@ -133,12 +133,20 @@ impl VolnaWindow {
         let is_spotify_nav_state = Rc::new(RefCell::new(is_spotify_nav));
 
         let initial_content_margin = if is_spotify_nav {
-            if initial_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH }
+            if initial_collapsed {
+                SIDEBAR_COLLAPSED_WIDTH
+            } else {
+                SIDEBAR_EXPANDED_WIDTH
+            }
         } else {
             0
         };
-        search_view.container.set_margin_start(initial_content_margin);
-        library_view.container.set_margin_start(initial_content_margin);
+        search_view
+            .container
+            .set_margin_start(initial_content_margin);
+        library_view
+            .container
+            .set_margin_start(initial_content_margin);
 
         let search_container = search_view.container.clone();
         let library_container = library_view.container.clone();
@@ -149,7 +157,11 @@ impl VolnaWindow {
         let sidebar = GtkBox::new(Orientation::Vertical, 0);
         sidebar.add_css_class("sidebar");
         sidebar.add_css_class("spotify-sidebar");
-        let initial_width = if initial_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH };
+        let initial_width = if initial_collapsed {
+            SIDEBAR_COLLAPSED_WIDTH
+        } else {
+            SIDEBAR_EXPANDED_WIDTH
+        };
         sidebar.set_width_request(initial_width);
         sidebar.set_halign(Align::Start);
         sidebar.set_valign(Align::Fill);
@@ -188,7 +200,11 @@ impl VolnaWindow {
         collapse_btn.add_css_class("sidebar-collapse-btn");
         collapse_btn.set_size_request(44, 40);
         collapse_btn.set_focusable(false);
-        collapse_btn.set_tooltip_text(Some(if initial_collapsed { "Развернуть панель" } else { "Свернуть панель" }));
+        collapse_btn.set_tooltip_text(Some(if initial_collapsed {
+            "Развернуть панель"
+        } else {
+            "Свернуть панель"
+        }));
         collapse_btn.set_valign(Align::Center);
 
         if initial_collapsed {
@@ -245,7 +261,11 @@ impl VolnaWindow {
 
         let nav_wave = create_sidebar_nav_btn("radio-symbolic", "Волна", initial_collapsed);
         let nav_search = create_sidebar_nav_btn("edit-find-symbolic", "Поиск", initial_collapsed);
-        let nav_liked = create_sidebar_nav_btn("emblem-favorite-symbolic", "Любимые треки", initial_collapsed);
+        let nav_liked = create_sidebar_nav_btn(
+            "emblem-favorite-symbolic",
+            "Любимые треки",
+            initial_collapsed,
+        );
 
         let btn_wave = nav_wave.btn.clone();
         let btn_search = nav_search.btn.clone();
@@ -290,7 +310,8 @@ impl VolnaWindow {
         let cur_prov = player.providers.active_id();
         let (initial_icon, initial_label) = match cur_prov {
             crate::api::provider::ProviderId::YouTubeMusic => ("🔴", "YouTube Music"),
-            _ => ("🌊", "Яндекс"),
+            crate::api::provider::ProviderId::Vk => ("🔵", "ВКонтакте"),
+            crate::api::provider::ProviderId::Yandex => ("🌊", "Яндекс"),
         };
 
         let source_icon = Label::new(Some(initial_icon));
@@ -339,6 +360,10 @@ impl VolnaWindow {
         yt_item.add_css_class("flat");
         yt_item.set_halign(Align::Fill);
 
+        let vk_item = Button::with_label("🔵  ВКонтакте");
+        vk_item.add_css_class("flat");
+        vk_item.set_halign(Align::Fill);
+
         {
             let p = player.clone();
             let pop = source_popover.clone();
@@ -356,8 +381,23 @@ impl VolnaWindow {
             });
         }
 
+        {
+            let p = player.clone();
+            let pop = source_popover.clone();
+            let window = window.downgrade();
+            vk_item.connect_clicked(move |_| {
+                if p.providers.get(ProviderId::Vk).is_some() {
+                    p.switch_provider(ProviderId::Vk);
+                } else if let Some(window) = window.upgrade() {
+                    show_vk_auth_dialog(&window, &p);
+                }
+                pop.popdown();
+            });
+        }
+
         source_pop_box.append(&ya_item);
         source_pop_box.append(&yt_item);
+        source_pop_box.append(&vk_item);
         source_popover.set_child(Some(&source_pop_box));
         source_btn.set_popover(Some(&source_popover));
 
@@ -412,7 +452,14 @@ impl VolnaWindow {
         }
 
         auth_btn.set_child(Some(&auth_overlay));
-        update_auth_ui(&auth_btn, &auth_icon, &auth_name_label, &header_auth_btn, &player, None);
+        update_auth_ui(
+            &auth_btn,
+            &auth_icon,
+            &auth_name_label,
+            &header_auth_btn,
+            &player,
+            None,
+        );
 
         // Кнопка настроек (с оверлеем)
         let settings_btn = Button::new();
@@ -496,10 +543,22 @@ impl VolnaWindow {
                 *is_collapsed.borrow_mut() = next_collapsed;
                 let _ = crate::api::auth::save_sidebar_collapsed(next_collapsed);
 
-                let from_w = if currently_collapsed { SIDEBAR_COLLAPSED_WIDTH as f64 } else { SIDEBAR_EXPANDED_WIDTH as f64 };
-                let to_w = if next_collapsed { SIDEBAR_COLLAPSED_WIDTH as f64 } else { SIDEBAR_EXPANDED_WIDTH as f64 };
+                let from_w = if currently_collapsed {
+                    SIDEBAR_COLLAPSED_WIDTH as f64
+                } else {
+                    SIDEBAR_EXPANDED_WIDTH as f64
+                };
+                let to_w = if next_collapsed {
+                    SIDEBAR_COLLAPSED_WIDTH as f64
+                } else {
+                    SIDEBAR_EXPANDED_WIDTH as f64
+                };
 
-                c_btn.set_tooltip_text(Some(if next_collapsed { "Развернуть панель" } else { "Свернуть панель" }));
+                c_btn.set_tooltip_text(Some(if next_collapsed {
+                    "Развернуть панель"
+                } else {
+                    "Свернуть панель"
+                }));
 
                 if next_collapsed {
                     // При сворачивании СРАЗУ скрываем текст и центрируем кнопку:
@@ -553,7 +612,9 @@ impl VolnaWindow {
                         sc.set_margin_start(w);
                         lc.set_margin_start(w);
                     }
-                    let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
+                    let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64)
+                        / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64))
+                        .clamp(0.0, 1.0);
                     if !next_collapsed {
                         bb.set_opacity(t);
                         slb.set_opacity(t);
@@ -580,7 +641,11 @@ impl VolnaWindow {
 
                 anim.connect_done(move |_| {
                     if *is_sp_done.borrow() {
-                        let m = if next_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH };
+                        let m = if next_collapsed {
+                            SIDEBAR_COLLAPSED_WIDTH
+                        } else {
+                            SIDEBAR_EXPANDED_WIDTH
+                        };
                         sc_done.set_margin_start(m);
                         lc_done.set_margin_start(m);
                     }
@@ -712,7 +777,10 @@ impl VolnaWindow {
         root_overlay.set_measure_overlay(&island.container, false);
 
         if let Some((core, deep, ridge)) = get_accent_palette(&theme_accent) {
-            wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
+            wave_view
+                .shader_state
+                .borrow_mut()
+                .set_target_colors(core, deep, ridge);
         }
 
         // Закрытие текста песни: задаётся ниже, когда создан экран караоке; переходы по клику из плеера закрывают его,
@@ -723,17 +791,24 @@ impl VolnaWindow {
         let open_from_player = |label: &gtk4::Label, artist: bool| {
             let click = gtk4::GestureClick::new();
             let (p, vs) = (player.clone(), view_stack.clone());
-            let (show_artist, show_track) = (search_view.show_artist.clone(), search_view.show_track.clone());
+            let (show_artist, show_track) = (
+                search_view.show_artist.clone(),
+                search_view.show_track.clone(),
+            );
             let close = close_karaoke.clone();
             click.connect_released(move |_, _, _, _| {
-                let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
+                let Some(track) = p.state.lock().unwrap().current_track.clone() else {
+                    return;
+                };
                 let f = close.borrow().clone();
                 if let Some(f) = f {
                     f();
                 }
                 if artist {
                     // shortcut: у трека с несколькими артистами открывается первый, для выбора нужен popover
-                    let Some(a) = track.artists.first() else { return };
+                    let Some(a) = track.artists.first() else {
+                        return;
+                    };
                     vs.set_visible_child_name("search");
                     show_artist(a.id.clone());
                 } else {
@@ -761,7 +836,9 @@ impl VolnaWindow {
             );
             let close = close_karaoke.clone();
             click.connect_released(move |_, _, _, _| {
-                let Some(target) = target.borrow().clone() else { return };
+                let Some(target) = target.borrow().clone() else {
+                    return;
+                };
                 let f = close.borrow().clone();
                 if let Some(f) = f {
                     f();
@@ -794,15 +871,23 @@ impl VolnaWindow {
         // Клик по обложке в плеере открывает альбом текущего трека
         {
             let click = gtk4::GestureClick::new();
-            let (p, vs, show_album) = (player.clone(), view_stack.clone(), search_view.show_album.clone());
+            let (p, vs, show_album) = (
+                player.clone(),
+                view_stack.clone(),
+                search_view.show_album.clone(),
+            );
             let close = close_karaoke.clone();
             click.connect_released(move |_, _, _, _| {
-                let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
+                let Some(track) = p.state.lock().unwrap().current_track.clone() else {
+                    return;
+                };
                 let f = close.borrow().clone();
                 if let Some(f) = f {
                     f();
                 }
-                let Some(mut album) = track.albums.first().cloned() else { return };
+                let Some(mut album) = track.albums.first().cloned() else {
+                    return;
+                };
                 if album.artists.is_empty() {
                     album.artists = track.artists.clone();
                 }
@@ -839,11 +924,13 @@ impl VolnaWindow {
         // первая и последняя) могла встать строго по центру; размер окна меняется — поля пересчитываются
         {
             let (container, scrolled) = (lyrics_container.clone(), lyrics_scrolled.downgrade());
-            lyrics_scrolled.vadjustment().connect_page_size_notify(move |_| {
-                if let Some(scrolled) = scrolled.upgrade() {
-                    apply_lyrics_margins(&container, &scrolled);
-                }
-            });
+            lyrics_scrolled
+                .vadjustment()
+                .connect_page_size_notify(move |_| {
+                    if let Some(scrolled) = scrolled.upgrade() {
+                        apply_lyrics_margins(&container, &scrolled);
+                    }
+                });
         }
         karaoke_overlay.set_child(Some(&lyrics_scrolled));
 
@@ -941,7 +1028,8 @@ impl VolnaWindow {
                     t_content.set_opacity(1.0 - v);
                     t_pill.set_opacity(1.0 - v);
                 });
-                let animation = libadwaita::TimedAnimation::new(&sheet, sheet.opacity(), to, 350, target);
+                let animation =
+                    libadwaita::TimedAnimation::new(&sheet, sheet.opacity(), to, 350, target);
                 if !open {
                     let (sheet_done, want) = (sheet.clone(), want_open.clone());
                     animation.connect_done(move |_| {
@@ -970,7 +1058,9 @@ impl VolnaWindow {
         {
             // кнопка «Т» работает как переключатель: повторное нажатие закрывает текст
             let (set, sheet) = (set_karaoke.clone(), karaoke_overlay.clone());
-            island.karaoke_btn.connect_clicked(move |_| set(!(sheet.is_visible() && sheet.opacity() > 0.5)));
+            island
+                .karaoke_btn
+                .connect_clicked(move |_| set(!(sheet.is_visible() && sheet.opacity() > 0.5)));
         }
         {
             let set = set_karaoke.clone();
@@ -983,7 +1073,9 @@ impl VolnaWindow {
         // демо для скриншотов: сразу открыть текст песни
         if std::env::var_os("VOLNA_DEMO_LYRICS").is_some() {
             let btn = island.karaoke_btn.clone();
-            gtk4::glib::timeout_add_local_once(Duration::from_millis(1500), move || btn.emit_clicked());
+            gtk4::glib::timeout_add_local_once(Duration::from_millis(1500), move || {
+                btn.emit_clicked()
+            });
         }
 
         // Клик по кнопке авторизации (сайдбар и верхний header_bar)
@@ -1006,27 +1098,89 @@ impl VolnaWindow {
                             );
                             alert.add_response("cancel", "Отмена");
                             alert.add_response("logout", "Выйти из Google");
-                            alert.set_response_appearance("logout", libadwaita::ResponseAppearance::Destructive);
+                            alert.set_response_appearance(
+                                "logout",
+                                libadwaita::ResponseAppearance::Destructive,
+                            );
 
                             let p_inner = p_clone.clone();
-                            alert.choose(Some(&w), None::<&gtk4::gio::Cancellable>, move |response| {
-                                if response == "logout" {
-                                    let _ = crate::api::auth::clear_ytmusic_refresh_token();
-                                    let _ = crate::api::auth::clear_ytmusic_cookie();
-                                    let guest = std::sync::Arc::new(crate::api::ytmusic::YtMusicClient::new())
-                                        as std::sync::Arc<dyn crate::api::provider::MusicProvider>;
-                                    p_inner.providers.register(guest);
-                                    p_inner.emit(crate::player::PlayerUiEvent::StatusMessage(
-                                        "Вы вышли из аккаунта Google (YouTube Music)".to_string(),
-                                    ));
-                                    if p_inner.providers.active_id() == ProviderId::YouTubeMusic {
-                                        p_inner.emit(crate::player::PlayerUiEvent::ProviderChanged(ProviderId::YouTubeMusic));
+                            alert.choose(
+                                Some(&w),
+                                None::<&gtk4::gio::Cancellable>,
+                                move |response| {
+                                    if response == "logout" {
+                                        let _ = crate::api::auth::clear_ytmusic_refresh_token();
+                                        let _ = crate::api::auth::clear_ytmusic_cookie();
+                                        let guest = std::sync::Arc::new(
+                                            crate::api::ytmusic::YtMusicClient::new(),
+                                        )
+                                            as std::sync::Arc<
+                                                dyn crate::api::provider::MusicProvider,
+                                            >;
+                                        p_inner.providers.register(guest);
+                                        p_inner.emit(crate::player::PlayerUiEvent::StatusMessage(
+                                            "Вы вышли из аккаунта Google (YouTube Music)"
+                                                .to_string(),
+                                        ));
+                                        if p_inner.providers.active_id() == ProviderId::YouTubeMusic
+                                        {
+                                            p_inner.emit(
+                                                crate::player::PlayerUiEvent::ProviderChanged(
+                                                    ProviderId::YouTubeMusic,
+                                                ),
+                                            );
+                                        }
                                     }
-                                }
-                            });
+                                },
+                            );
                         } else {
                             let p_inner = p_clone.clone();
                             show_ytmusic_auth_dialog(&w, &p_inner, move || {});
+                        }
+                    } else if active_id == ProviderId::Vk {
+                        let is_auth = p_clone
+                            .providers
+                            .get(ProviderId::Vk)
+                            .is_some_and(|provider| provider.is_authenticated());
+                        if is_auth {
+                            let alert = libadwaita::AlertDialog::new(
+                                Some("ВКонтакте"),
+                                Some("Вы авторизованы в VK Музыке."),
+                            );
+                            alert.add_response("cancel", "Отмена");
+                            alert.add_response("logout", "Выйти из ВКонтакте");
+                            alert.set_response_appearance(
+                                "logout",
+                                libadwaita::ResponseAppearance::Destructive,
+                            );
+                            let p = p_clone.clone();
+                            alert.choose(
+                                Some(&w),
+                                None::<&gtk4::gio::Cancellable>,
+                                move |response| {
+                                    if response == "logout" {
+                                        let token_result = crate::api::vk::auth::clear_vk_token();
+                                        let user_result = crate::api::auth::clear_vk_user_id();
+                                        p.switch_provider(ProviderId::Yandex);
+                                        p.providers.unregister(ProviderId::Vk);
+                                        let clear_error = token_result
+                                            .err()
+                                            .map(|error| error.to_string())
+                                            .or_else(|| user_result.err().map(|error| error.to_string()));
+                                        if let Some(error) = clear_error {
+                                            p.emit(crate::player::PlayerUiEvent::Error(format!(
+                                                "VK отключён, но не все локальные данные удалены: {error}"
+                                            )));
+                                        } else {
+                                            p.emit(crate::player::PlayerUiEvent::StatusMessage(
+                                                "Вы вышли из аккаунта ВКонтакте".to_string(),
+                                            ));
+                                        }
+                                    }
+                                },
+                            );
+                        } else {
+                            show_vk_auth_dialog(&w, &p_clone);
                         }
                     } else {
                         let is_logged_in = p_clone.client.lock().map_or(false, |c| c.has_token());
@@ -1038,14 +1192,21 @@ impl VolnaWindow {
                             );
                             alert.add_response("cancel", "Отмена");
                             alert.add_response("logout", "Выйти из аккаунта");
-                            alert.set_response_appearance("logout", libadwaita::ResponseAppearance::Destructive);
+                            alert.set_response_appearance(
+                                "logout",
+                                libadwaita::ResponseAppearance::Destructive,
+                            );
 
                             let p_inner = p_clone.clone();
-                            alert.choose(Some(&w), None::<&gtk4::gio::Cancellable>, move |response| {
-                                if response == "logout" {
-                                    p_inner.logout();
-                                }
-                            });
+                            alert.choose(
+                                Some(&w),
+                                None::<&gtk4::gio::Cancellable>,
+                                move |response| {
+                                    if response == "logout" {
+                                        p_inner.logout();
+                                    }
+                                },
+                            );
                         } else {
                             show_auth_dialog(&w, &p_clone);
                         }
@@ -1135,16 +1296,27 @@ impl VolnaWindow {
                     if profile && sc.is_mapped() {
                         let mut st = stats.borrow_mut();
                         st.0 += 1;
-                        if dt > 0.025 { st.1 += 1; }
+                        if dt > 0.025 {
+                            st.1 += 1;
+                        }
                         st.2 = st.2.max(dt);
                         if st.0 >= 120 {
-                            eprintln!("[lyrics] fps≈{:.0}, пропусков >25мс: {}, худший кадр {:.0} мс", clock.fps(), st.1, st.2 * 1000.0);
+                            eprintln!(
+                                "[lyrics] fps≈{:.0}, пропусков >25мс: {}, худший кадр {:.0} мс",
+                                clock.fps(),
+                                st.1,
+                                st.2 * 1000.0
+                            );
                             *st = (0, 0, 0.0);
                         }
                     }
 
                     let synced = container.has_css_class("synced");
-                    let policy = if synced { PolicyType::External } else { PolicyType::Automatic };
+                    let policy = if synced {
+                        PolicyType::External
+                    } else {
+                        PolicyType::Automatic
+                    };
                     if sc.vscrollbar_policy() != policy {
                         sc.set_policy(PolicyType::Never, policy);
                     }
@@ -1156,9 +1328,10 @@ impl VolnaWindow {
                     let vadj = sc.vadjustment();
 
                     // Активная строка: положение относительно container
-                    let bounds = active.borrow().as_ref().and_then(|l| {
-                        l.compute_bounds(&container)
-                    });
+                    let bounds = active
+                        .borrow()
+                        .as_ref()
+                        .and_then(|l| l.compute_bounds(&container));
 
                     if bounds.is_none() {
                         if vadj.value() != 0.0 {
@@ -1171,7 +1344,9 @@ impl VolnaWindow {
                     if let (true, Some(b)) = (sc.is_mapped(), bounds) {
                         let top_margin = f64::from(container.margin_top());
                         let max = (vadj.upper() - vadj.page_size()).max(0.0);
-                        let goal = (top_margin + f64::from(b.y() + b.height() / 2.0) - vadj.page_size() / 2.0).clamp(0.0, max);
+                        let goal = (top_margin + f64::from(b.y() + b.height() / 2.0)
+                            - vadj.page_size() / 2.0)
+                            .clamp(0.0, max);
                         let mut cur = vadj.value();
                         let mut vel = velocity.get();
 
@@ -1229,9 +1404,9 @@ impl VolnaWindow {
                         // Страховка: если последняя строка размечена заметно дальше конца трека,
                         // это текст другой песни — караоке по нему не ведём
                         let stale_timeline = player_clone.duration_seconds().is_some_and(|d| {
-                            lines
-                                .last()
-                                .is_some_and(|l| crate::api::lrclib::timeline_too_long(l.time_ms, d))
+                            lines.last().is_some_and(|l| {
+                                crate::api::lrclib::timeline_too_long(l.time_ms, d)
+                            })
                         });
                         if stale_timeline && !stale_logged.replace(true) {
                             eprintln!(
@@ -1241,7 +1416,8 @@ impl VolnaWindow {
                         }
                         if !lines.is_empty() && lines.len() == labels.len() && !stale_timeline {
                             // Проверяем обратный отсчет ИСКЛЮЧИТЕЛЬНО перед первой строкой в начале песни
-                            let next_line_info = match lines.iter().position(|l| l.time_ms > pos_ms) {
+                            let next_line_info = match lines.iter().position(|l| l.time_ms > pos_ms)
+                            {
                                 Some(0) => Some(lines[0].time_ms),
                                 _ => None,
                             };
@@ -1286,7 +1462,11 @@ impl VolnaWindow {
                             let active_idx = lines.iter().rposition(|l| l.time_ms <= pos_ms);
                             if let Some(idx) = active_idx {
                                 // CSS и цель прокрутки меняем только при смене строки, а не каждые 50 мс
-                                if last_active.get() != idx || labels.get(idx).map_or(false, |l| !l.has_css_class("active")) {
+                                if last_active.get() != idx
+                                    || labels
+                                        .get(idx)
+                                        .map_or(false, |l| !l.has_css_class("active"))
+                                {
                                     last_active.set(idx);
                                     for (i, lbl) in labels.iter().enumerate() {
                                         if i == idx {
@@ -1417,37 +1597,25 @@ fn get_accent_palette(accent: &str) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
             [0.03, 0.22, 0.08],
             [0.35, 0.95, 0.55],
         )),
-        "ruby" => Some((
-            [0.882, 0.114, 0.282],
-            [0.26, 0.03, 0.08],
-            [1.0, 0.40, 0.55],
-        )),
-        "sunset" => Some((
-            [0.95, 0.42, 0.02],
-            [0.36, 0.10, 0.00],
-            [1.0, 0.84, 0.42],
-        )),
-        "violet" => Some((
-            [0.659, 0.333, 0.969],
-            [0.20, 0.08, 0.32],
-            [0.85, 0.60, 1.0],
-        )),
-        "ocean" => Some((
-            [0.231, 0.510, 0.965],
-            [0.05, 0.15, 0.32],
-            [0.55, 0.78, 1.0],
-        )),
-        "monochrome" => Some((
-            [0.90, 0.90, 0.90],
-            [0.18, 0.18, 0.18],
-            [1.0, 1.0, 1.0],
-        )),
+        "ruby" => Some(([0.882, 0.114, 0.282], [0.26, 0.03, 0.08], [1.0, 0.40, 0.55])),
+        "sunset" => Some(([0.95, 0.42, 0.02], [0.36, 0.10, 0.00], [1.0, 0.84, 0.42])),
+        "violet" => Some(([0.659, 0.333, 0.969], [0.20, 0.08, 0.32], [0.85, 0.60, 1.0])),
+        "ocean" => Some(([0.231, 0.510, 0.965], [0.05, 0.15, 0.32], [0.55, 0.78, 1.0])),
+        "monochrome" => Some(([0.90, 0.90, 0.90], [0.18, 0.18, 0.18], [1.0, 1.0, 1.0])),
         _ => None,
     }
 }
 
 fn apply_accent_classes(widget: &impl IsA<gtk4::Widget>, accent: &str) {
-    for a in &["accent-dynamic", "accent-spotify", "accent-ruby", "accent-sunset", "accent-violet", "accent-ocean", "accent-monochrome"] {
+    for a in &[
+        "accent-dynamic",
+        "accent-spotify",
+        "accent-ruby",
+        "accent-sunset",
+        "accent-violet",
+        "accent-ocean",
+        "accent-monochrome",
+    ] {
         widget.remove_css_class(a);
     }
     widget.add_css_class(&format!("accent-{}", accent));
@@ -1542,7 +1710,14 @@ fn create_sidebar_nav_btn(icon_name: &str, label_text: &str, is_collapsed: bool)
 
     btn.set_child(Some(&overlay));
 
-    SidebarNavItem { btn, overlay, icon_box, icon, label, label_box }
+    SidebarNavItem {
+        btn,
+        overlay,
+        icon_box,
+        icon,
+        label,
+        label_box,
+    }
 }
 
 fn update_auth_ui(
@@ -1565,9 +1740,8 @@ fn update_auth_ui(
             let is_auth = if !prov_is_auth {
                 if let Some(cookie) = config_cookie {
                     let yt_client = crate::api::ytmusic::YtMusicClient::with_cookie(cookie);
-                    player.providers.register(
-                        std::sync::Arc::new(yt_client) as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
-                    );
+                    player.providers.register(std::sync::Arc::new(yt_client)
+                        as std::sync::Arc<dyn crate::api::provider::MusicProvider>);
                     true
                 } else {
                     false
@@ -1602,7 +1776,44 @@ fn update_auth_ui(
                 header_auth_btn.add_css_class("suggested-action");
             }
         }
-        _ => {
+        ProviderId::Vk => {
+            let is_auth = player
+                .providers
+                .get(ProviderId::Vk)
+                .is_some_and(|provider| provider.is_authenticated());
+            auth_icon.set_text("🔵");
+            auth_name_label.set_text(if is_auth {
+                "ВКонтакте"
+            } else {
+                "Войти во ВКонтакте"
+            });
+            header_auth_btn.set_label(if is_auth {
+                "🔵 ВКонтакте"
+            } else {
+                "🔵 Войти во ВКонтакте"
+            });
+            auth_btn.set_tooltip_text(Some(if is_auth {
+                "VK Музыка подключена"
+            } else {
+                "Войти во ВКонтакте"
+            }));
+            header_auth_btn.set_tooltip_text(Some("VK Музыка"));
+            auth_btn.remove_css_class(if is_auth {
+                "login-required"
+            } else {
+                "logged-in"
+            });
+            auth_btn.add_css_class(if is_auth {
+                "logged-in"
+            } else {
+                "login-required"
+            });
+            header_auth_btn.remove_css_class("flat");
+            header_auth_btn.remove_css_class("login-required");
+            header_auth_btn.remove_css_class("suggested-action");
+            header_auth_btn.add_css_class("logged-in");
+        }
+        ProviderId::Yandex => {
             let is_auth = player.client.lock().map_or(false, |c| c.has_token());
             auth_icon.set_text("🌊");
             if is_auth {
@@ -1697,7 +1908,12 @@ fn setup_event_listener(
                     // клип прошлого трека гаснет; клип нового придёт отдельным событием, если он есть и включён
                     wave_view.clip.stop();
                     let artists = track.artists_string();
-                    let album = track.albums.first().and_then(|a| a.title.as_ref()).map(|s| s.as_str()).unwrap_or("");
+                    let album = track
+                        .albums
+                        .first()
+                        .and_then(|a| a.title.as_ref())
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     let subtitle = if album.is_empty() {
                         artists.clone()
                     } else {
@@ -1712,9 +1928,17 @@ fn setup_event_listener(
                     if accent == "dynamic" {
                         wave_view.update_track_colors(&track);
                         let c = track.core_rgb();
-                        update_dynamic_accent_css(&dynamic_provider, c[0] as f64, c[1] as f64, c[2] as f64);
+                        update_dynamic_accent_css(
+                            &dynamic_provider,
+                            c[0] as f64,
+                            c[1] as f64,
+                            c[2] as f64,
+                        );
                     } else if let Some((core, deep, ridge)) = get_accent_palette(&accent) {
-                        wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
+                        wave_view
+                            .shader_state
+                            .borrow_mut()
+                            .set_target_colors(core, deep, ridge);
                     }
 
                     island.title_label.set_markup(&track.title_markup());
@@ -1744,7 +1968,9 @@ fn setup_event_listener(
 
                     if let Some(dur_ms) = track.duration_ms {
                         let total_secs = dur_ms / 1000;
-                        island.total_time_label.set_text(&format_seconds(total_secs));
+                        island
+                            .total_time_label
+                            .set_text(&format_seconds(total_secs));
                         island.seek_scale.set_range(0.0, total_secs as f64);
                     }
 
@@ -1762,8 +1988,13 @@ fn setup_event_listener(
                     island.play_btn_icon.set_icon_name(Some(icon_name));
                     wave_view.drawing_area.queue_draw();
                 }
-                PlayerUiEvent::Progress { current_sec, total_sec } => {
-                    island.curr_time_label.set_text(&format_seconds(current_sec));
+                PlayerUiEvent::Progress {
+                    current_sec,
+                    total_sec,
+                } => {
+                    island
+                        .curr_time_label
+                        .set_text(&format_seconds(current_sec));
                     island.total_time_label.set_text(&format_seconds(total_sec));
                     island.seek_scale.set_value(current_sec as f64);
                 }
@@ -1790,7 +2021,9 @@ fn setup_event_listener(
                     wave_view.set_source(source.as_ref().map(|s| s.label.as_str()));
                     *wave_view.source_target.borrow_mut() = source.and_then(|s| s.target);
                 }
-                PlayerUiEvent::StationTarget(target) => *wave_view.source_target.borrow_mut() = target,
+                PlayerUiEvent::StationTarget(target) => {
+                    *wave_view.source_target.borrow_mut() = target
+                }
                 PlayerUiEvent::WaveChips(chips) => wave_view.set_chips(&chips),
                 PlayerUiEvent::RepeatChanged(mode) => {
                     let tip = match mode {
@@ -1806,18 +2039,18 @@ fn setup_event_listener(
                         island.repeat_btn.add_css_class("active");
                     }
                 }
-                PlayerUiEvent::CastChanged(name) => {
-                    match &name {
-                        Some(n) => {
-                            island.cast_btn.add_css_class("cast-active");
-                            island.cast_btn.set_tooltip_text(Some(&format!("Играет на «{}»", n)));
-                        }
-                        None => {
-                            island.cast_btn.remove_css_class("cast-active");
-                            island.cast_btn.set_tooltip_text(Some("Яндекс Станция"));
-                        }
+                PlayerUiEvent::CastChanged(name) => match &name {
+                    Some(n) => {
+                        island.cast_btn.add_css_class("cast-active");
+                        island
+                            .cast_btn
+                            .set_tooltip_text(Some(&format!("Играет на «{}»", n)));
                     }
-                }
+                    None => {
+                        island.cast_btn.remove_css_class("cast-active");
+                        island.cast_btn.set_tooltip_text(Some("Яндекс Станция"));
+                    }
+                },
                 PlayerUiEvent::StreamQuality(label) => {
                     island.quality_badge.set_text(&label);
                 }
@@ -1905,12 +2138,14 @@ fn setup_event_listener(
                             empty_box.set_halign(Align::Center);
                             empty_box.set_margin_top(60);
 
-                            let empty_icon = gtk4::Image::from_icon_name("audio-x-generic-symbolic");
+                            let empty_icon =
+                                gtk4::Image::from_icon_name("audio-x-generic-symbolic");
                             empty_icon.set_pixel_size(48);
                             empty_icon.add_css_class("dim-label");
                             empty_box.append(&empty_icon);
 
-                            let empty_label = Label::new(Some("У этого трека текст песни пока не добавлен"));
+                            let empty_label =
+                                Label::new(Some("У этого трека текст песни пока не добавлен"));
                             empty_label.add_css_class("heading");
                             empty_label.add_css_class("dim-label");
                             empty_box.append(&empty_label);
@@ -1961,7 +2196,9 @@ fn setup_event_listener(
                     wave_view.title_label.set_text("Волна");
                     wave_view.explicit_badge.set_visible(false);
                     island.explicit_badge.set_visible(false);
-                    wave_view.artist_label.set_text("Войдите в Яндекс ID для запуска потока");
+                    wave_view
+                        .artist_label
+                        .set_text("Войдите в Яндекс ID для запуска потока");
                     island.title_label.set_text("Волна");
                     island.artist_label.set_text("Яндекс Музыка");
                     island.cover_image.clear(); // пустая картинка = CSS-заглушка обложки
@@ -1976,6 +2213,12 @@ fn setup_event_listener(
                     let toast = Toast::new(&format!("Ошибка: {}", err));
                     toast.set_use_markup(false);
                     toast_overlay.add_toast(toast);
+                }
+                PlayerUiEvent::VkAuthRequired => {
+                    show_vk_auth_dialog(&window, &player);
+                }
+                PlayerUiEvent::VkCaptchaRequired { image_url, respond } => {
+                    show_vk_api_captcha_dialog(&window, image_url, respond);
                 }
                 PlayerUiEvent::CrossfadeChanged { .. } => {}
                 PlayerUiEvent::NavLayoutChanged(style) => {
@@ -2006,18 +2249,29 @@ fn setup_event_listener(
                     }
                     if let Some((core, deep, ridge)) = get_accent_palette(&accent) {
                         dynamic_provider.load_from_string("");
-                        wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
+                        wave_view
+                            .shader_state
+                            .borrow_mut()
+                            .set_target_colors(core, deep, ridge);
                     } else {
                         let t = player.state.lock().unwrap().current_track.clone();
                         if let Some(t) = t {
                             wave_view.update_track_colors(&t);
                             let c = t.core_rgb();
-                            update_dynamic_accent_css(&dynamic_provider, c[0] as f64, c[1] as f64, c[2] as f64);
+                            update_dynamic_accent_css(
+                                &dynamic_provider,
+                                c[0] as f64,
+                                c[1] as f64,
+                                c[2] as f64,
+                            );
                         } else {
                             let core = [0.95, 0.42, 0.02];
                             let deep = [0.36, 0.10, 0.00];
                             let ridge = [1.0, 0.84, 0.42];
-                            wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
+                            wave_view
+                                .shader_state
+                                .borrow_mut()
+                                .set_target_colors(core, deep, ridge);
                             update_dynamic_accent_css(&dynamic_provider, core[0], core[1], core[2]);
                         }
                     }
@@ -2028,7 +2282,11 @@ fn setup_event_listener(
                             source_icon.set_text("🔴");
                             source_label.set_text("YouTube Music");
                         }
-                        _ => {
+                        crate::api::provider::ProviderId::Vk => {
+                            source_icon.set_text("🔵");
+                            source_label.set_text("ВКонтакте");
+                        }
+                        crate::api::provider::ProviderId::Yandex => {
                             source_icon.set_text("🌊");
                             source_label.set_text("Яндекс");
                         }
