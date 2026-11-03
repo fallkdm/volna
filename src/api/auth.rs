@@ -1,7 +1,7 @@
-use std::fs::{create_dir_all, File};
+use serde::{Deserialize, Serialize};
+use std::fs::{File, create_dir_all};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 /// Публичный OAuth client_id приложения Яндекс Музыки; то же значение в открытом проекте
 /// MarshalX/yandex-music-token (MIT): web-app/src/api.ts и browser-extension/src/background.js.
@@ -64,9 +64,12 @@ pub struct AppConfig {
     /// Свернут ли левый сайдбар (компактный режим)
     #[serde(default)]
     pub sidebar_collapsed: bool,
-    /// Активный музыкальный провайдер ("yandex" или "ytmusic")
+    /// Активный музыкальный провайдер ("yandex", "ytmusic" или "vk")
     #[serde(default)]
     pub active_provider: Option<String>,
+    /// Числовой ID пользователя VK; токен хранится отдельно в keyring/секретном файле
+    #[serde(default)]
+    pub vk_user_id: Option<i64>,
     /// Google OAuth refresh token для YouTube Music
     #[serde(default)]
     pub ytmusic_refresh_token: Option<String>,
@@ -102,6 +105,7 @@ impl Default for AppConfig {
             theme_accent: None,
             sidebar_collapsed: false,
             active_provider: None,
+            vk_user_id: None,
             ytmusic_refresh_token: None,
             ytmusic_cookie: None,
             recent_played: Vec::new(),
@@ -146,7 +150,12 @@ pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error +
     let json = serde_json::to_string_pretty(config)?;
     // в файле токен аккаунта: читать его может только владелец (права ставим и на уже созданный файл)
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(json.as_bytes())?;
     Ok(())
@@ -154,32 +163,49 @@ pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error +
 
 /// Получает сохраненный токен или None
 pub fn load_token() -> Option<String> {
-    load_config().ok().and_then(|cfg| cfg.token).filter(|t| !t.trim().is_empty())
+    load_config()
+        .ok()
+        .and_then(|cfg| cfg.token)
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Ключ Last.fm или None, если не задан
 pub fn load_lastfm_key() -> Option<String> {
-    load_config().ok().and_then(|c| c.lastfm_key).filter(|t| !t.trim().is_empty())
+    load_config()
+        .ok()
+        .and_then(|c| c.lastfm_key)
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Сохраняет ключ Last.fm (пустая строка удаляет)
 pub fn save_lastfm_key(key: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     let key = key.trim();
-    config.lastfm_key = if key.is_empty() { None } else { Some(key.to_string()) };
+    config.lastfm_key = if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    };
     save_config(&config)
 }
 
 /// Токен Genius или None, если не задан
 pub fn load_genius_token() -> Option<String> {
-    load_config().ok().and_then(|c| c.genius_token).filter(|t| !t.trim().is_empty())
+    load_config()
+        .ok()
+        .and_then(|c| c.genius_token)
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Сохраняет токен Genius (пустая строка удаляет)
 pub fn save_genius_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     let token = token.trim();
-    config.genius_token = if token.is_empty() { None } else { Some(token.to_string()) };
+    config.genius_token = if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    };
     save_config(&config)
 }
 
@@ -206,7 +232,10 @@ pub fn load_clips() -> bool {
 /// Настройки Discord: (включено, Application ID)
 pub fn load_discord() -> (bool, Option<String>) {
     let c = load_config().unwrap_or_default();
-    (c.discord_rpc, c.discord_client_id.filter(|i| !i.trim().is_empty()))
+    (
+        c.discord_rpc,
+        c.discord_client_id.filter(|i| !i.trim().is_empty()),
+    )
 }
 
 pub fn save_discord_rpc(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -230,12 +259,19 @@ pub fn save_clips(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Syn
 /// Настройки плавного перехода между треками: (включен, длительность в секундах)
 pub fn load_crossfade() -> (bool, u32) {
     let c = load_config().unwrap_or_default();
-    let duration = if c.crossfade_duration == 0 { 3 } else { c.crossfade_duration };
+    let duration = if c.crossfade_duration == 0 {
+        3
+    } else {
+        c.crossfade_duration
+    };
     (c.crossfade, duration)
 }
 
 /// Сохраняет настройки плавного перехода между треками
-pub fn save_crossfade(enabled: bool, duration: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save_crossfade(
+    enabled: bool,
+    duration: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     config.crossfade = enabled;
     config.crossfade_duration = duration;
@@ -265,7 +301,6 @@ pub fn load_player_layout() -> String {
     }
 }
 
-/// Сохраняет стиль плеера
 pub fn save_player_layout(layout: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     config.player_layout = Some(layout.to_string());
@@ -275,7 +310,9 @@ pub fn save_player_layout(layout: &str) -> Result<(), Box<dyn std::error::Error 
 /// Выбранный акцент темы: `dynamic` (по умолчанию), `spotify`, `ruby`, `sunset`, `violet`, `ocean`, `monochrome`
 pub fn load_theme_accent() -> String {
     match load_config().ok().and_then(|c| c.theme_accent).as_deref() {
-        Some(a @ ("spotify" | "ruby" | "sunset" | "violet" | "ocean" | "monochrome")) => a.to_string(),
+        Some(a @ ("spotify" | "ruby" | "sunset" | "violet" | "ocean" | "monochrome")) => {
+            a.to_string()
+        }
         _ => "dynamic".to_string(),
     }
 }
@@ -293,7 +330,9 @@ pub fn load_sidebar_collapsed() -> bool {
 }
 
 /// Сохраняет состояние свернутости сайдбара
-pub fn save_sidebar_collapsed(collapsed: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save_sidebar_collapsed(
+    collapsed: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     config.sidebar_collapsed = collapsed;
     save_config(&config)
@@ -316,33 +355,67 @@ pub fn clear_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 /// Загружает сохраненного активного провайдера (по умолчанию ProviderId::Yandex)
 pub fn load_active_provider() -> crate::api::provider::ProviderId {
-    match load_config().ok().and_then(|c| c.active_provider).as_deref() {
+    match load_config()
+        .ok()
+        .and_then(|c| c.active_provider)
+        .as_deref()
+    {
         Some("ytmusic") => crate::api::provider::ProviderId::YouTubeMusic,
+        Some("vk") => crate::api::provider::ProviderId::Vk,
         _ => crate::api::provider::ProviderId::Yandex,
     }
 }
 
 /// Сохраняет активного провайдера в конфигурацию
-pub fn save_active_provider(provider: crate::api::provider::ProviderId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save_active_provider(
+    provider: crate::api::provider::ProviderId,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = load_config().unwrap_or_default();
     let val = match provider {
         crate::api::provider::ProviderId::YouTubeMusic => "ytmusic",
-        _ => "yandex",
+        crate::api::provider::ProviderId::Vk => "vk",
+        crate::api::provider::ProviderId::Yandex => "yandex",
     };
     config.active_provider = Some(val.to_string());
     save_config(&config)
 }
 
+/// Числовой ID нужен `audio.getPlaylists`; это не секрет и не заменяет токен.
+pub fn load_vk_user_id() -> Option<i64> {
+    load_config().ok().and_then(|config| config.vk_user_id)
+}
+
+pub fn save_vk_user_id(user_id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.vk_user_id = Some(user_id);
+    save_config(&config)
+}
+
+pub fn clear_vk_user_id() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.vk_user_id = None;
+    save_config(&config)
+}
+
 /// Загружает refresh-токен YouTube Music или None
 pub fn load_ytmusic_refresh_token() -> Option<String> {
-    load_config().ok().and_then(|c| c.ytmusic_refresh_token).filter(|t| !t.trim().is_empty())
+    load_config()
+        .ok()
+        .and_then(|c| c.ytmusic_refresh_token)
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Сохраняет refresh-токен YouTube Music
-pub fn save_ytmusic_refresh_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn save_ytmusic_refresh_token(
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let clean = token.trim();
     let mut config = load_config().unwrap_or_default();
-    config.ytmusic_refresh_token = if clean.is_empty() { None } else { Some(clean.to_string()) };
+    config.ytmusic_refresh_token = if clean.is_empty() {
+        None
+    } else {
+        Some(clean.to_string())
+    };
     save_config(&config)
 }
 
@@ -355,14 +428,21 @@ pub fn clear_ytmusic_refresh_token() -> Result<(), Box<dyn std::error::Error + S
 
 /// Загружает сохраненную куку YouTube Music или None
 pub fn load_ytmusic_cookie() -> Option<String> {
-    load_config().ok().and_then(|c| c.ytmusic_cookie).filter(|t| !t.trim().is_empty())
+    load_config()
+        .ok()
+        .and_then(|c| c.ytmusic_cookie)
+        .filter(|t| !t.trim().is_empty())
 }
 
 /// Сохраняет полную куку YouTube Music (включая LOGIN_INFO для привязки к аккаунту и каналу пользователя)
 pub fn save_ytmusic_cookie(cookie: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sanitized = crate::api::ytmusic::sanitize_cookie(cookie);
     let mut config = load_config().unwrap_or_default();
-    config.ytmusic_cookie = if sanitized.is_empty() { None } else { Some(sanitized) };
+    config.ytmusic_cookie = if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    };
     save_config(&config)
 }
 
@@ -404,7 +484,8 @@ pub struct DeviceCodeResponse {
 }
 
 /// Запрашивает device_code для авторизации по коду на ya.ru/device
-pub async fn request_device_code() -> Result<DeviceCodeResponse, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn request_device_code()
+-> Result<DeviceCodeResponse, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let resp = client
         .post("https://oauth.yandex.ru/device/code")
@@ -429,17 +510,16 @@ mod tests {
             "y0_AgAAAAABcDeF"
         );
         assert_eq!(
-            extract_token_from_input("https://music.yandex.ru/#access_token=y0_AgAAAA12345&token_type=bearer"),
+            extract_token_from_input(
+                "https://music.yandex.ru/#access_token=y0_AgAAAA12345&token_type=bearer"
+            ),
             "y0_AgAAAA12345"
         );
         assert_eq!(
             extract_token_from_input("access_token=y0_SecretToken&other=1"),
             "y0_SecretToken"
         );
-        assert_eq!(
-            extract_token_from_input("OAuth y0_MyToken"),
-            "y0_MyToken"
-        );
+        assert_eq!(extract_token_from_input("OAuth y0_MyToken"), "y0_MyToken");
     }
 
     #[test]

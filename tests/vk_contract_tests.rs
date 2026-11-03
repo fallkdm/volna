@@ -165,20 +165,23 @@ fn stream_mix_settings_expose_server_category_and_option_ids() {
         .iter()
         .find(|category| category.category_id == "mood")
         .expect("mood category must exist");
-    assert!(mood
-        .options
-        .iter()
-        .any(|option| option.option_id == "active"));
+    assert!(
+        mood.options
+            .iter()
+            .any(|option| option.option_id == "active")
+    );
 
     let language = response
         .categories
         .iter()
         .find(|category| category.category_id == "language")
         .expect("language category must exist");
-    assert!(language
-        .options
-        .iter()
-        .any(|option| option.option_id == "without-words"));
+    assert!(
+        language
+            .options
+            .iter()
+            .any(|option| option.option_id == "without-words")
+    );
 }
 
 #[test]

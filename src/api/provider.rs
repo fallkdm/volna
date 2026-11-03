@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::api::client::YandexMusicClient;
 use crate::api::models::{Album, Playlist, SearchResult, Track};
+use async_trait::async_trait;
 
 /// Идентификатор музыкального сервиса / провайдера
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,31 +68,65 @@ pub trait MusicProvider: Send + Sync {
     fn is_authenticated(&self) -> bool;
 
     /// Получение прямой ссылки на аудиопоток трека
-    async fn get_stream_url(&self, track_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_stream_url(
+        &self,
+        track_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Поиск треков, альбомов и плейлистов
-    async fn search(&self, query: &str) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>>;
+    async fn search(
+        &self,
+        query: &str,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Получение списка треков из медиатеки («Любимые»)
-    async fn get_liked_tracks(&self) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_liked_tracks(
+        &self,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Установка / снятие лайка у трека
-    async fn set_track_like(&self, track_id: &str, liked: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn set_track_like(
+        &self,
+        track_id: &str,
+        liked: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Установка дизлайка у трека
-    async fn set_track_dislike(&self, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn set_track_dislike(
+        &self,
+        track_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Получение любимых альбомов
-    async fn get_liked_albums(&self) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_liked_albums(
+        &self,
+    ) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Получение плейлистов пользователя
-    async fn get_playlists(&self) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_playlists(
+        &self,
+    ) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Получение треков плейлиста, если провайдер поддерживает эту операцию.
+    async fn get_playlist_tracks(
+        &self,
+        _playlist: &Playlist,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("Открытие плейлистов не поддерживается этим провайдером".into())
+    }
 
     /// Получение порции треков станции
-    async fn get_station_tracks(&self, station_id: &str, batch_id: Option<&str>) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>>;
+    async fn get_station_tracks(
+        &self,
+        station_id: &str,
+        batch_id: Option<&str>,
+    ) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Отправка фидбека станции (старт, завершение, скип)
-    async fn send_feedback(&self, event: FeedbackEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    async fn send_feedback(
+        &self,
+        event: FeedbackEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Получение текста песни трека (LRC / синхронизированного или обычного)
     async fn get_track_lyrics(&self, track: &Track) -> Option<String>;
@@ -117,7 +151,10 @@ impl MusicProvider for YandexMusicClient {
         self.has_token()
     }
 
-    async fn get_stream_url(&self, track_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_stream_url(
+        &self,
+        track_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let (url, _) = self
             .get_track_direct_url(track_id)
             .await
@@ -125,13 +162,18 @@ impl MusicProvider for YandexMusicClient {
         Ok(url)
     }
 
-    async fn search(&self, query: &str) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
+    async fn search(
+        &self,
+        query: &str,
+    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
         self.search(query)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn get_liked_tracks(&self) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_liked_tracks(
+        &self,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
         let uid = self
             .get_uid()
             .await
@@ -141,7 +183,11 @@ impl MusicProvider for YandexMusicClient {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn set_track_like(&self, track_id: &str, liked: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn set_track_like(
+        &self,
+        track_id: &str,
+        liked: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let uid = self
             .get_uid()
             .await
@@ -151,7 +197,10 @@ impl MusicProvider for YandexMusicClient {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn set_track_dislike(&self, track_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn set_track_dislike(
+        &self,
+        track_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let uid = self
             .get_uid()
             .await
@@ -161,7 +210,9 @@ impl MusicProvider for YandexMusicClient {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn get_liked_albums(&self) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_liked_albums(
+        &self,
+    ) -> Result<Vec<Album>, Box<dyn std::error::Error + Send + Sync>> {
         let uid = self
             .get_uid()
             .await
@@ -171,7 +222,9 @@ impl MusicProvider for YandexMusicClient {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn get_playlists(&self) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_playlists(
+        &self,
+    ) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>> {
         let uid = self
             .get_uid()
             .await
@@ -181,7 +234,11 @@ impl MusicProvider for YandexMusicClient {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
-    async fn get_station_tracks(&self, station_id: &str, _batch_id: Option<&str>) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_station_tracks(
+        &self,
+        station_id: &str,
+        _batch_id: Option<&str>,
+    ) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>> {
         let res = self
             .get_station_tracks(station_id)
             .await
@@ -194,23 +251,37 @@ impl MusicProvider for YandexMusicClient {
         })
     }
 
-    async fn send_feedback(&self, event: FeedbackEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn send_feedback(
+        &self,
+        event: FeedbackEvent,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match event {
-            FeedbackEvent::TrackStarted { track_id, station_id, batch_id } => {
-                self.feedback_track_started(&station_id, &track_id, batch_id)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            }
-            FeedbackEvent::TrackFinished { track_id, station_id, duration_secs, batch_id } => {
-                self.feedback_track_finished(&station_id, &track_id, duration_secs as f64, batch_id)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            }
-            FeedbackEvent::Skip { track_id, station_id, position_secs, batch_id } => {
-                self.feedback_skip(&station_id, &track_id, position_secs as f64, batch_id)
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            }
+            FeedbackEvent::TrackStarted {
+                track_id,
+                station_id,
+                batch_id,
+            } => self
+                .feedback_track_started(&station_id, &track_id, batch_id)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            FeedbackEvent::TrackFinished {
+                track_id,
+                station_id,
+                duration_secs,
+                batch_id,
+            } => self
+                .feedback_track_finished(&station_id, &track_id, duration_secs as f64, batch_id)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            FeedbackEvent::Skip {
+                track_id,
+                station_id,
+                position_secs,
+                batch_id,
+            } => self
+                .feedback_skip(&station_id, &track_id, position_secs as f64, batch_id)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
         }
     }
 
