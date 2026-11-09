@@ -1056,11 +1056,7 @@ impl DetailPage {
 
     /// Плашка количества слушателей на странице артиста
     pub fn set_listeners(&self, count: u64, metric: ListenersMetric) {
-        let label = match metric {
-            ListenersMetric::Monthly => format!("{} слушателей в месяц", group_digits(count)),
-            ListenersMetric::LastFm => format!("{} слушателей на Last.fm", group_digits(count)),
-        };
-        self.listeners_label.set_text(&label);
+        self.listeners_label.set_text(&format_listeners_label(count, metric));
         self.listeners.set_visible(true);
     }
 
