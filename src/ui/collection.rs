@@ -1539,11 +1539,16 @@ pub fn open_album(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, 
 
 /// Плитка альбома: клик открывает страницу альбома
 pub fn album_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, album: &Album, size: i32) -> Button {
-    let title = album.title.clone().unwrap_or_default();
+    let raw_title = album.title.as_deref().unwrap_or("").trim();
+    let title = if raw_title.is_empty() || raw_title.eq_ignore_ascii_case("unnamed") {
+        "Альбом"
+    } else {
+        raw_title
+    };
     let sub = album_subtitle(album);
     let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
     let al = album.clone();
-    tile(&title, &sub, album.cover_url(300), size, false, move || open_album(&p, &stack, &page, &al))
+    tile(title, &sub, album.cover_url(300), size, false, move || open_album(&p, &stack, &page, &al))
 }
 
 fn playlist_subtitle(pl: &Playlist) -> String {

@@ -73,12 +73,20 @@ fn history_row(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, item: &H
                 open_artist(&p, &stack, &page, a.clone(), source);
             }
         }),
-        HistoryItem::Album(a) => item_row(a.title.as_deref().unwrap_or(""), &a.artists_string(), a.cover_url(100), false, move || {
-            push_history_for(provider, it.clone());
-            if let HistoryItem::Album(a) = &it {
-                open_album(&p, &stack, &page, a);
-            }
-        }),
+        HistoryItem::Album(a) => {
+            let raw_title = a.title.as_deref().unwrap_or("").trim();
+            let title = if raw_title.is_empty() || raw_title.eq_ignore_ascii_case("unnamed") {
+                "Альбом"
+            } else {
+                raw_title
+            };
+            item_row(title, &a.artists_string(), a.cover_url(100), false, move || {
+                push_history_for(provider, it.clone());
+                if let HistoryItem::Album(a) = &it {
+                    open_album(&p, &stack, &page, a);
+                }
+            })
+        }
         HistoryItem::Playlist(pl) => item_row(&pl.title, "Плейлист", pl.cover_url(100), false, move || {
             push_history_for(provider, it.clone());
             if let HistoryItem::Playlist(pl) = &it {

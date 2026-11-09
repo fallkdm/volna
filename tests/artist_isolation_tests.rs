@@ -328,3 +328,35 @@ fn test_vk_playlist_dto_parses_access_key() {
     assert_eq!(playlist_no_key.access_key, None);
 }
 
+#[test]
+fn test_filter_artist_items_replaces_unnamed_album_title() {
+    let items = vec![api::vk::models::VkAudioDto {
+        id: 1,
+        owner_id: 100,
+        artist: "Imagine Dragons".into(),
+        title: "Demons".into(),
+        subtitle: None,
+        duration: 180,
+        url: Some("https://example.com/audio1.mp3".into()),
+        audio_streams: None,
+        lyrics_id: None,
+        album: Some(api::vk::models::VkAlbumDto {
+            id: 10,
+            owner_id: Some(100),
+            title: "unnamed".into(),
+            thumb: None,
+        }),
+        main_artists: Some(vec![api::vk::models::VkArtistDto {
+            id: None,
+            name: "Imagine Dragons".into(),
+        }]),
+        is_explicit: None,
+    }];
+
+    let (_tracks, albums) = api::vk::provider::filter_artist_items("Imagine Dragons", 100, &items);
+
+    assert_eq!(albums.len(), 1);
+    assert_eq!(albums[0].title.as_deref(), Some("Demons"));
+}
+
+

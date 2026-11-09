@@ -299,7 +299,25 @@ impl MusicProvider for VkProvider {
                         let key = (alb.owner_id.unwrap_or(self.owner_id), alb.id);
                         let entry = albums_map
                             .entry(key)
-                            .or_insert_with(|| (alb.clone().into_album(), 0));
+                            .or_insert_with(|| {
+                                let mut album_obj = alb.clone().into_album();
+                                let is_unnamed = album_obj
+                                    .title
+                                    .as_deref()
+                                    .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
+                                if is_unnamed && !audio.title.trim().is_empty() {
+                                    album_obj.title = Some(audio.title.trim().to_string());
+                                }
+                                (album_obj, 0)
+                            });
+                        let is_unnamed = entry
+                            .0
+                            .title
+                            .as_deref()
+                            .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
+                        if is_unnamed && !audio.title.trim().is_empty() {
+                            entry.0.title = Some(audio.title.trim().to_string());
+                        }
                         entry.1 += 1;
                     }
                 }
@@ -743,6 +761,31 @@ impl MusicProvider for VkProvider {
 
         let (top_tracks, albums) = filter_artist_items(artist_name, self.owner_id, &raw_items);
 
+        let mut enriched_albums = Vec::new();
+        for mut album in albums {
+            let is_unnamed = album
+                .title
+                .as_deref()
+                .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
+            if is_unnamed {
+                let clean_id = album.id.strip_prefix("vk:").unwrap_or(&album.id);
+                if let Some((o_str, a_str)) = clean_id.split_once('_') {
+                    if let (Ok(o), Ok(a)) = (o_str.parse::<i64>(), a_str.parse::<i64>()) {
+                        if let Ok(pl) = self.client.get_playlist_by_id(o, a).await {
+                            let pl_title = pl.title.trim();
+                            if !pl_title.is_empty() && !pl_title.eq_ignore_ascii_case("unnamed") {
+                                album.title = Some(pl_title.to_string());
+                                if album.og_image.is_none() {
+                                    album.og_image = pl.photo.and_then(|p| p.best_url().map(str::to_owned));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            enriched_albums.push(album);
+        }
+
         let mut playlists = Vec::new();
         if let Ok(pl_res) = self.client.search_playlists(artist_name, 10).await {
             for pl in pl_res.items {
@@ -767,7 +810,7 @@ impl MusicProvider for VkProvider {
                 cover: None,
             },
             popular_tracks: top_tracks,
-            albums,
+            albums: enriched_albums,
             playlists,
             all_covers: Vec::new(),
             stats: None,
@@ -843,7 +886,25 @@ pub fn filter_artist_items(
             let key = (alb.owner_id.unwrap_or(fallback_owner), alb.id);
             let entry = albums_map
                 .entry(key)
-                .or_insert_with(|| (alb.clone().into_album(), 0));
+                .or_insert_with(|| {
+                    let mut album_obj = alb.clone().into_album();
+                    let is_unnamed = album_obj
+                        .title
+                        .as_deref()
+                        .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
+                    if is_unnamed && !item.title.trim().is_empty() {
+                        album_obj.title = Some(item.title.trim().to_string());
+                    }
+                    (album_obj, 0)
+                });
+            let is_unnamed = entry
+                .0
+                .title
+                .as_deref()
+                .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
+            if is_unnamed && !item.title.trim().is_empty() {
+                entry.0.title = Some(item.title.trim().to_string());
+            }
             entry.1 += 1;
         }
         if top_tracks.len() < 10 && item.is_playable() {
