@@ -5,12 +5,13 @@ use async_channel::Sender;
 use futures_util::stream::StreamExt;
 
 use crate::api::client::YandexMusicClient;
-use crate::api::models::{Album, Playlist, Track, TrackSource};
+use crate::api::models::{Track, TrackSource};
 use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId};
 use crate::api::provider_manager::ProviderManager;
 use crate::api::vk::provider::VkProvider;
 use crate::api::ytmusic::YtMusicClient;
 use super::audio::AudioBackend;
+use super::source::*;
 use super::wave_engine::WaveEngine;
 
 static AUDIO_DOWNLOAD_LOCKS: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
@@ -23,30 +24,6 @@ pub enum RepeatMode {
     Off,
     One,
     All,
-}
-
-/// Куда ведёт клик по плашке источника
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum SourceTarget {
-    Album(Album),
-    Playlist(Playlist),
-    Artist(String),
-    Track(Track),
-    /// Вкладка «Медиатека» («Мне нравится», «Загруженные»)
-    Library,
-}
-
-/// Откуда играет очередь: подпись на плашке и страница, куда ведёт клик по ней
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PlaySource {
-    pub label: String,
-    pub target: Option<SourceTarget>,
-}
-
-impl PlaySource {
-    pub fn new(label: impl Into<String>, target: Option<SourceTarget>) -> Self {
-        Self { label: label.into(), target }
-    }
 }
 
 /// Какой клип показывать: от этого зависят зацикливание, кроп и прозрачность слоя.
@@ -344,6 +321,7 @@ pub struct PlayerManager {
     tail_swap_epoch: Arc<AtomicU64>,
     /// Настройки плавного перехода: (включен, длительность в секундах)
     crossfade: Arc<Mutex<(bool, u32)>>,
+    pub artist_registry: Arc<std::sync::Mutex<std::collections::HashMap<(TrackSource, String), String>>>,
 }
 
 async fn resolve_stream_for_source(
@@ -487,6 +465,7 @@ impl PlayerManager {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade,
+            artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         // Подключаем автоматический переход к следующему треку по окончании воспроизведения
@@ -521,6 +500,28 @@ impl PlayerManager {
         manager.cast_autoconnect();
 
         Ok(manager)
+    }
+
+    pub fn register_artist(&self, source: TrackSource, id: &str, name: &str) {
+        if !name.trim().is_empty() {
+            let clean_id = id.trim();
+            if let Ok(mut reg) = self.artist_registry.lock() {
+                if !clean_id.is_empty() {
+                    reg.insert((source, clean_id.to_string()), name.trim().to_string());
+                }
+                // Также регистрируем по имени для быстрого поиска
+                reg.insert((source, name.trim().to_string()), name.trim().to_string());
+            }
+        }
+    }
+
+    pub fn get_registered_artist_name(&self, source: TrackSource, id: &str) -> Option<String> {
+        self.artist_registry.lock().ok()?.get(&(source, id.trim().to_string())).cloned()
+    }
+
+    pub fn lookup_registered_artist_by_id(&self, raw_id: &str) -> Option<(TrackSource, String)> {
+        let reg = self.artist_registry.lock().ok()?;
+        lookup_registered_artist_in_map(&reg, raw_id)
     }
 
     /// Режим `VOLNA_DEMO=1|2|3` для скриншотов README: вымышленный исполнитель, свои тексты,
@@ -1919,14 +1920,28 @@ impl PlayerManager {
     }
 
     /// Запускает «Волну по артисту»
-    pub fn play_artist_wave(&self, artist_id: &str, artist_name: &str) {
-        self.start_station(format!("artist:{}", artist_id), None, format!("По артисту: {}", artist_name));
+    pub fn play_artist_wave(&self, artist_id: &str, artist_name: &str, source: TrackSource) {
+        let clean_id = match source {
+            TrackSource::Yandex => artist_id.strip_prefix("ya:").unwrap_or(artist_id),
+            TrackSource::YouTubeMusic => artist_id.strip_prefix("yt:").unwrap_or(artist_id),
+            TrackSource::Vk => artist_id.strip_prefix("vk:").unwrap_or(artist_id),
+        };
+        self.start_station_for_source(format!("artist:{}", clean_id), None, format!("По артисту: {}", artist_name), source);
     }
 
     /// Запускает станцию Ротора (`track:ID`, `artist:ID`). Если задан `first`, он играет сразу,
     /// а треки станции дописываются в очередь следом.
     pub fn start_station(&self, station_id: String, first: Option<Track>, label: String) {
-        let provider = self.providers.current();
+        self.start_station_for_source(station_id, first, label, self.providers.current().provider_id().into());
+    }
+
+    /// Запускает станцию для указанного источника.
+    pub fn start_station_for_source(&self, station_id: String, first: Option<Track>, label: String, source: TrackSource) {
+        let provider_id: ProviderId = source.into();
+        let Some(provider) = self.providers.get(provider_id) else {
+            self.emit(PlayerUiEvent::StatusMessage(format!("Сервис {:?} не подключён", source)));
+            return;
+        };
         if provider.provider_id() == ProviderId::Vk {
             if !provider.is_authenticated() {
                 self.emit(PlayerUiEvent::VkAuthRequired);
@@ -1973,7 +1988,14 @@ impl PlayerManager {
         self.set_wave_label(Some(label.clone()));
         let target = match (&first, station_id.split_once(':')) {
             (Some(t), Some(("track", _))) => Some(SourceTarget::Track(t.clone())),
-            (_, Some(("artist", id))) => Some(SourceTarget::Artist(id.to_string())),
+            (_, Some(("artist", id))) => {
+                let prefixed = match source {
+                    TrackSource::Yandex => if id.starts_with("ya:") { id.to_string() } else { format!("ya:{}", id) },
+                    TrackSource::YouTubeMusic => if id.starts_with("yt:") { id.to_string() } else { format!("yt:{}", id) },
+                    TrackSource::Vk => if id.starts_with("vk:") { id.to_string() } else { format!("vk:{}", id) },
+                };
+                Some(SourceTarget::Artist(prefixed))
+            }
             _ => None,
         };
         self.emit(PlayerUiEvent::StationTarget(target));
@@ -1990,7 +2012,9 @@ impl PlayerManager {
 
         let me = self.clone();
         tokio::spawn(async move {
-            let provider = me.providers.current();
+            let Some(provider) = me.providers.get(provider_id) else {
+                return;
+            };
             let is_vk = provider.provider_id() == ProviderId::Vk;
             let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
 
@@ -4903,6 +4927,7 @@ mod like_tests {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
+            artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         manager.toggle_play();
@@ -4951,6 +4976,7 @@ mod like_tests {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
+            artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         manager.switch_provider(ProviderId::YouTubeMusic);
@@ -4964,6 +4990,54 @@ mod like_tests {
         assert_eq!(st.station_id, "user:onyourwave");
     }
 
+    #[test]
+    fn test_player_manager_lookup_registered_artist_by_id() {
+        let client = YandexMusicClient::new(None);
+        let audio = Arc::new(AudioBackend::new().unwrap());
+        let client_mutex = Arc::new(Mutex::new(client.clone()));
+        let state_arc = Arc::new(Mutex::new(PlayerState::default()));
+        let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = Arc::new(YtMusicClient::new()) as Arc<dyn MusicProvider>;
+        let provider_manager =
+            ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+
+        let manager = PlayerManager {
+            audio,
+            client: client_mutex,
+            providers: Arc::new(provider_manager),
+            yt_client: Arc::new(YtMusicClient::new()),
+            clips: crate::player::clip::ClipBackground::new(
+                Arc::new(YtMusicClient::new()),
+                Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            state: state_arc,
+            wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
+            event_senders: Arc::new(Mutex::new(Vec::new())),
+            cast: Arc::default(),
+            prefetch: Arc::default(),
+            prefetch_inflight: Arc::default(),
+            generation: Arc::new(AtomicU64::new(0)),
+            tail_swap_epoch: Arc::new(AtomicU64::new(0)),
+            crossfade: Arc::new(Mutex::new((false, 3))),
+            artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        // 1. Регистрация Yandex 123 -> находит
+        manager.register_artist(TrackSource::Yandex, "123", "Radiohead");
+        assert_eq!(
+            manager.lookup_registered_artist_by_id("123"),
+            Some((TrackSource::Yandex, "Radiohead".to_string()))
+        );
+
+        // 2. Коллизия Yandex 123 и VK 123 -> отказ (None)
+        manager.register_artist(TrackSource::Vk, "123", "Три дня дождя");
+        assert_eq!(manager.lookup_registered_artist_by_id("123"), None);
+
+        // 3. Неизвестный ID -> None
+        assert_eq!(manager.lookup_registered_artist_by_id("456"), None);
+        assert_eq!(manager.lookup_registered_artist_by_id(""), None);
+    }
 }
 
 #[cfg(test)]

@@ -213,6 +213,7 @@ pub fn parse_artist_browse(
         },
         albums,
         popular_tracks,
+        playlists: Vec::new(),
         stats: None,
         all_covers,
         background_video_url: None,

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use md5::{Digest, Md5};
 
 pub mod cover_resolver;
+pub mod lastfm;
 pub mod youtube_clips;
 pub use cover_resolver::{resolve_artist_avatar, resolve_studio_cover};
 pub use youtube_clips::*;

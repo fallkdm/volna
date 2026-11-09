@@ -6,6 +6,9 @@
 /agent_chat.md
 /AGENT_CHAT_TASK.md
 /.agent_chat_watch.offset
+/.agent_chat_antigravity_watch.offset
 /watch_agent_chat.sh
+/watch_deepseek_chat.sh
 /scripts/
 /.gitattributes
+

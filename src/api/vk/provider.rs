@@ -569,6 +569,77 @@ impl MusicProvider for VkProvider {
         )
         .await
     }
+
+    async fn get_artist_brief(
+        &self,
+        artist: &crate::api::models::Artist,
+    ) -> Result<crate::api::models::ArtistBrief, Box<dyn std::error::Error + Send + Sync>> {
+        let artist_name = artist.name.trim();
+        let tracks_res = self.client.search_audio(artist_name, 0, 40).await.ok();
+        let raw_items = tracks_res.map(|r| r.items).unwrap_or_default();
+
+        let (top_tracks, albums) = filter_artist_items(artist_name, self.owner_id, &raw_items);
+
+        let mut playlists = Vec::new();
+        if let Ok(pl_res) = self.client.search_playlists(artist_name, 10).await {
+            for pl in pl_res.items {
+                if pl.title.to_lowercase().contains(&artist_name.to_lowercase()) {
+                    playlists.push(into_playlist(pl));
+                }
+            }
+        }
+
+        let real_id = if artist.id.starts_with("vk:") {
+            artist.id.clone()
+        } else if !artist_name.is_empty() {
+            format!("vk:name:{}", glib::Uri::escape_string(artist_name, None, true))
+        } else {
+            artist.id.clone()
+        };
+
+        Ok(crate::api::models::ArtistBrief {
+            artist: crate::api::models::Artist {
+                id: real_id,
+                name: artist_name.to_string(),
+                cover: None,
+            },
+            popular_tracks: top_tracks,
+            albums,
+            playlists,
+            all_covers: Vec::new(),
+            stats: None,
+            background_video_url: None,
+        })
+    }
+}
+
+pub fn filter_artist_items(
+    artist_name: &str,
+    fallback_owner: i64,
+    items: &[VkAudioDto],
+) -> (Vec<Track>, Vec<Album>) {
+    let mut top_tracks = Vec::new();
+    let mut albums_map = std::collections::HashMap::new();
+
+    for item in items {
+        let matches = item.main_artists.as_ref().map_or(false, |artists| {
+            artists.iter().any(|a| a.name.eq_ignore_ascii_case(artist_name))
+        }) || item.artist.eq_ignore_ascii_case(artist_name)
+           || item.artist.to_lowercase().contains(&artist_name.to_lowercase());
+        if !matches {
+            continue;
+        }
+        if let Some(alb) = &item.album {
+            let key = (alb.owner_id.unwrap_or(fallback_owner), alb.id);
+            albums_map.entry(key).or_insert_with(|| alb.clone().into_album());
+        }
+        if top_tracks.len() < 10 && item.is_playable() {
+            top_tracks.push(item.clone().into_track());
+        }
+    }
+
+    let albums = albums_map.into_values().collect();
+    (top_tracks, albums)
 }
 
 #[cfg(test)]

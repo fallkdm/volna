@@ -20,6 +20,16 @@ impl From<ProviderId> for crate::api::models::TrackSource {
     }
 }
 
+impl From<crate::api::models::TrackSource> for ProviderId {
+    fn from(source: crate::api::models::TrackSource) -> Self {
+        match source {
+            crate::api::models::TrackSource::Yandex => ProviderId::Yandex,
+            crate::api::models::TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+            crate::api::models::TrackSource::Vk => ProviderId::Vk,
+        }
+    }
+}
+
 /// Чип выдачи станции: подпись и вариант сида, который она открывает
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StationChip {
@@ -121,6 +131,14 @@ pub trait MusicProvider: Send + Sync {
     /// Официальное общее количество треков в медиатеке (если известно из метаданных сервиса)
     async fn get_liked_total_count(&self) -> Option<u32> {
         None
+    }
+
+    /// Получение краткой информации об артисте (популярные треки, альбомы, плейлисты)
+    async fn get_artist_brief(
+        &self,
+        _artist: &crate::api::models::Artist,
+    ) -> Result<crate::api::models::ArtistBrief, Box<dyn std::error::Error + Send + Sync>> {
+        Err("Просмотр артиста не поддерживается этим провайдером".into())
     }
 }
 
@@ -251,5 +269,14 @@ impl MusicProvider for YandexMusicClient {
             .await
             .ok()
             .flatten()
+    }
+
+    async fn get_artist_brief(
+        &self,
+        artist: &crate::api::models::Artist,
+    ) -> Result<crate::api::models::ArtistBrief, Box<dyn std::error::Error + Send + Sync>> {
+        let clean_id = artist.id.strip_prefix("ya:").unwrap_or(&artist.id);
+        let brief = self.get_artist_brief(clean_id).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        Ok(brief)
     }
 }

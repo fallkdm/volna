@@ -134,7 +134,7 @@ impl Playlist {
 }
 
 /// Источник трека (музыкальный сервис)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum TrackSource {
     #[default]
     Yandex,
@@ -496,6 +496,8 @@ pub struct ArtistBrief {
     pub albums: Vec<Album>,
     #[serde(default, rename = "popularTracks")]
     pub popular_tracks: Vec<Track>,
+    #[serde(default)]
+    pub playlists: Vec<Playlist>,
     #[serde(default)]
     pub stats: Option<ArtistStats>,
     /// Все фото артиста (список аватарок)

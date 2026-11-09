@@ -902,10 +902,28 @@ impl VolnaWindow {
                         vs.set_visible_child_name("search");
                         show_playlist(pl);
                     }
-                    Artist(id) => {
+                    Artist(raw_id) => {
                         vs.set_visible_child_name("search");
-                        let source = p.providers.active_id().into();
-                        show_artist(crate::api::models::Artist { id, ..Default::default() }, source);
+                        let resolved = crate::player::parse_artist_id(&raw_id, None)
+                            .map(|(clean_id, source)| {
+                                let name = p.get_registered_artist_name(source, &clean_id).unwrap_or_else(|| clean_id.clone());
+                                (clean_id, name, source)
+                            })
+                            .ok()
+                            .or_else(|| {
+                                // Резолв старых сессий (например, чистый числовой "123") через реестр
+                                p.lookup_registered_artist_by_id(&raw_id)
+                                    .map(|(source, name)| (raw_id.clone(), name, source))
+                            });
+
+                        match resolved {
+                            Some((clean_id, name, source)) => {
+                                show_artist(crate::api::models::Artist { id: clean_id, name, cover: None }, source);
+                            }
+                            None => {
+                                p.emit(PlayerUiEvent::Error("Не удалось открыть исполнителя: Источник артиста не определён".to_string()));
+                            }
+                        }
                     }
                     Track(t) => {
                         vs.set_visible_child_name("search");

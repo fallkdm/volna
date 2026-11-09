@@ -371,7 +371,7 @@ fn search_placeholder(id: ProviderId) -> &'static str {
                     tracks_list.append(&row);
                 }
                 for artist in &artists {
-                    let tile = artist_tile(&p, &stack, &page, artist, TILE_SIZE);
+                    let tile = artist_tile(&p, &stack, &page, artist, p.providers.active_id().into(), TILE_SIZE);
                     let (p2, a) = (p.clone(), artist.clone());
                     tile.connect_clicked(move |_| push_history_for(p2.providers.active_id(), HistoryItem::Artist(a.clone())));
                     artists_grid.append(&tile);

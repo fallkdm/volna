@@ -1,19 +1,12 @@
-pub mod api;
-pub mod cache;
-pub mod discord;
-pub mod ipc;
-pub mod mpris;
-pub mod player;
-pub mod station;
-pub mod ui;
-
 use libadwaita::prelude::*;
 use libadwaita::Application;
 
-use crate::api::auth::load_token;
-use crate::api::client::YandexMusicClient;
-use crate::player::PlayerManager;
-use crate::ui::VolnaWindow;
+#[allow(unused_imports)]
+use volna::{api, cache, cast, discord, ipc, mpris, player, station, ui, trim_allocator};
+use volna::api::auth::load_token;
+use volna::api::client::YandexMusicClient;
+use volna::player::PlayerManager;
+use volna::ui::VolnaWindow;
 
 const APP_ID: &str = "io.github.fallkdm.Volna";
 
@@ -42,20 +35,6 @@ fn tune_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
 
-/// Возвращает освободившуюся heap-память системе (glibc не делает это сам).
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-pub(crate) fn trim_allocator() {
-    unsafe extern "C" {
-        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
-    }
-    unsafe {
-        let _ = malloc_trim(0);
-    }
-}
-
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-pub(crate) fn trim_allocator() {}
-
 fn main() {
     tune_allocator();
 
@@ -69,7 +48,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "mcp" {
         // Запускаем MCP сервер без инициализации GTK!
-        rt.block_on(crate::ipc::mcp::run_mcp_server());
+        rt.block_on(volna::ipc::mcp::run_mcp_server());
         return;
     }
     if args.len() > 1 && args[1] == "cmd" {
@@ -135,7 +114,7 @@ fn main() {
         };
 
         rt.block_on(async {
-            match crate::ipc::send_cmd(&cmd_json).await {
+            match volna::ipc::send_cmd(&cmd_json).await {
                 Ok(resp) => {
                     println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_else(|_| resp.to_string()));
                 }
@@ -186,7 +165,7 @@ fn main() {
 
                 // Фоновый возврат освободившейся памяти ОС каждые 45 секунд
                 gtk4::glib::timeout_add_seconds_local(45, || {
-                    std::thread::spawn(|| crate::trim_allocator());
+                    std::thread::spawn(|| volna::trim_allocator());
                     glib::ControlFlow::Continue
                 });
             }

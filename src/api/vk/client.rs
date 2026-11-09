@@ -277,6 +277,19 @@ impl VkClient {
         .await
     }
 
+    pub async fn search_playlists(
+        &self,
+        query: &str,
+        count: u32,
+    ) -> Result<VkPlaylistListDto, VkError> {
+        let count_str = count.to_string();
+        self.call(
+            "audio.searchPlaylists",
+            &[("q", query), ("count", &count_str)],
+        )
+        .await
+    }
+
     pub async fn get_playlists(
         &self,
         owner_id: i64,
