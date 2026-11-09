@@ -338,7 +338,6 @@ impl VkClient {
             let offset_str = offset.to_string();
             let mut params = vec![
                 ("owner_id", owner_str.as_str()),
-                ("playlist_id", playlist_str.as_str()),
                 ("album_id", playlist_str.as_str()),
                 ("offset", offset_str.as_str()),
                 ("count", "100"),
