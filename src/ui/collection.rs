@@ -379,6 +379,25 @@ pub enum Wave {
     Track(Track),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenersMetric {
+    Monthly,
+    LastFm,
+}
+
+impl ListenersMetric {
+    pub fn format_label(&self, count: u64) -> String {
+        format_listeners_label(count, *self)
+    }
+}
+
+pub fn format_listeners_label(count: u64, metric: ListenersMetric) -> String {
+    match metric {
+        ListenersMetric::Monthly => format!("{} слушателей в месяц", group_digits(count)),
+        ListenersMetric::LastFm => format!("{} слушателей на Last.fm", group_digits(count)),
+    }
+}
+
 impl DetailPage {
     pub fn new(player: &PlayerManager, on_back: impl Fn() + 'static) -> Rc<Self> {
         let widget = GtkBox::new(Orientation::Vertical, 12);
@@ -1035,9 +1054,13 @@ impl DetailPage {
         }
     }
 
-    /// Плашка «N слушателей в месяц» на странице артиста
-    pub fn set_listeners(&self, count: u64) {
-        self.listeners_label.set_text(&format!("{} слушателей в месяц", group_digits(count)));
+    /// Плашка количества слушателей на странице артиста
+    pub fn set_listeners(&self, count: u64, metric: ListenersMetric) {
+        let label = match metric {
+            ListenersMetric::Monthly => format!("{} слушателей в месяц", group_digits(count)),
+            ListenersMetric::LastFm => format!("{} слушателей на Last.fm", group_digits(count)),
+        };
+        self.listeners_label.set_text(&label);
         self.listeners.set_visible(true);
     }
 
@@ -1673,14 +1696,15 @@ pub fn open_artist(
                 });
 
                 if let Some(n) = brief.stats.as_ref().and_then(|s| s.last_month_listeners) {
-                    page.set_listeners(n);
+                    page.set_listeners(n, ListenersMetric::Monthly);
                 } else {
+                    page.listeners.set_visible(false);
                     let weak = Rc::downgrade(&page);
                     let a_name = a.name.clone();
                     glib::spawn_future_local(async move {
                         if let Ok(Some(count)) = crate::cache::lastfm::get_artist_listeners(&a_name).await {
                             if let Some(pg) = weak.upgrade() {
-                                pg.set_listeners(count);
+                                pg.set_listeners(count, ListenersMetric::LastFm);
                             }
                         }
                     });
@@ -2459,7 +2483,7 @@ fn source_label(kind: &str, title: &str) -> Option<String> {
 }
 
 /// 5510287 → «5 510 287» (неразрывные пробелы)
-fn group_digits(n: u64) -> String {
+pub fn group_digits(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

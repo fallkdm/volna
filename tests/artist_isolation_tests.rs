@@ -1,6 +1,7 @@
 use volna::api;
 use volna::api::models::TrackSource;
 use volna::player::{lookup_registered_artist_in_map, parse_artist_id, PlaySource, SourceTarget};
+use volna::ui::collection::{format_listeners_label, group_digits, ListenersMetric};
 use std::collections::HashMap;
 
 #[test]
@@ -197,4 +198,26 @@ fn test_vk_artist_brief_alien_album_filtered_out() {
     assert_eq!(tracks.len(), 1);
     assert_eq!(tracks[0].title, "Karma Police");
 }
+
+#[test]
+fn test_listeners_metric_formatting() {
+    let monthly_text = format_listeners_label(5_510_287, ListenersMetric::Monthly);
+    assert_eq!(monthly_text, "5\u{a0}510\u{a0}287 слушателей в месяц");
+    assert!(monthly_text.contains("слушателей в месяц"));
+
+    let lastfm_text = format_listeners_label(1_234_567, ListenersMetric::LastFm);
+    assert_eq!(lastfm_text, "1\u{a0}234\u{a0}567 слушателей на Last.fm");
+    assert!(lastfm_text.contains("слушателей на Last.fm"));
+
+    assert_eq!(
+        ListenersMetric::Monthly.format_label(999),
+        "999 слушателей в месяц"
+    );
+    assert_eq!(
+        ListenersMetric::LastFm.format_label(999),
+        "999 слушателей на Last.fm"
+    );
+    assert_eq!(group_digits(10_000), "10\u{a0}000");
+}
+
 
