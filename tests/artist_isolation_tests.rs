@@ -147,38 +147,76 @@ fn test_vk_artist_brief_alien_album_filtered_out() {
         api::vk::models::VkAudioDto {
             id: 1,
             owner_id: 100,
-            artist: "Radiohead".into(),
-            title: "Karma Police".into(),
+            artist: "Plenka".into(),
+            title: "Closed".into(),
             subtitle: None,
-            duration: 260,
+            duration: 180,
             url: Some("https://example.com/audio1.mp3".into()),
             audio_streams: None,
             lyrics_id: None,
             album: Some(api::vk::models::VkAlbumDto {
                 id: 1,
                 owner_id: Some(100),
-                title: "OK Computer".into(),
+                title: "Ptah".into(),
                 thumb: None,
             }),
             main_artists: Some(vec![api::vk::models::VkArtistDto {
                 id: None,
-                name: "Radiohead".into(),
+                name: "Plenka".into(),
             }]),
             is_explicit: None,
         },
         api::vk::models::VkAudioDto {
             id: 2,
-            owner_id: 200,
-            artist: "Muse".into(),
-            title: "Plug in Baby".into(),
+            owner_id: 100,
+            artist: "Plenka, Asenssia".into(),
+            title: "Nightmare".into(),
             subtitle: None,
-            duration: 220,
+            duration: 200,
             url: Some("https://example.com/audio2.mp3".into()),
             audio_streams: None,
             lyrics_id: None,
             album: Some(api::vk::models::VkAlbumDto {
                 id: 2,
+                owner_id: Some(100),
+                title: "Plenka & Asenssia".into(),
+                thumb: None,
+            }),
+            main_artists: None,
+            is_explicit: None,
+        },
+        api::vk::models::VkAudioDto {
+            id: 3,
+            owner_id: 200,
+            artist: "Plenka 1987".into(),
+            title: "Alien Track".into(),
+            subtitle: None,
+            duration: 220,
+            url: Some("https://example.com/audio3.mp3".into()),
+            audio_streams: None,
+            lyrics_id: None,
+            album: Some(api::vk::models::VkAlbumDto {
+                id: 29202913,
                 owner_id: Some(200),
+                title: "Alien 1987 Album".into(),
+                thumb: None,
+            }),
+            main_artists: None,
+            is_explicit: None,
+        },
+        api::vk::models::VkAudioDto {
+            id: 4,
+            owner_id: 300,
+            artist: "Muse".into(),
+            title: "Plug in Baby".into(),
+            subtitle: None,
+            duration: 220,
+            url: Some("https://example.com/audio4.mp3".into()),
+            audio_streams: None,
+            lyrics_id: None,
+            album: Some(api::vk::models::VkAlbumDto {
+                id: 4,
+                owner_id: Some(300),
                 title: "Origin of Symmetry".into(),
                 thumb: None,
             }),
@@ -190,13 +228,27 @@ fn test_vk_artist_brief_alien_album_filtered_out() {
         },
     ];
 
-    let (tracks, albums) = api::vk::provider::filter_artist_items("Radiohead", 100, &items);
+    let (tracks, albums) = api::vk::provider::filter_artist_items("Plenka", 100, &items);
 
-    assert_eq!(albums.len(), 1);
-    assert_eq!(albums[0].title.as_deref(), Some("OK Computer"));
-    assert_eq!(albums[0].id, "vk:100_1");
-    assert_eq!(tracks.len(), 1);
-    assert_eq!(tracks[0].title, "Karma Police");
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].title, "Closed");
+    assert_eq!(tracks[1].title, "Nightmare");
+
+    assert_eq!(albums.len(), 2);
+    assert!(albums.iter().any(|a| a.id == "vk:100_1"));
+    assert!(albums.iter().any(|a| a.id == "vk:100_2"));
+    assert!(!albums.iter().any(|a| a.id.contains("29202913")));
+}
+
+#[test]
+fn test_matches_artist_name() {
+    use api::vk::provider::matches_artist_name;
+
+    assert!(matches_artist_name("Plenka", "Plenka"));
+    assert!(matches_artist_name("Plenka, Asenssia", "Plenka"));
+    assert!(!matches_artist_name("Plenka 1987", "Plenka"));
+    assert!(!matches_artist_name("Radiohead Tribute", "Radiohead"));
+    assert!(matches_artist_name("Thom Yorke feat. Plenka", "Plenka"));
 }
 
 #[test]

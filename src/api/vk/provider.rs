@@ -583,7 +583,7 @@ impl MusicProvider for VkProvider {
         let mut playlists = Vec::new();
         if let Ok(pl_res) = self.client.search_playlists(artist_name, 10).await {
             for pl in pl_res.items {
-                if pl.title.to_lowercase().contains(&artist_name.to_lowercase()) {
+                if pl.owner_id < 0 && pl.title.trim().eq_ignore_ascii_case(artist_name) {
                     playlists.push(into_playlist(pl));
                 }
             }
@@ -613,32 +613,85 @@ impl MusicProvider for VkProvider {
     }
 }
 
+pub fn matches_artist_name(raw_artist: &str, target_artist: &str) -> bool {
+    let target = target_artist.trim();
+    if target.is_empty() {
+        return false;
+    }
+    if raw_artist.trim().eq_ignore_ascii_case(target) {
+        return true;
+    }
+    let target_lower = target.to_lowercase();
+
+    // Разделение по коллаборациям: ',', '&', '/', "feat.", "ft."
+    for part in raw_artist.split(|c| c == ',' || c == '&' || c == '/') {
+        let trimmed = part.trim();
+        if trimmed.eq_ignore_ascii_case(target) {
+            return true;
+        }
+
+        let lower = trimmed.to_lowercase();
+        let stripped = if let Some(rest) = lower.strip_prefix("feat. ") {
+            Some(rest)
+        } else if let Some(rest) = lower.strip_prefix("feat ") {
+            Some(rest)
+        } else if let Some(rest) = lower.strip_prefix("ft. ") {
+            Some(rest)
+        } else if let Some(rest) = lower.strip_prefix("ft ") {
+            Some(rest)
+        } else {
+            None
+        };
+        if let Some(rest) = stripped {
+            if rest.trim() == target_lower {
+                return true;
+            }
+        }
+
+        // Поддержка "Artist feat. Target" и "Artist ft. Target"
+        for delimiter in &[" feat. ", " ft. ", " feat ", " ft "] {
+            for sub in lower.split(delimiter) {
+                if sub.trim() == target_lower {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn filter_artist_items(
     artist_name: &str,
     fallback_owner: i64,
     items: &[VkAudioDto],
 ) -> (Vec<Track>, Vec<Album>) {
     let mut top_tracks = Vec::new();
-    let mut albums_map = std::collections::HashMap::new();
+    let mut albums_map: std::collections::HashMap<(i64, i64), (Album, usize)> =
+        std::collections::HashMap::new();
 
     for item in items {
         let matches = item.main_artists.as_ref().map_or(false, |artists| {
-            artists.iter().any(|a| a.name.eq_ignore_ascii_case(artist_name))
-        }) || item.artist.eq_ignore_ascii_case(artist_name)
-           || item.artist.to_lowercase().contains(&artist_name.to_lowercase());
+            artists.iter().any(|a| a.name.trim().eq_ignore_ascii_case(artist_name))
+        }) || matches_artist_name(&item.artist, artist_name);
         if !matches {
             continue;
         }
         if let Some(alb) = &item.album {
             let key = (alb.owner_id.unwrap_or(fallback_owner), alb.id);
-            albums_map.entry(key).or_insert_with(|| alb.clone().into_album());
+            let entry = albums_map
+                .entry(key)
+                .or_insert_with(|| (alb.clone().into_album(), 0));
+            entry.1 += 1;
         }
         if top_tracks.len() < 10 && item.is_playable() {
             top_tracks.push(item.clone().into_track());
         }
     }
 
-    let albums = albums_map.into_values().collect();
+    let mut albums_sorted: Vec<(Album, usize)> = albums_map.into_values().collect();
+    albums_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    let albums: Vec<Album> = albums_sorted.into_iter().take(12).map(|(a, _)| a).collect();
+
     (top_tracks, albums)
 }
 
