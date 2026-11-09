@@ -13,14 +13,14 @@ use super::collection::{
     album_tile, artist_row, artist_tile, clear_box, ensure_liked, item_row, open_album, open_artist, open_playlist, open_track, playlist_tile, section_title, track_actions, track_row, DetailPage,
 };
 use crate::api::history::{clear_history_for, load_history_for, push_history_for, HistoryItem};
-use crate::api::models::{Album, SearchResult, Track};
+use crate::api::models::{Album, Artist, SearchResult, Track, TrackSource};
 use crate::api::provider::ProviderId;
 use crate::player::PlayerManager;
 
 pub struct SearchViewWidgets {
     pub container: GtkBox,
     /// Открыть страницу артиста / трека (из плеера); вкладку «Поиск» переключает вызывающий
-    pub show_artist: Rc<dyn Fn(String)>,
+    pub show_artist: Rc<dyn Fn(Artist, TrackSource)>,
     pub show_track: Rc<dyn Fn(Track)>,
     pub show_album: Rc<dyn Fn(Album)>,
     pub show_playlist: Rc<dyn Fn(crate::api::models::Playlist)>,
@@ -69,7 +69,8 @@ fn history_row(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, item: &H
         HistoryItem::Artist(a) => artist_row(&a.name, "Исполнитель", a.cover_url(100), move || {
             push_history_for(provider, it.clone());
             if let HistoryItem::Artist(a) = &it {
-                open_artist(&p, &stack, &page, a.id.clone());
+                let source = provider.into();
+                open_artist(&p, &stack, &page, a.clone(), source);
             }
         }),
         HistoryItem::Album(a) => item_row(a.title.as_deref().unwrap_or(""), &a.artists_string(), a.cover_url(100), false, move || {
@@ -120,13 +121,17 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     stack.add_named(&page.widget, Some("detail"));
     page.set_nav(&stack);
 
+fn search_placeholder(id: ProviderId) -> &'static str {
+    match id {
+        ProviderId::Vk => "Поиск во ВКонтакте…",
+        ProviderId::YouTubeMusic => "Поиск в YouTube Music…",
+        ProviderId::Yandex => "Поиск в Яндекс Музыке…",
+    }
+}
+
     let search_entry = SearchEntry::new();
     let initial_provider = player.providers.active_id();
-    search_entry.set_placeholder_text(Some(if initial_provider == ProviderId::YouTubeMusic {
-        "Поиск в YouTube Music…"
-    } else {
-        "Поиск в Яндекс Музыке…"
-    }));
+    search_entry.set_placeholder_text(Some(search_placeholder(initial_provider)));
     search_entry.set_hexpand(true);
     main.append(&search_entry);
 
@@ -416,11 +421,7 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 if let crate::player::PlayerUiEvent::ProviderChanged(id) = event {
-                    se.set_placeholder_text(Some(if id == ProviderId::YouTubeMusic {
-                        "Поиск в YouTube Music…"
-                    } else {
-                        "Поиск в Яндекс Музыке…"
-                    }));
+                    se.set_placeholder_text(Some(search_placeholder(id)));
                     let text = se.text().trim().to_string();
                     if !text.is_empty() {
                         ds_prov(text);
@@ -432,9 +433,9 @@ pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
         });
     }
 
-    let show_artist: Rc<dyn Fn(String)> = {
+    let show_artist: Rc<dyn Fn(Artist, TrackSource)> = {
         let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
-        Rc::new(move |id| open_artist(&p, &stack, &page, id))
+        Rc::new(move |artist, source| open_artist(&p, &stack, &page, artist, source))
     };
     let show_track: Rc<dyn Fn(Track)> = {
         let (p, stack, page) = (player.clone(), stack.clone(), page.clone());

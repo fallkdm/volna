@@ -3,5 +3,9 @@
 # рабочие файлы разработки, не часть программы
 /graphify-out/
 /AGENT_CHAT.md
+/agent_chat.md
+/AGENT_CHAT_TASK.md
+/.agent_chat_watch.offset
+/watch_agent_chat.sh
 /scripts/
 /.gitattributes

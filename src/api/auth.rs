@@ -14,12 +14,16 @@ fn default_crossfade_duration() -> u32 {
     3
 }
 
+fn default_pet_enabled() -> bool {
+    true
+}
+
 /// Конфигурация приложения Волна
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     /// OAuth токен Яндекс Музыки
     pub token: Option<String>,
-    /// Качество звука: `best` (по умолчанию), `balanced` или `economy`
+    /// Качество звука: `lossless` (по умолчанию), `best`, `balanced` или `economy`
     #[serde(default)]
     pub quality: Option<String>,
     /// Клиентский токен Genius (справка об исполнителях, если нет в Википедии)
@@ -28,6 +32,12 @@ pub struct AppConfig {
     /// Клипы на фоне Волны (превью-ролики из Яндекса, полупрозрачно); по умолчанию выключено
     #[serde(default)]
     pub clips: bool,
+    /// Питомец на панели плеера: ходит по ней и прыгает в такт басу
+    #[serde(default = "default_pet_enabled")]
+    pub pet_enabled: bool,
+    /// Облик питомца: "wave" (Волнёнок), "cat" (Кот) или "slime" (Слизень)
+    #[serde(default)]
+    pub pet_style: Option<String>,
     /// Ключ API Last.fm (справка об исполнителях)
     #[serde(default)]
     pub lastfm_key: Option<String>,
@@ -82,9 +92,15 @@ pub struct AppConfig {
     /// История поиска YouTube Music
     #[serde(default)]
     pub ytmusic_history_items: Vec<serde_json::Value>,
+    /// Числовой ID аккаунта VK (для audio.getPlaylists)
+    #[serde(default)]
+    pub vk_user_id: Option<i64>,
     /// Недавно проигранное (свежие первыми): Волна не должна повторять это после перезапуска
     #[serde(default)]
     pub recent_played: Vec<String>,
+    /// Сохраненная громкость пользователя (от 0.0 до 1.0, по умолчанию 0.85)
+    #[serde(default)]
+    pub volume: Option<f64>,
 }
 
 impl Default for AppConfig {
@@ -94,6 +110,8 @@ impl Default for AppConfig {
             quality: None,
             genius_token: None,
             clips: false,
+            pet_enabled: true,
+            pet_style: None,
             lastfm_key: None,
             ytmusic_oauth_client_id: None,
             ytmusic_oauth_client_secret: None,
@@ -112,7 +130,9 @@ impl Default for AppConfig {
             active_provider: None,
             ytmusic_refresh_token: None,
             ytmusic_cookie: None,
+            vk_user_id: None,
             recent_played: Vec::new(),
+            volume: None,
         }
     }
 }
@@ -203,11 +223,11 @@ pub fn save_genius_token(token: &str) -> Result<(), Box<dyn std::error::Error + 
     save_config(&config)
 }
 
-/// Выбранное качество звука (`best`, `balanced`, `economy`); при отсутствии или ошибке — `best`
+/// Выбранное качество звука (`lossless`, `best`, `balanced`, `economy`); при отсутствии или ошибке — `lossless`
 pub fn load_quality() -> String {
     match load_config().ok().and_then(|c| c.quality).as_deref() {
-        Some(q @ ("balanced" | "economy")) => q.to_string(),
-        _ => "best".to_string(),
+        Some(q @ ("lossless" | "best" | "balanced" | "economy")) => q.to_string(),
+        _ => "lossless".to_string(),
     }
 }
 
@@ -307,6 +327,31 @@ pub fn save_theme_accent(accent: &str) -> Result<(), Box<dyn std::error::Error +
     save_config(&config)
 }
 
+/// Питомец на плеере включён?
+pub fn load_pet_enabled() -> bool {
+    load_config().map(|c| c.pet_enabled).unwrap_or(true)
+}
+
+pub fn save_pet_enabled(enabled: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.pet_enabled = enabled;
+    save_config(&config)
+}
+
+/// Облик питомца: "wave", "cat" или "slime"
+pub fn load_pet_style() -> String {
+    match load_config().ok().and_then(|c| c.pet_style).as_deref() {
+        Some(style @ ("cat" | "slime")) => style.to_string(),
+        _ => "wave".to_string(),
+    }
+}
+
+pub fn save_pet_style(style: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.pet_style = Some(style.to_string());
+    save_config(&config)
+}
+
 /// Состояние свернутости сайдбара
 pub fn load_sidebar_collapsed() -> bool {
     load_config().map(|c| c.sidebar_collapsed).unwrap_or(false)
@@ -317,6 +362,18 @@ pub fn save_sidebar_collapsed(collapsed: bool) -> Result<(), Box<dyn std::error:
     let mut config = load_config().unwrap_or_default();
     config.sidebar_collapsed = collapsed;
     save_config(&config)
+}
+
+/// Загружает сохраненную громкость пользователя (от 0.0 до 1.0, по умолчанию 0.85)
+pub fn load_volume() -> f64 {
+    load_config().ok().and_then(|c| c.volume).unwrap_or(0.85).clamp(0.0, 1.0)
+}
+
+/// Сохраняет громкость пользователя в файл конфигурации
+pub fn save_volume(vol: f64) {
+    let mut cfg = load_config().unwrap_or_default();
+    cfg.volume = Some(vol.clamp(0.0, 1.0));
+    let _ = save_config(&cfg);
 }
 
 /// Сохраняет токен в файл конфигурации
@@ -338,6 +395,7 @@ pub fn clear_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 pub fn load_active_provider() -> crate::api::provider::ProviderId {
     match load_config().ok().and_then(|c| c.active_provider).as_deref() {
         Some("ytmusic") => crate::api::provider::ProviderId::YouTubeMusic,
+        Some("vk") => crate::api::provider::ProviderId::Vk,
         _ => crate::api::provider::ProviderId::Yandex,
     }
 }
@@ -347,9 +405,27 @@ pub fn save_active_provider(provider: crate::api::provider::ProviderId) -> Resul
     let mut config = load_config().unwrap_or_default();
     let val = match provider {
         crate::api::provider::ProviderId::YouTubeMusic => "ytmusic",
-        _ => "yandex",
+        crate::api::provider::ProviderId::Vk => "vk",
+        crate::api::provider::ProviderId::Yandex => "yandex",
     };
     config.active_provider = Some(val.to_string());
+    save_config(&config)
+}
+
+/// Числовой ID нужен `audio.getPlaylists`; это не секрет и не заменяет токен.
+pub fn load_vk_user_id() -> Option<i64> {
+    load_config().ok().and_then(|config| config.vk_user_id)
+}
+
+pub fn save_vk_user_id(user_id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.vk_user_id = Some(user_id);
+    save_config(&config)
+}
+
+pub fn clear_vk_user_id() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = load_config().unwrap_or_default();
+    config.vk_user_id = None;
     save_config(&config)
 }
 
@@ -533,5 +609,19 @@ mod tests {
 
         let default_cfg = AppConfig::default();
         assert_eq!(default_cfg.ytmusic_cookie, None);
+    }
+
+    #[test]
+    fn test_volume_config() {
+        let default_cfg = AppConfig::default();
+        assert_eq!(default_cfg.volume, None);
+
+        let json = "{}";
+        let parsed: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.volume, None);
+
+        let json_custom = r#"{"volume": 0.42}"#;
+        let parsed_custom: AppConfig = serde_json::from_str(json_custom).unwrap();
+        assert_eq!(parsed_custom.volume, Some(0.42));
     }
 }

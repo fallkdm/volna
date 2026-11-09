@@ -1,8 +1,11 @@
+use base64::prelude::*;
 use chrono::Utc;
 use md5::{Digest, Md5};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+use ring::hmac;
 use std::fmt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::models::{
     AccountStatus, Album, AlbumWithTracks, ArtistBrief, DownloadInfo, LikedAlbumItem,
@@ -59,6 +62,33 @@ fn pick_download_info<'a>(infos: &'a [DownloadInfo], quality: &str) -> Option<&'
     }
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct FileInfoResponse {
+    codec: Option<String>,
+    bitrate: Option<u32>,
+    quality: Option<String>,
+    #[serde(default)]
+    urls: Vec<String>,
+}
+
+fn sign_file_info(
+    ts: u64,
+    track_id: &str,
+    quality: &str,
+    codecs_sign: &str,
+    transport: &str,
+) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, b"7tvSmFbyf5hJnIHhCimDDD");
+    let msg = format!("{ts}{track_id}{quality}{codecs_sign}{transport}");
+    let tag = hmac::sign(&key, msg.as_bytes());
+    let b64 = BASE64_STANDARD.encode(tag.as_ref());
+    if b64.is_empty() {
+        String::new()
+    } else {
+        b64[..b64.len() - 1].to_string()
+    }
+}
 
 /// Клиент для работы с API Яндекс Музыки
 /// Устройство аккаунта из `quasar.yandex.net/glagol/device_list`
@@ -229,7 +259,54 @@ impl YandexMusicClient {
         Ok(api_response.result)
     }
 
-    /// Получает прямую ссылку на MP3-поток трека через download-info и подпись качества вида «MP3 192»
+    /// Получает прямую ссылку на Lossless FLAC поток трека, если доступно
+    pub async fn get_track_lossless_url(&self, track_id: &str) -> Option<(String, String)> {
+        let quality = super::auth::load_quality();
+        if quality == "economy" || quality == "balanced" {
+            return None;
+        }
+
+        let token = self.token.as_ref()?;
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let codecs_param = "flac-mp4,aac-mp4,he-aac-mp4";
+        let codecs_sign = "flac-mp4aac-mp4he-aac-mp4";
+        let sign = sign_file_info(ts, track_id, "lossless", codecs_sign, "raw");
+
+        let url = format!(
+            "{}/resources/v2/file-info?ts={ts}&trackId={}&quality=lossless&codecs={}&transports=raw&sign={}",
+            self.base_url,
+            urlencoding_encode(track_id),
+            urlencoding_encode(codecs_param),
+            urlencoding_encode(&sign),
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, format!("OAuth {token}"))
+            .header("X-Yandex-Music-Client", "YandexMusicWebNext/4.1724.1")
+            .header(
+                USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+            )
+            .header("Origin", "https://music.yandex.ru")
+            .header("Referer", "https://music.yandex.ru/")
+            .send()
+            .await
+            .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let res: FileInfoResponse = resp.json().await.ok()?;
+        if res.codec.as_deref() == Some("flac-mp4") && !res.urls.is_empty() {
+            Some((res.urls[0].clone(), "LOSSLESS".to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Получает прямую ссылку на трек через Lossless FLAC или MP3-поток и подпись качества вида «LOSSLESS» или «MP3 192»
     pub async fn get_track_direct_url(&self, track_id: &str) -> Result<(String, String), ApiError> {
         // Хранилище Яндекса отвечает рывками: то 100 мс, то 2–6 с. Если первая попытка не уложилась в 900 мс,
         // параллельно стартует вторая (новая одноразовая ссылка), берётся та, что завершилась успешно раньше.
@@ -274,6 +351,10 @@ impl YandexMusicClient {
         &self,
         track_id: &str,
     ) -> Result<(String, String), ApiError> {
+        if let Some(res) = self.get_track_lossless_url(track_id).await {
+            return Ok(res);
+        }
+
         let download_infos = self.get_track_download_info(track_id).await?;
         if download_infos.is_empty() {
             return Err(ApiError::MissingData(format!(
@@ -1712,5 +1793,33 @@ mod rotor_url_tests {
             YandexMusicClient::rotor_tracks_url("https://api.music.yandex.net", "user:onyourwave", Some(&queue)),
             "https://api.music.yandex.net/rotor/station/user:onyourwave/tracks?queue=107350639,58042199"
         );
+    }
+}
+
+#[cfg(test)]
+mod lossless_tests {
+    use super::*;
+
+    #[test]
+    fn test_sign_file_info_hmac() {
+        let ts = 1793636800;
+        let track_id = "153919218";
+        let quality = "lossless";
+        let codecs_sign = "flac-mp4aac-mp4he-aac-mp4";
+        let transport = "raw";
+        let sign = sign_file_info(ts, track_id, quality, codecs_sign, transport);
+        assert_eq!(sign, "tdXmVb/EMh9GXRUtCD3oIqsEWFIkzFAOHvxlJg5FdQg");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_lossless_live() {
+        let client = YandexMusicClient::new(crate::api::auth::load_token());
+        let res = client.get_track_lossless_url("153919218").await;
+        eprintln!("lossless result: {:?}", res);
+        assert!(res.is_some());
+        let (url, label) = res.unwrap();
+        assert_eq!(label, "LOSSLESS");
+        assert!(url.starts_with("https://"));
     }
 }

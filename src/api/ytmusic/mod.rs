@@ -1959,6 +1959,7 @@ impl MusicProvider for YtMusicClient {
             return Ok(StationBatch {
                 batch_id: cont.unwrap_or_default(),
                 tracks,
+                chips: Vec::new(),
             });
         }
 
@@ -2037,6 +2038,7 @@ impl MusicProvider for YtMusicClient {
         Ok(StationBatch {
             batch_id: continuation.unwrap_or_default(),
             tracks,
+            chips: Vec::new(),
         })
     }
 

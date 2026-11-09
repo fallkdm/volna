@@ -268,7 +268,8 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
 
     // Громкость: только значок, ползунок всплывает над ним при наведении (как в Яндекс Музыке).
     // Всплывающее окно рисуется внутри окна приложения (оверлеем), а не отдельным окном: оно не выходит за края.
-    let vol_adj = Adjustment::new(85.0, 0.0, 100.0, 1.0, 10.0, 0.0);
+    let current_vol_pct = (player.get_volume() * 100.0).clamp(0.0, 100.0);
+    let vol_adj = Adjustment::new(current_vol_pct, 0.0, 100.0, 1.0, 10.0, 0.0);
     let volume_scale = Scale::new(Orientation::Vertical, Some(&vol_adj));
     volume_scale.add_css_class("adw-scale");
     volume_scale.add_css_class("volume-vertical");
@@ -276,7 +277,13 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     volume_scale.set_height_request(118);
     volume_scale.set_draw_value(false);
 
-    let vol_icon = Image::from_icon_name("audio-volume-high-symbolic");
+    let initial_icon = match current_vol_pct {
+        v if v <= 0.5 => "audio-volume-muted-symbolic",
+        v if v < 34.0 => "audio-volume-low-symbolic",
+        v if v < 67.0 => "audio-volume-medium-symbolic",
+        _ => "audio-volume-high-symbolic",
+    };
+    let vol_icon = Image::from_icon_name(initial_icon);
     let volume_btn = Button::new();
     volume_btn.set_child(Some(&vol_icon));
     volume_btn.add_css_class("flat");

@@ -140,6 +140,7 @@ impl PlayerSlot {
         });
 
         let pipeline = play.pipeline();
+        use gtk4::glib::prelude::ObjectExt;
         if pipeline.find_property("flags").is_some() {
             // download, а не buffering: queue2 тянет поток целиком во временный файл настолько
             // быстро, насколько позволяет сеть, и не переигрывает BUFFERING->PLAYING каждые
@@ -148,9 +149,50 @@ impl PlayerSlot {
             // заранее, поэтому старт следующего трека остаётся мгновенным.
             pipeline.set_property_from_str("flags", "audio+soft-volume+download");
         }
-        use gtk4::glib::prelude::ObjectExt;
-        // buffer-duration/buffer-size не переопределяем: в download-режиме дефолты playbin
-        // (без ограничения по времени, 4 МиБ) как раз и означают «качать как можно быстрее».
+        if pipeline.find_property("buffer-duration").is_some() {
+            let _ = pipeline.set_property("buffer-duration", 10_000_000_000i64); // 10 секунд буфера
+        }
+        if pipeline.find_property("buffer-size").is_some() {
+            let _ = pipeline.set_property("buffer-size", 4 * 1024 * 1024i32); // 4 МБ
+        }
+        if pipeline.find_property("ring-buffer-max-size").is_some() {
+            let _ = pipeline.set_property("ring-buffer-max-size", 8 * 1024 * 1024u64); // 8 МБ
+        }
+
+        pipeline.connect("element-setup", false, |values| {
+            if let Some(element) = values.get(1).and_then(|v| v.get::<gstreamer::Element>().ok()) {
+                let name = element.name();
+                let factory_name = element.factory().map(|f| f.name().to_string()).unwrap_or_default();
+                if name.starts_with("hlsdemux") || factory_name.contains("hlsdemux") {
+                    if element.has_property("low-watermark-fragments") {
+                        let _ = element.set_property("low-watermark-fragments", 2.0f64);
+                    }
+                    if element.has_property("high-watermark-fragments") {
+                        let _ = element.set_property("high-watermark-fragments", 5.0f64);
+                    }
+                    if element.has_property("connection-speed") {
+                        let _ = element.set_property("connection-speed", 10000u32);
+                    }
+                }
+            }
+            None
+        });
+
+        if let Some(bus) = pipeline.bus() {
+            let pipe_weak = pipeline.downgrade();
+            bus.set_sync_handler(move |_, msg| {
+                if let gstreamer::MessageView::Buffering(b) = msg.view() {
+                    if b.percent() < 100 {
+                        if let Some(pipe) = pipe_weak.upgrade() {
+                            if pipe.current_state() == gstreamer::State::Playing {
+                                return gstreamer::BusSyncReply::Drop;
+                            }
+                        }
+                    }
+                }
+                gstreamer::BusSyncReply::Pass
+            });
+        }
 
         pipeline.connect("source-setup", false, |values| {
             if let Some(source) = values.get(1).and_then(|v| v.get::<gstreamer::Element>().ok()) {
@@ -163,11 +205,14 @@ impl PlayerSlot {
                 if source.has_property("iradio-mode") {
                     let _ = source.set_property("iradio-mode", false);
                 }
-                // keep-alive намеренно не включаем: souphttpsrc по умолчанию переоткрывает
-                // соединение, а переиспользованный сокет к googlevideo периодически оказывается
-                // полумертвым — поток замирал до ближайшего seek. Возврат к дефолту.
                 if source.has_property("blocksize") {
-                    let _ = source.set_property("blocksize", 65536u32);
+                    let _ = source.set_property("blocksize", 131072u32); // 128 КБ
+                }
+                if source.has_property("keep-alive") {
+                    let _ = source.set_property("keep-alive", true);
+                }
+                if source.has_property("timeout") {
+                    let _ = source.set_property("timeout", 15u32);
                 }
             }
             None
@@ -214,6 +259,39 @@ impl PendingPreroll<'_> {
     }
 }
 
+pub fn is_hls_url(url: &str) -> bool {
+    url.contains(".m3u8")
+        || url.contains("/s/v1/")
+        || (url.contains("vkuseraudio.net") && !url.contains(".mp3") && !url.contains("type=2"))
+}
+
+fn configure_pipeline_for_url(pipeline: &gstreamer::Element, url: &str) {
+    if is_hls_url(url) {
+        // Для HLS плейлистов флаги без buffering и без download, чтобы playbin3
+        // не создавал паразитный queue2 с жестким ожиданием 10 секунд
+        if pipeline.find_property("flags").is_some() {
+            pipeline.set_property_from_str("flags", "audio+soft-volume");
+        }
+        if pipeline.find_property("buffer-duration").is_some() {
+            let _ = pipeline.set_property("buffer-duration", -1i64);
+        }
+        if pipeline.find_property("buffer-size").is_some() {
+            let _ = pipeline.set_property("buffer-size", -1i32);
+        }
+    } else {
+        // Для прогрессивных MP3/FLAC/Opus/AAC используем download и 10s буфер
+        if pipeline.find_property("flags").is_some() {
+            pipeline.set_property_from_str("flags", "audio+soft-volume+download");
+        }
+        if pipeline.find_property("buffer-duration").is_some() {
+            let _ = pipeline.set_property("buffer-duration", 10_000_000_000i64);
+        }
+        if pipeline.find_property("buffer-size").is_some() {
+            let _ = pipeline.set_property("buffer-size", 4 * 1024 * 1024i32);
+        }
+    }
+}
+
 /// Переводит слот в состояние «прогретого» преролла: поток открыт, начало декодировано,
 /// громкость 0.0. Повторный вызов для того же URL ничего не делает, чтобы не рвать уже
 /// установленное соединение и не сбрасывать буфер.
@@ -223,6 +301,7 @@ fn preroll_slot(play: &Play, current_uri: &Arc<Mutex<Option<String>>>, is_prerol
             return;
         }
     }
+    configure_pipeline_for_url(&play.pipeline(), url);
     play.stop();
     play.set_volume(0.0);
     play.set_uri(Some(url));
@@ -254,8 +333,10 @@ impl AudioBackend {
         let slot0 = PlayerSlot::new(0)?;
         let slot1 = PlayerSlot::new(1)?;
 
-        let initial_vol = slot0.play.volume().clamp(0.0, 1.0);
-        let user_volume = Arc::new(Mutex::new(if initial_vol <= 0.0 { 1.0 } else { initial_vol }));
+        let initial_vol = crate::api::auth::load_volume();
+        slot0.play.set_volume(initial_vol);
+        slot1.play.set_volume(0.0);
+        let user_volume = Arc::new(Mutex::new(initial_vol));
         let fade_gen = Arc::new(AtomicU64::new(0));
         let fading_gen = Arc::new(AtomicU64::new(0));
         let active_slot = Arc::new(AtomicUsize::new(0));
@@ -316,14 +397,15 @@ impl AudioBackend {
         let inactive_idx = 1 - (self.active_slot.load(Ordering::SeqCst) % 2);
         let slot = &self.slots[inactive_idx];
 
-        // Идёт сводка: неактивный слот — это ещё звучащий исходящий трек. Если его остановить
-        // ради преролла, плавное затухание обрывается на середине (щелчок и резкий обрыв).
-        // Поэтому откладываем преролл до момента, когда сводка доиграет и слот освободится.
-        if self.fading_gen.load(Ordering::SeqCst) != 0 && slot.play.pipeline().current_state() == gstreamer::State::Playing {
+        let is_busy = self.fading_gen.load(Ordering::SeqCst) != 0
+            || slot.play.pipeline().current_state() == gstreamer::State::Playing
+            || slot.is_playing.lock().map(|l| *l).unwrap_or(false);
+
+        if is_busy {
             if let Ok(mut pending) = self.pending_preroll.lock() {
                 *pending = Some(url.to_string());
             }
-            eprintln!("[audio] Преролл отложен до конца сводки: слот {} ещё звучит ({})", inactive_idx, url);
+            eprintln!("[audio] Преролл отложен до освобождения слота {}: {}", inactive_idx, url);
             return;
         }
 
@@ -370,6 +452,7 @@ impl AudioBackend {
             }
             let vol = *self.user_volume.lock().unwrap();
             self.slots[inactive_idx].play.set_volume(vol);
+            configure_pipeline_for_url(&self.slots[inactive_idx].play.pipeline(), url);
             self.slots[inactive_idx].play.play();
             if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
                 *lock = true;
@@ -390,6 +473,7 @@ impl AudioBackend {
         let vol = *self.user_volume.lock().unwrap();
         current.play.set_volume(vol);
         current.play.set_uri(Some(url));
+        configure_pipeline_for_url(&current.play.pipeline(), url);
         current.play.play();
         if let Ok(mut cur) = current.current_uri.lock() {
             *cur = Some(url.to_string());
@@ -423,6 +507,7 @@ impl AudioBackend {
             }
             self.slots[inactive_idx].is_prerolled.store(false, Ordering::SeqCst);
             self.slots[inactive_idx].play.set_volume(0.0);
+            configure_pipeline_for_url(&self.slots[inactive_idx].play.pipeline(), url);
             self.slots[inactive_idx].play.play();
             if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
                 *lock = true;
@@ -443,6 +528,7 @@ impl AudioBackend {
         current.is_prerolled.store(false, Ordering::SeqCst);
         current.play.set_volume(0.0);
         current.play.set_uri(Some(url));
+        configure_pipeline_for_url(&current.play.pipeline(), url);
         current.play.play();
         if let Ok(mut cur) = current.current_uri.lock() {
             *cur = Some(url.to_string());
@@ -468,8 +554,19 @@ impl AudioBackend {
         let current_idx = self.active_slot.load(Ordering::SeqCst) % 2;
         let next_idx = 1 - current_idx;
 
+        let generation_id = self.fade_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let fade_gen = self.fade_gen.clone();
+        if duration_ms > 0 {
+            self.fading_gen.store(generation_id, Ordering::SeqCst);
+        } else {
+            self.fading_gen.store(0, Ordering::SeqCst);
+        }
+        self.active_slot.store(next_idx, Ordering::SeqCst);
+
         let current_slot = &self.slots[current_idx];
         let next_slot = &self.slots[next_idx];
+
+        configure_pipeline_for_url(&next_slot.play.pipeline(), url);
 
         let is_already_prerolled = {
             let cur_match = next_slot.current_uri.lock().map(|cur| cur.as_deref() == Some(url)).unwrap_or(false);
@@ -481,6 +578,7 @@ impl AudioBackend {
             next_slot.play.set_volume(0.0);
             next_slot.play.play();
         } else {
+            next_slot.play.stop();
             next_slot.play.set_volume(0.0);
             next_slot.play.set_uri(Some(url));
             next_slot.play.play();
@@ -493,20 +591,12 @@ impl AudioBackend {
             *lock = true;
         }
 
-        // Мгновенно переключаем активный слот на новый трек, чтобы position_ms() и UI
-        // не считывали устаревшую позицию конца предыдущего трека (устраняет дергание полосы
-        // прогресса и ложные срабатывания автокроссфейда).
-        self.active_slot.store(next_idx, Ordering::SeqCst);
-
         let user_volume_arc = self.user_volume.clone();
         let user_vol = self.user_volume();
 
         let current_play = current_slot.play.clone();
         let next_play = next_slot.play.clone();
         let current_is_playing = current_slot.is_playing.clone();
-
-        let generation_id = self.fade_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        let fade_gen = self.fade_gen.clone();
 
         if duration_ms == 0 {
             current_play.stop();
@@ -517,9 +607,6 @@ impl AudioBackend {
             self.flush_pending_preroll();
             return;
         }
-
-        // Отмечаем, что исходящий слот ещё звучит: преролл не должен его останавливать.
-        self.fading_gen.store(generation_id, Ordering::SeqCst);
 
         let start_current_vol = current_play.volume().min(user_vol);
         let fading_gen = self.fading_gen.clone();
@@ -534,6 +621,10 @@ impl AudioBackend {
             let mut started = false;
             loop {
                 if fade_gen.load(Ordering::SeqCst) != generation_id {
+                    current_play.stop();
+                    if let Ok(mut lock) = current_is_playing.lock() {
+                        *lock = false;
+                    }
                     return;
                 }
                 if next_play.pipeline().current_state() == gstreamer::State::Playing {
@@ -550,13 +641,13 @@ impl AudioBackend {
             if !started {
                 // Новый поток так и не заиграл: вместо тишины отдаём трек без сводки, иначе
                 // active_slot уже указывает на молчащий слот, а UI считает, что играет он.
+                current_play.stop();
+                if let Ok(mut lock) = current_is_playing.lock() {
+                    *lock = false;
+                }
                 if fade_gen.load(Ordering::SeqCst) == generation_id {
                     eprintln!("[audio] новый поток не перешел в Playing за 15 с — переключаем без сводки");
                     let vol = user_volume_arc.lock().map(|l| *l).unwrap_or(1.0);
-                    current_play.stop();
-                    if let Ok(mut lock) = current_is_playing.lock() {
-                        *lock = false;
-                    }
                     next_play.set_volume(vol);
                     if fading_gen.load(Ordering::SeqCst) == generation_id {
                         fading_gen.store(0, Ordering::SeqCst);
@@ -582,6 +673,10 @@ impl AudioBackend {
                 interval.tick().await;
                 if fade_gen.load(Ordering::SeqCst) != generation_id {
                     // Фейд был перехвачен новым переключением или остановкой
+                    current_play.stop();
+                    if let Ok(mut lock) = current_is_playing.lock() {
+                        *lock = false;
+                    }
                     return;
                 }
                 let t = step as f64 / steps as f64;
@@ -597,11 +692,11 @@ impl AudioBackend {
                 next_play.set_volume(next_v.clamp(0.0, 1.0));
             }
 
+            current_play.stop();
+            if let Ok(mut lock) = current_is_playing.lock() {
+                *lock = false;
+            }
             if fade_gen.load(Ordering::SeqCst) == generation_id {
-                current_play.stop();
-                if let Ok(mut lock) = current_is_playing.lock() {
-                    *lock = false;
-                }
                 let cur_user_vol = user_volume_arc.lock().map(|l| *l).unwrap_or(1.0);
                 next_play.set_volume(cur_user_vol);
                 if fading_gen.load(Ordering::SeqCst) == generation_id {
@@ -725,7 +820,8 @@ impl AudioBackend {
 
     /// Перемотка с точностью до миллисекунды (переход к строке текста песни)
     pub fn seek_ms(&self, ms: u64) {
-        self.active().play.seek(gstreamer::ClockTime::from_mseconds(ms));
+        let time = gstreamer::ClockTime::from_mseconds(ms);
+        self.active().play.seek(time);
     }
 
     /// Докуда загружен текущий поток активного слота, доля 0..1
@@ -870,13 +966,12 @@ impl AudioBackend {
         }
     }
 
-    /// Установка громкости (от 0.0 до 1.0). Сохраняет в user_volume и отменяет активный fade
+    /// Установка громкости (от 0.0 до 1.0). Сохраняет в user_volume и устанавливает громкость активного слота
     pub fn set_volume(&self, volume: f64) {
         let v = volume.clamp(0.0, 1.0);
         if let Ok(mut lock) = self.user_volume.lock() {
             *lock = v;
         }
-        self.fade_gen.fetch_add(1, Ordering::SeqCst);
         self.active().play.set_volume(v);
     }
 

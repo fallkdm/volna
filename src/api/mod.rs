@@ -8,6 +8,7 @@ pub mod models;
 pub mod provider;
 pub mod provider_manager;
 pub mod translate;
+pub mod vk;
 pub mod wiki;
 pub mod ytmusic;
 pub mod lrclib;

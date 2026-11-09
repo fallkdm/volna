@@ -1,7 +1,7 @@
 //! Общие виджеты коллекций: обложки, плитки, строки треков и страница альбома/плейлиста.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
@@ -16,14 +16,91 @@ use crate::api::models::{Album, Artist, Playlist, Track, TrackSource};
 use crate::api::provider::ProviderId;
 use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 
+/// Кэш текстур обложек с ограничением по памяти.
+///
+/// Раньше сюда складывалась каждая увиденная обложка навсегда: после часа
+/// поиска и альбомов процесс разрастался до сотен мегабайт. Теперь это LRU
+/// с бюджетом 16 МБ; видимые картинки держат собственные ссылки и не ломаются.
+const COVER_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct CoverCache {
+    map: HashMap<String, gdk::Texture>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl CoverCache {
+    fn texture_bytes(tex: &gdk::Texture) -> usize {
+        (tex.width() as usize)
+            .saturating_mul(tex.height() as usize)
+            .saturating_mul(4)
+    }
+
+    fn get(&mut self, key: &str) -> Option<gdk::Texture> {
+        let tex = self.map.get(key)?.clone();
+        if let Some(pos) = self.order.iter().position(|item| item == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_owned());
+        Some(tex)
+    }
+
+    fn insert(&mut self, key: String, tex: gdk::Texture) {
+        let size = Self::texture_bytes(&tex);
+        // Одиночная гигантская обложка не должна вытеснять весь кэш.
+        if size > COVER_CACHE_BUDGET / 2 {
+            return;
+        }
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(Self::texture_bytes(&old));
+        }
+        if let Some(pos) = self.order.iter().position(|item| *item == key) {
+            self.order.remove(pos);
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.map.insert(key.clone(), tex);
+        self.order.push_back(key);
+        while self.bytes > COVER_CACHE_BUDGET {
+            let Some(old_key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.map.remove(&old_key) {
+                self.bytes = self.bytes.saturating_sub(Self::texture_bytes(&old));
+            }
+        }
+    }
+}
+
 thread_local! {
-    static COVERS: RefCell<HashMap<String, gdk::Texture>> = RefCell::new(HashMap::new());
+    static COVERS: RefCell<CoverCache> = RefCell::new(CoverCache::default());
+}
+
+/// Сколько сейчас занимают текстуры обложек в памяти и каков лимит (байты).
+pub fn cover_cache_usage() -> (usize, usize) {
+    COVERS.with(|cache| {
+        let cache = cache.borrow();
+        (cache.bytes, COVER_CACHE_BUDGET)
+    })
+}
+
+/// Полностью очищает кэш текстур обложек; возвращает освобождённые байты.
+/// Видимые картинки продолжают работать: у них свои ссылки на текстуры.
+pub fn clear_cover_memory_cache() -> usize {
+    COVERS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let bytes = cache.bytes;
+        cache.map.clear();
+        cache.order.clear();
+        cache.bytes = 0;
+        bytes
+    })
 }
 
 /// Загружает обложку по URL в `Image` (кэш в памяти; при ошибке остаётся заглушка)
 pub fn load_cover(image: &Image, url: Option<String>) {
     let Some(url) = url else { return };
-    if let Some(tex) = COVERS.with(|c| c.borrow().get(&url).cloned()) {
+    if let Some(tex) = COVERS.with(|c| c.borrow_mut().get(&url)) {
         image.set_paintable(Some(&tex));
         return;
     }
@@ -269,6 +346,8 @@ pub struct DetailPage {
     pub link_handler: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>,
     /// Альбомы, на которые ведут ссылки подписи
     pub link_albums: RefCell<Vec<Album>>,
+    /// Артисты, на которых ведут ссылки подписи
+    pub link_artists: RefCell<Vec<Artist>>,
     /// Справка об исполнителе из Википедии
     about: GtkBox,
     about_for: Rc<RefCell<String>>,
@@ -603,7 +682,7 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, video, video_shared, video_gen: Default::default(), listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, video, video_shared, video_gen: Default::default(), listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), link_artists: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
     }
 
     /// Кнопка-описание у своего плейлиста: клик открывает редактирование
@@ -715,8 +794,14 @@ impl DetailPage {
         let (p, stack, weak) = (self.player.clone(), stack.clone(), Rc::downgrade(self));
         *self.link_handler.borrow_mut() = Some(Rc::new(move |uri: &str| {
             let Some(page) = weak.upgrade() else { return };
-            if let Some(id) = uri.strip_prefix("artist:") {
-                open_artist(&p, &stack, &page, id.to_string());
+            if let Some(idx_str) = uri.strip_prefix("artist:") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    let artist_opt = page.link_artists.borrow().get(idx).cloned();
+                    if let Some(artist) = artist_opt {
+                        let source = page.tracks.borrow().first().map(|t| t.source).unwrap_or(p.providers.active_id().into());
+                        open_artist(&p, &stack, &page, artist, source);
+                    }
+                }
             } else if let Some(id) = uri.strip_prefix("album:") {
                 let album = page.link_albums.borrow().iter().find(|a| a.id == id).cloned();
                 if let Some(album) = album {
@@ -969,16 +1054,24 @@ impl DetailPage {
 
     /// Подпись со ссылками: исполнители ведут на страницу артиста, альбом на страницу альбома
     pub fn set_subtitle_links(&self, artists: &[Artist], album: Option<&Album>, year: Option<u32>) {
+        *self.link_artists.borrow_mut() = artists.to_vec();
         let parts: Vec<String> = artists
             .iter()
-            .map(|a| format!("<a href=\"artist:{}\">{}</a>", a.id, glib::markup_escape_text(&a.name)))
+            .enumerate()
+            .map(|(idx, a)| format!("<a href=\"artist:{}\">{}</a>", idx, glib::markup_escape_text(&a.name)))
             .collect();
         let mut text = parts.join(", ");
         if let Some(al) = album {
             if !text.is_empty() {
                 text.push_str(" · ");
             }
-            text.push_str(&format!("<a href=\"album:{}\">{}</a>", al.id, glib::markup_escape_text(al.title.as_deref().unwrap_or(""))));
+            let raw_title = al.title.as_deref().unwrap_or("");
+            let display_title = if raw_title.trim().is_empty() || raw_title.trim().eq_ignore_ascii_case("unnamed") {
+                "Альбом"
+            } else {
+                raw_title
+            };
+            text.push_str(&format!("<a href=\"album:{}\">{}</a>", al.id, glib::markup_escape_text(display_title)));
             *self.link_albums.borrow_mut() = vec![al.clone()];
         } else if let Some(y) = year {
             if !text.is_empty() {
@@ -1169,6 +1262,11 @@ impl DetailPage {
         *self.wave.borrow_mut() = None;
         clear_box(&self.extra);
 
+        self.set_tracks(tracks);
+    }
+
+    /// Обновляет список треков на странице
+    pub fn set_tracks(&self, tracks: Vec<Track>) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -1184,7 +1282,9 @@ impl DetailPage {
         }
         self.empty.set_visible(tracks.is_empty());
         self.offline_btn.set_label(offline_label(&tracks));
-        self.offline_btn.set_visible(!tracks.is_empty());
+        self.offline_btn.set_visible(
+            !tracks.is_empty() && !tracks.iter().any(|track| track.source == TrackSource::Vk),
+        );
         *self.tracks.borrow_mut() = tracks;
     }
 
@@ -1198,7 +1298,7 @@ impl DetailPage {
                 insert_track_row(&self.player, &self.nav, &self.tracks, &self.list, &self.empty, track);
                 let count = self.tracks.borrow().len();
                 self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
-                self.offline_btn.set_visible(true);
+                self.offline_btn.set_visible(track.source != TrackSource::Vk);
             } else {
                 let pos = self.tracks.borrow().iter().position(|t| t.id == track.id);
                 if let Some(idx) = pos {
@@ -1278,10 +1378,23 @@ pub fn open(
                     || p.providers.active_id() == ProviderId::YouTubeMusic
             }
         };
+        let is_vk = match &source {
+            Source::Album(id) => id.starts_with("vk:"),
+            Source::Playlist(uid, kind) => uid.starts_with("vk:") || kind.starts_with("vk:"),
+        };
+        let session = p.providers.session();
 
         let result: Result<Vec<Track>, String> = match &source {
             Source::Album(id) => {
-                if is_yt {
+                if is_vk {
+                    match p.providers.get(ProviderId::Vk) {
+                        Some(provider) => provider
+                            .get_album_tracks(id)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("Требуется вход во ВКонтакте".to_owned()),
+                    }
+                } else if is_yt {
                     p.yt_client.get_album_tracks(id).await.map_err(|e| e.to_string())
                 } else {
                     let client = p.client.lock().unwrap().clone();
@@ -1289,7 +1402,21 @@ pub fn open(
                 }
             }
             Source::Playlist(uid, k) => {
-                if is_yt {
+                if is_vk {
+                    let playlist = Playlist {
+                        uid: uid.clone(),
+                        kind: k.clone(),
+                        title: title.clone(),
+                        ..Default::default()
+                    };
+                    match p.providers.get(ProviderId::Vk) {
+                        Some(provider) => provider
+                            .get_playlist_tracks(&playlist)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("Требуется вход во ВКонтакте".to_owned()),
+                    }
+                } else if is_yt {
                     p.yt_client.get_album_tracks(uid).await.map_err(|e| e.to_string())
                 } else {
                     let client = p.client.lock().unwrap().clone();
@@ -1298,11 +1425,21 @@ pub fn open(
             }
         };
 
-        ensure_liked(&p).await;
+        if !is_yt && !is_vk {
+            ensure_liked(&p).await;
+        }
+        if !p.providers.is_current(session.id, session.generation) {
+            return;
+        }
         match result {
             Ok(tracks) => {
                 let cover_url = cover_url.or_else(|| tracks.first().and_then(|t| t.cover_url(400)));
-                page.show(kind, &title, &subtitle, cover_url, tracks);
+                let display_title = if title.trim().is_empty() || title.trim().eq_ignore_ascii_case("unnamed") {
+                    "Альбом".to_string()
+                } else {
+                    title.clone()
+                };
+                page.show(kind, &display_title, &subtitle, cover_url, tracks);
                 match (&source, &album) {
                     (Source::Album(_), Some(al)) => page.set_source_target(SourceTarget::Album(al.clone())),
                     (Source::Playlist(uid, k), _) => page.set_source_target(SourceTarget::Playlist(Playlist {
@@ -1314,7 +1451,7 @@ pub fn open(
                     _ => {}
                 }
                 if let Source::Playlist(uid, k) = &source {
-                    if !is_yt {
+                    if !is_yt && !is_vk {
                         let client = p.client.lock().unwrap().clone();
                         if let Ok(me) = client.get_uid().await {
                             let liked = client.get_liked_playlist_keys(&me).await.unwrap_or_default().contains(&format!("{}:{}", uid, k));
@@ -1351,13 +1488,20 @@ fn album_subtitle(album: &Album) -> String {
 
 /// Открывает страницу альбома (например, по клику на обложку в плеере)
 pub fn open_album(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, album: &Album) {
+    let title = album
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("unnamed"))
+        .unwrap_or("Альбом")
+        .to_string();
     open(
         player,
         stack,
         page,
         Source::Album(album.id.clone()),
         "Альбом",
-        album.title.clone().unwrap_or_default(),
+        title,
         album_subtitle(album),
         album.cover_url(400),
         Some(album.clone()),
@@ -1413,33 +1557,96 @@ pub fn artist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
     btn.set_child(Some(&col));
     btn.add_css_class("flat");
     btn.add_css_class("cover-tile");
-    let (p, stack, page, id) = (player.clone(), stack.clone(), page.clone(), artist.id.clone());
+    let (p, stack, page, artist) = (player.clone(), stack.clone(), page.clone(), artist.clone());
     btn.connect_clicked(move |_| {
-        open_artist(&p, &stack, &page, id.clone());
+        let source = page.tracks.borrow().first().map(|t| t.source).unwrap_or(p.providers.active_id().into());
+        open_artist(&p, &stack, &page, artist.clone(), source);
     });
     btn
 }
 
 /// Страница артиста: популярные треки, альбомы и «Волна по артисту»
-pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, artist_id: String) {
+pub fn open_artist(
+    player: &PlayerManager,
+    stack: &Stack,
+    page: &Rc<DetailPage>,
+    artist: Artist,
+    source: crate::api::models::TrackSource,
+) {
     let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
     glib::spawn_future_local(async move {
-        let is_yt = artist_id.starts_with("UC") || p.providers.active_id() == ProviderId::YouTubeMusic;
+        if source == TrackSource::Vk
+            || (source != TrackSource::YouTubeMusic && artist.id.trim().is_empty())
+            || (source == TrackSource::YouTubeMusic && artist.id.trim().is_empty() && artist.name.trim().is_empty())
+            || (source == TrackSource::Yandex && artist.id.parse::<u64>().is_err())
+        {
+            // НЕ ВЫЗЫВАТЬ p.client.get_artist_brief! В Яндекс запросов ноль!
+            page.show("Исполнитель", &artist.name, "", None, Vec::new());
+            page.set_round_cover(true);
+            load_artist_avatar(&page.cover, &artist.name, None);
+            page.load_about(artist.name.clone());
+            page.set_source_target(SourceTarget::Artist(artist.id.clone()));
+            page.set_wave(Wave::Artist(artist.id.clone(), artist.name.clone()));
+            stack.set_visible_child_name("detail");
+
+            let (p2, page2, artist_name, source) = (p.clone(), page.clone(), artist.name.clone(), source);
+            glib::spawn_future_local(async move {
+                let mut tracks = if source == TrackSource::Vk {
+                    if let Some(provider) = p2.providers.get(ProviderId::Vk) {
+                        if let Ok(res) = provider.search(&artist_name).await {
+                            res.tracks.map(|s| s.results).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                if tracks.is_empty() {
+                    let state = p2.state.lock().unwrap();
+                    tracks = state
+                        .liked_tracks_cache
+                        .iter()
+                        .filter(|t| t.source == source && t.artists.iter().any(|a| a.name.eq_ignore_ascii_case(&artist_name)))
+                        .cloned()
+                        .collect();
+                }
+                if !tracks.is_empty() {
+                    page2.set_tracks(tracks);
+                }
+            });
+            return;
+        }
+
+        let is_yt = source == TrackSource::YouTubeMusic;
         let brief_result: Result<crate::api::models::ArtistBrief, String> = if is_yt {
-            p.yt_client.get_artist(&artist_id).await.map_err(|e| e.to_string())
-        } else {
+            let target = if artist.id.starts_with("UC") {
+                &artist.id
+            } else if !artist.name.trim().is_empty() {
+                &artist.name
+            } else {
+                &artist.id
+            };
+            p.yt_client.get_artist(target).await.map_err(|e| e.to_string())
+        } else if source == TrackSource::Yandex && artist.id.parse::<u64>().is_ok() {
             let client = p.client.lock().unwrap().clone();
-            client.get_artist_brief(&artist_id).await.map_err(|e| e.to_string())
+            client.get_artist_brief(&artist.id).await.map_err(|e| e.to_string())
+        } else {
+            Err("Неизвестный источник артиста".to_string())
         };
 
         match brief_result {
             Ok(brief) => {
-                ensure_liked(&p).await;
+                if source == TrackSource::Yandex {
+                    ensure_liked(&p).await;
+                }
                 let a = &brief.artist;
                 page.show("Исполнитель", &a.name, "", None, brief.popular_tracks);
                 page.set_round_cover(true);
                 load_artist_avatar(&page.cover, &a.name, None);
-                let real_artist_id = if a.id.is_empty() { artist_id } else { a.id.clone() };
+                let real_artist_id = if a.id.is_empty() { artist.id.clone() } else { a.id.clone() };
                 page.set_source_target(SourceTarget::Artist(real_artist_id.clone()));
                 let photos: Vec<String> = brief
                     .all_covers
@@ -1490,7 +1697,33 @@ pub fn open_artist(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                 }
                 stack.set_visible_child_name("detail");
             }
-            Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить артиста: {}", e))),
+            Err(e) => {
+                if source == TrackSource::YouTubeMusic {
+                    page.show("Исполнитель", &artist.name, "", None, Vec::new());
+                    page.set_round_cover(true);
+                    load_artist_avatar(&page.cover, &artist.name, None);
+                    page.load_about(artist.name.clone());
+                    page.set_source_target(SourceTarget::Artist(artist.id.clone()));
+                    page.set_wave(Wave::Artist(artist.id.clone(), artist.name.clone()));
+                    stack.set_visible_child_name("detail");
+
+                    let (p2, page2, artist_name, source) = (p.clone(), page.clone(), artist.name.clone(), source);
+                    glib::spawn_future_local(async move {
+                        let state = p2.state.lock().unwrap();
+                        let tracks: Vec<_> = state
+                            .liked_tracks_cache
+                            .iter()
+                            .filter(|t| t.source == source && t.artists.iter().any(|a| a.name.eq_ignore_ascii_case(&artist_name)))
+                            .cloned()
+                            .collect();
+                        if !tracks.is_empty() {
+                            page2.set_tracks(tracks);
+                        }
+                    });
+                } else {
+                    p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить артиста: {}", e)));
+                }
+            }
         }
     });
 }
@@ -1712,34 +1945,88 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
             f();
         });
         main.append(&b);
+        b
     };
 
     {
         let (p, t) = (player.clone(), track.clone());
-        add("media-playlist-consecutive-symbolic", "Волна по треку", Box::new(move || p.play_single_track(t.clone())));
+        let wave = add(
+            "media-playlist-consecutive-symbolic",
+            "Волна по треку",
+            Box::new(move || p.play_single_track(t.clone())),
+        );
+        // VK Mix не принимает ID отдельного трека как seed.
+        wave.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        let is_yt = t.source == TrackSource::YouTubeMusic || t.id.len() == 11 || p.providers.active_id() == ProviderId::YouTubeMusic;
-        add("dialog-error-symbolic", "Не нравится", Box::new(move || {
-            if is_yt {
-                let (p, t) = (p.clone(), t.clone());
-                glib::spawn_future_local(async move {
-                    if let Some(yt) = p.providers.get(ProviderId::YouTubeMusic) {
-                        let _ = yt.set_track_like(&t.id, false).await;
-                    }
-                    let _ = p.yt_client.dislike_track(&t.id).await;
-                    p.emit(PlayerUiEvent::StatusMessage("Трек скрыт из рекомендаций 👎".into()));
-                    let is_current = p.state.lock().unwrap().current_track.as_ref().map(|cur| cur.id == t.id).unwrap_or(false);
-                    if is_current {
-                        p.next_track();
-                    }
-                });
-            } else {
-                let id = t.id.clone();
-                run_api(&p, Some("Трек скрыт из рекомендаций 👎"), move |c, uid| async move { c.dislike_track(&uid, &id).await });
-            }
-        }));
+        let is_yt = t.source == TrackSource::YouTubeMusic
+            || t.id.len() == 11
+            || p.providers.active_id() == ProviderId::YouTubeMusic;
+        let is_vk = t.source == TrackSource::Vk;
+        add(
+            "dialog-error-symbolic",
+            "Не нравится",
+            Box::new(move || {
+                if is_vk {
+                    let (p, t) = (p.clone(), t.clone());
+                    glib::spawn_future_local(async move {
+                        let result = match p.providers.get(ProviderId::Vk) {
+                            Some(provider) => provider.set_track_dislike(&t.id).await,
+                            None => Err("Требуется вход во ВКонтакте".into()),
+                        };
+                        match result {
+                            Ok(()) => {
+                                p.emit(PlayerUiEvent::StatusMessage(
+                                    "Трек скрыт из рекомендаций 👎".into(),
+                                ));
+                                let is_current = p
+                                    .state
+                                    .lock()
+                                    .unwrap()
+                                    .current_track
+                                    .as_ref()
+                                    .map(|cur| cur.id == t.id)
+                                    .unwrap_or(false);
+                                if is_current {
+                                    p.next_track();
+                                }
+                            }
+                            Err(error) => p.emit(PlayerUiEvent::Error(format!(
+                                "Не удалось скрыть трек VK: {error}"
+                            ))),
+                        }
+                    });
+                } else if is_yt {
+                    let (p, t) = (p.clone(), t.clone());
+                    glib::spawn_future_local(async move {
+                        if let Some(yt) = p.providers.get(ProviderId::YouTubeMusic) {
+                            let _ = yt.set_track_like(&t.id, false).await;
+                        }
+                        let _ = p.yt_client.dislike_track(&t.id).await;
+                        p.emit(PlayerUiEvent::StatusMessage(
+                            "Трек скрыт из рекомендаций 👎".into(),
+                        ));
+                        let is_current = p
+                            .state
+                            .lock()
+                            .unwrap()
+                            .current_track
+                            .as_ref()
+                            .map(|cur| cur.id == t.id)
+                            .unwrap_or(false);
+                        if is_current {
+                            p.next_track();
+                        }
+                    });
+                } else {
+                    let id = t.id.clone();
+                    run_api(&p, Some("Трек скрыт из рекомендаций 👎"), move |c, uid| async move {
+                        c.dislike_track(&uid, &id).await
+                    });
+                }
+            }),
+        );
     }
 
     // «Добавить в плейлист» открывает вторую страницу с плейлистами пользователя
@@ -1844,12 +2131,18 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
             });
         });
     }
+    to_pl.set_visible(track.source != TrackSource::Vk);
     main.append(&to_pl);
 
     {
         let (p, t) = (player.clone(), track.clone());
         add("edit-copy-symbolic", "Скопировать ссылку", Box::new(move || {
-            let url = if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+            let url = if t.source == TrackSource::Vk {
+                format!(
+                    "https://vk.com/audio{}",
+                    t.id.strip_prefix("vk:").unwrap_or(&t.id)
+                )
+            } else if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
                 format!("https://music.youtube.com/watch?v={}", t.id)
             } else {
                 match t.albums.first() {
@@ -1865,7 +2158,7 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        add("folder-download-symbolic", "Скачать", Box::new(move || {
+        let download = add("folder-download-symbolic", "Скачать", Box::new(move || {
             p.emit(PlayerUiEvent::StatusMessage("Скачивание…".into()));
             let (p, t) = (p.clone(), t.clone());
             glib::spawn_future_local(async move {
@@ -1883,10 +2176,11 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                 }
             });
         }));
+        download.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        add("folder-download-symbolic", "Сохранить офлайн (в приложении)", Box::new(move || {
+        let offline = add("folder-download-symbolic", "Сохранить офлайн (в приложении)", Box::new(move || {
             if crate::cache::offline_audio_path(&t.id).is_some() {
                 crate::cache::remove_offline(&t.id);
                 p.emit(PlayerUiEvent::StatusMessage("Удалено из офлайна".into()));
@@ -1909,10 +2203,11 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                 }
             });
         }));
+        offline.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        add("video-x-generic-symbolic", "Трейлер", Box::new(move || {
+        let trailer = add("video-x-generic-symbolic", "Трейлер", Box::new(move || {
             if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
                 let url = format!("https://www.youtube.com/watch?v={}", t.id);
                 let _ = std::process::Command::new("xdg-open").arg(url).spawn();
@@ -1930,10 +2225,11 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                 });
             }
         }));
+        trailer.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        add("code-symbolic", "Скопировать HTML-код", Box::new(move || {
+        let html = add("code-symbolic", "Скопировать HTML-код", Box::new(move || {
             if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
                 let html = format!(
                     r#"<iframe width="560" height="315" src="https://www.youtube-nocookie.com/embed/{}" title="{}" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>"#,
@@ -1959,6 +2255,7 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                 }
             }
         }));
+        html.set_visible(track.source != TrackSource::Vk);
     }
     {
         let (p, t, anchor) = (player.clone(), track.clone(), menu.clone());
@@ -1967,11 +2264,12 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     // переходы нужны экрану со стеком страниц; без него (например, добавление в плейлист на лету) их нет
     if let (Some((stack, page)), Some(album)) = (nav, track.albums.first().cloned()) {
         let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
-        add("media-optical-symbolic", "Перейти к альбому", Box::new(move || open_album(&p, &stack, &page, &album)));
+        let album_nav = add("media-optical-symbolic", "Перейти к альбому", Box::new(move || open_album(&p, &stack, &page, &album)));
+        album_nav.set_visible(track.source != TrackSource::Vk);
     }
     if let (Some((stack, page)), Some(artist)) = (nav, track.artists.first()) {
-        let (p, stack, page, id) = (player.clone(), stack.clone(), page.clone(), artist.id.clone());
-        add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || open_artist(&p, &stack, &page, id.clone())));
+        let (p, stack, page, artist, source) = (player.clone(), stack.clone(), page.clone(), artist.clone(), track.source);
+        add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || open_artist(&p, &stack, &page, artist.clone(), source)));
     }
 
     bx.append(&menu);
@@ -2043,16 +2341,43 @@ fn show_track_credits(player: &PlayerManager, anchor: &impl IsA<gtk4::Widget>, t
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));
 
-    if track.source == TrackSource::YouTubeMusic || track.id.len() == 11 {
+    if track.source == TrackSource::YouTubeMusic
+        || track.source == TrackSource::Vk
+        || track.id.len() == 11
+    {
         content.remove(&status);
         let duration = track.formatted_duration();
-        let album = track.albums.first().and_then(|a| a.title.as_deref()).unwrap_or("Сингл");
-        let link = format!("https://music.youtube.com/watch?v={}", track.id);
+        let album = track
+            .albums
+            .first()
+            .and_then(|a| a.title.as_deref())
+            .unwrap_or("Сингл");
+        let (service, link) = match track.source {
+            TrackSource::YouTubeMusic => (
+                "YouTube Music",
+                format!("https://music.youtube.com/watch?v={}", track.id),
+            ),
+            TrackSource::Vk => (
+                "ВКонтакте",
+                format!(
+                    "https://vk.com/audio{}",
+                    track.id.strip_prefix("vk:").unwrap_or(&track.id)
+                ),
+            ),
+            TrackSource::Yandex => unreachable!(),
+        };
         let items: [(&str, String); 6] = [
             ("Исполнитель", track.artists_string()),
             ("Альбом", album.to_string()),
-            ("Длительность", if duration.is_empty() { "—".to_string() } else { duration }),
-            ("Сервис", "YouTube Music".to_string()),
+            (
+                "Длительность",
+                if duration.is_empty() {
+                    "—".to_string()
+                } else {
+                    duration
+                },
+            ),
+            ("Сервис", service.to_string()),
             ("ID", track.id.clone()),
             ("Ссылка", link),
         ];
@@ -2243,7 +2568,7 @@ mod ambient_tests {
 
 /// Загружает картинку в `Picture` (тот же кэш в памяти, что у обложек)
 fn load_picture(pic: &gtk4::Picture, url: String) {
-    if let Some(tex) = COVERS.with(|c| c.borrow().get(&url).cloned()) {
+    if let Some(tex) = COVERS.with(|c| c.borrow_mut().get(&url)) {
         pic.set_paintable(Some(&tex));
         return;
     }

@@ -175,6 +175,7 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
             let target_id = match prov {
                 "yandex" => Some(crate::api::provider::ProviderId::Yandex),
                 "ytmusic" | "youtube" => Some(crate::api::provider::ProviderId::YouTubeMusic),
+                "vk" => Some(crate::api::provider::ProviderId::Vk),
                 _ => None,
             };
             if let Some(id) = target_id {
@@ -385,6 +386,14 @@ mod tests {
         let resp_back = handle_command(&player, &cmd_back).await;
         assert_eq!(resp_back["ok"], true);
         assert_eq!(player.providers.active_id(), crate::api::provider::ProviderId::Yandex);
+
+        let vk_prov = crate::api::vk::provider::VkProvider::new("test_token", 12345).unwrap();
+        player.register_vk_provider(vk_prov);
+
+        let cmd_vk = serde_json::json!({ "cmd": "switch_provider", "provider": "vk" });
+        let resp_vk = handle_command(&player, &cmd_vk).await;
+        assert_eq!(resp_vk["ok"], true);
+        assert_eq!(player.providers.active_id(), crate::api::provider::ProviderId::Vk);
     }
 
     #[tokio::test]

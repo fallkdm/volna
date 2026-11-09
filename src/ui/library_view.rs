@@ -166,12 +166,38 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
             let (albums_box, albums_row) = (albums_box.clone(), albums_row.clone());
             let (offline_box, offline_list) = (offline_box.clone(), offline_list.clone());
 
-            // офлайн-треки показываются сразу и без сети
+            // офлайн-треки показываются сразу и без сети, отфильтрованные по активному провайдеру
             offline_list.remove_all();
-            let saved = crate::cache::list_offline();
+            let active_id = p.providers.active_id();
+            let saved: Vec<crate::api::models::Track> = crate::cache::list_offline()
+                .into_iter()
+                .filter(|track| match active_id {
+                    crate::api::provider::ProviderId::Vk => {
+                        track.source == crate::api::models::TrackSource::Vk
+                    }
+                    crate::api::provider::ProviderId::YouTubeMusic => {
+                        track.source == crate::api::models::TrackSource::YouTubeMusic
+                    }
+                    crate::api::provider::ProviderId::Yandex => {
+                        track.source == crate::api::models::TrackSource::Yandex
+                    }
+                })
+                .collect();
             for (i, track) in saved.iter().enumerate() {
                 let (p, queue) = (p.clone(), saved.clone());
-                let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play_from(queue.clone(), i, Some(PlaySource::new("Загруженные", Some(SourceTarget::Library)))) });
+                let row = track_row(track, {
+                    let (p, queue) = (p.clone(), queue.clone());
+                    move || {
+                        p.set_queue_and_play_from(
+                            queue.clone(),
+                            i,
+                            Some(PlaySource::new(
+                                "Загруженные",
+                                Some(SourceTarget::Library),
+                            )),
+                        )
+                    }
+                });
                 row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                 offline_list.append(&row);
             }
@@ -204,9 +230,9 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
                 yt_login_btn.set_visible(false);
                 status.set_text("");
-                status.set_visible(false);
-
-                ensure_liked(&p).await;
+                if is_yandex {
+                    ensure_liked(&p).await;
+                }
 
                 let (liked_res, playlists_res, albums_res, total_cnt_opt) = tokio::join!(
                     provider.get_liked_tracks(),
@@ -275,12 +301,12 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
                 if let Ok(playlists) = playlists_res {
                     clear_box(&playlists_row);
-                    let uid = {
-                        let client = p.client.lock().unwrap().clone();
-                        client.get_uid().await.unwrap_or_else(|_| "user".to_string())
-                    };
 
                     if is_yandex {
+                        let uid = {
+                            let client = p.client.lock().unwrap().clone();
+                            client.get_uid().await.unwrap_or_else(|_| "user".to_string())
+                        };
                         let (p2, stack2, page2, row2, uid2) = (p.clone(), stack.clone(), page.clone(), playlists_row.clone(), uid.clone());
                         let new_tile = new_playlist_tile(TILE_SIZE, {
                             let anchor = playlists_row.clone();

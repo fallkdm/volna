@@ -161,13 +161,13 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "volna_switch_provider",
-            "description": "Переключение музыкального сервиса (yandex или ytmusic)",
+            "description": "Переключение музыкального сервиса (yandex, ytmusic или vk)",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "enum": ["yandex", "ytmusic"]
+                        "enum": ["yandex", "ytmusic", "vk"]
                     }
                 },
                 "required": ["provider"]

@@ -1,0 +1,6 @@
+{
+  "error": "need_captcha",
+  "error_description": "captcha required",
+  "captcha_sid": "1234567890",
+  "captcha_img": "https://api.example.invalid/captcha.php?sid=1234567890"
+}

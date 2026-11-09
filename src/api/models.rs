@@ -142,6 +142,24 @@ pub enum TrackSource {
     Vk,
 }
 
+impl TrackSource {
+    pub fn service_name(&self) -> &'static str {
+        match self {
+            TrackSource::Yandex => "Яндекс Музыка",
+            TrackSource::YouTubeMusic => "YouTube Music",
+            TrackSource::Vk => "ВКонтакте",
+        }
+    }
+
+    pub fn source_badge(&self) -> &'static str {
+        match self {
+            TrackSource::Yandex => "🌊",
+            TrackSource::YouTubeMusic => "🔴",
+            TrackSource::Vk => "🔵",
+        }
+    }
+}
+
 /// Трек
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Track {
@@ -228,11 +246,12 @@ impl DerivedColors {
 impl Track {
     /// Бейдж сервиса-источника трека
     pub fn source_badge(&self) -> &'static str {
-        match self.source {
-            TrackSource::Yandex => "🌊",
-            TrackSource::YouTubeMusic => "🔴",
-            TrackSource::Vk => "🔵",
-        }
+        self.source.source_badge()
+    }
+
+    /// Человекочитаемое имя сервиса-источника трека
+    pub fn service_name(&self) -> &'static str {
+        self.source.service_name()
     }
 
     /// Название для Pango-разметки: версия («Slowed») идёт следом приглушённым цветом

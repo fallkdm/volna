@@ -281,11 +281,14 @@ pub fn audio_cache_dir() -> PathBuf {
     dir
 }
 
-/// Проверяет наличие файлов mp3, opus или m4a в кэше размером > 128 КБ
+/// Проверяет наличие файлов flac, mka, mp3, opus или m4a в кэше размером > 128 КБ
 pub fn cached_audio_path(track_id: &str) -> Option<PathBuf> {
-    let dir = audio_cache_dir();
+    cached_audio_path_in(&audio_cache_dir(), track_id)
+}
+
+pub fn cached_audio_path_in(dir: &std::path::Path, track_id: &str) -> Option<PathBuf> {
     let s_id = safe_id(track_id);
-    for ext in ["mp3", "opus", "m4a"] {
+    for ext in ["flac", "mka", "mp3", "opus", "m4a"] {
         let p = dir.join(format!("{}.{}", s_id, ext));
         if let Ok(meta) = p.metadata() {
             if meta.is_file() && meta.len() > 128 * 1024 {
@@ -308,14 +311,22 @@ pub fn final_audio_cache_path(track_id: &str, ext: &str) -> PathBuf {
 
 /// Удаляет старые файлы кэша аудио по алгоритму LRU, пока общий размер не станет <= 75% от max_bytes
 pub fn clean_audio_cache_lru(max_bytes: u64) {
-    let dir = audio_cache_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    clean_audio_cache_lru_in(&audio_cache_dir(), max_bytes);
+}
+
+pub fn clean_audio_cache_lru_in(dir: &std::path::Path, max_bytes: u64) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
     let mut total_bytes: u64 = 0;
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.ends_with(".part") {
+            continue;
+        }
         if let Ok(meta) = entry.metadata() {
             if meta.is_file() {
                 let size = meta.len();
@@ -448,34 +459,55 @@ mod audio_cache_tests {
 
     #[test]
     fn test_audio_cache_paths_and_clean() {
-        let _dir = audio_cache_dir();
+        let dir = std::env::temp_dir().join(format!("volna-cache-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
         let track_id = "test_audio_track_999";
-        let final_path = final_audio_cache_path(track_id, "mp3");
-        let temp_path = temp_audio_cache_path(track_id, "mp3");
-        assert!(temp_path.to_string_lossy().ends_with(".part"));
-        assert!(final_path.to_string_lossy().ends_with(".mp3"));
+        let default_final = final_audio_cache_path(track_id, "mp3");
+        let default_temp = temp_audio_cache_path(track_id, "mp3");
+        assert!(default_temp.to_string_lossy().ends_with(".part"));
+        assert!(default_final.to_string_lossy().ends_with(".mp3"));
 
-        // Удалим перед тестом если остался
-        let _ = std::fs::remove_file(&final_path);
-        let _ = std::fs::remove_file(&temp_path);
+        let final_path = dir.join(format!("{}.mp3", track_id));
+        let temp_path = dir.join(format!("{}.mp3.part", track_id));
 
-        assert!(cached_audio_path(track_id).is_none());
+        assert!(cached_audio_path_in(&dir, track_id).is_none());
 
-        // Файл слишком маленький (меньше 128 КБ) -> cached_audio_path должен вернуть None
+        // Файл слишком маленький (меньше 128 КБ) -> cached_audio_path_in должен вернуть None
         let small_data = vec![0u8; 100 * 1024];
         std::fs::write(&final_path, &small_data).unwrap();
-        assert!(cached_audio_path(track_id).is_none());
+        assert!(cached_audio_path_in(&dir, track_id).is_none());
 
         // Файл больше 128 КБ -> Some(path)
         let valid_data = vec![0u8; 150 * 1024];
         std::fs::write(&final_path, &valid_data).unwrap();
-        assert_eq!(cached_audio_path(track_id), Some(final_path.clone()));
+        assert_eq!(cached_audio_path_in(&dir, track_id), Some(final_path.clone()));
 
-        // Проверим clean_audio_cache_lru
-        clean_audio_cache_lru(100 * 1024); // лимит 100 КБ, наш файл 150 КБ -> должен очиститься
-        assert!(cached_audio_path(track_id).is_none());
+        // Проверим clean_audio_cache_lru_in:
+        // создаем .part файл и убеждаемся, что он не удаляется при очистке
+        std::fs::write(&temp_path, &valid_data).unwrap();
+        assert!(temp_path.exists());
 
-        let _ = std::fs::remove_file(&final_path);
+        clean_audio_cache_lru_in(&dir, 100 * 1024); // лимит 100 КБ, наш файл 150 КБ -> должен очиститься
+        assert!(cached_audio_path_in(&dir, track_id).is_none());
+        assert!(!final_path.exists());
+        assert!(temp_path.exists(), "временный файл .part не должен удаляться при LRU-очистке");
+
+        let _ = std::fs::remove_file(&temp_path);
+
+        // Проверка mka
+        let mka_path = dir.join(format!("{}.mka", track_id));
+        std::fs::write(&mka_path, &valid_data).unwrap();
+        assert_eq!(cached_audio_path_in(&dir, track_id), Some(mka_path.clone()));
+        let _ = std::fs::remove_file(&mka_path);
+
+        // Проверка flac
+        let flac_path = dir.join(format!("{}.flac", track_id));
+        std::fs::write(&flac_path, &valid_data).unwrap();
+        assert_eq!(cached_audio_path_in(&dir, track_id), Some(flac_path.clone()));
+        let _ = std::fs::remove_file(&flac_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

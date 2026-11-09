@@ -1,22 +1,69 @@
 use gtk4::prelude::*;
-use gtk4::{Box as GtkBox, Button, Entry, Image, Orientation};
+use gtk4::{Box as GtkBox, Button, Image, Orientation};
 use libadwaita::prelude::*;
 use libadwaita::{
     ActionRow, ComboRow, EntryRow, PasswordEntryRow, PreferencesDialog, PreferencesGroup,
     PreferencesPage, SpinRow, SwitchRow,
 };
+#[allow(deprecated)]
+use libadwaita::PreferencesWindow;
 
 use crate::api::auth::{
     load_clips, load_crossfade, load_discord, load_genius_token, load_lastfm_key, load_nav_style,
-    load_player_layout, load_quality, load_theme_accent, load_token, save_crossfade,
-    save_discord_client_id, save_discord_rpc, save_genius_token, save_lastfm_key, save_nav_style,
-    save_player_layout, save_quality, save_theme_accent, save_token,
+    load_pet_enabled, load_pet_style, load_player_layout, load_quality, load_theme_accent, load_token,
+    save_crossfade, save_discord_client_id, save_discord_rpc, save_genius_token, save_lastfm_key,
+    save_nav_style, save_pet_enabled, save_pet_style, save_player_layout, save_quality,
+    save_theme_accent, save_token,
 };
 use crate::cache::{clear_clips_cache, clear_covers_cache, clips_cache_size, covers_cache_size};
 use crate::player::PlayerManager;
 
 fn size_text(bytes: u64) -> String {
     format!("{:.1} МБ", bytes as f64 / 1_048_576.0)
+}
+
+/// Реальный RSS процесса из /proc/self/status (в байтах).
+fn process_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+// Открытое окно настроек: повторный клик по шестерёнке поднимает его,
+// а не создаёт второе такое же.
+thread_local! {
+    static SETTINGS_WINDOW: std::cell::RefCell<Option<glib::WeakRef<PreferencesWindow>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Классы акцентов, которые понимает style.css для диалогов.
+const ACCENT_CLASSES: [&str; 7] = [
+    "accent-dynamic",
+    "accent-spotify",
+    "accent-ruby",
+    "accent-sunset",
+    "accent-violet",
+    "accent-ocean",
+    "accent-monochrome",
+];
+
+/// Красит окно/диалог настроек в палитру приложения и акцент текущей темы.
+/// Серый Adwaita-вид заменяют CSS-переменные в `.preferences`.
+pub(crate) fn apply_dialog_theme(widget: &impl IsA<gtk4::Widget>) {
+    apply_dialog_accent(widget, &load_theme_accent());
+}
+
+fn apply_dialog_accent(widget: &impl IsA<gtk4::Widget>, accent: &str) {
+    let widget = widget.as_ref();
+    for class in ACCENT_CLASSES {
+        widget.remove_css_class(class);
+    }
+    widget.add_css_class(&format!("accent-{accent}"));
 }
 
 /// Строка в стиле оригинала: название, подпись и стрелка справа
@@ -27,15 +74,55 @@ fn nav_row(title: &str, subtitle: &str) -> ActionRow {
 }
 
 /// Окно настроек. `open_wave_settings` открывает панель настройки волны на экране «Волна».
+#[allow(deprecated)]
 pub fn show_preferences_dialog(
     parent: &impl IsA<gtk4::Widget>,
     player: &PlayerManager,
     open_wave_settings: impl Fn() + 'static,
 ) {
-    let dialog = PreferencesDialog::new();
-    dialog.set_title("Настройки");
+    if let Some(existing) = SETTINGS_WINDOW.with(|cell| {
+        cell.borrow().as_ref().and_then(|weak| weak.upgrade())
+    }) {
+        existing.present();
+        return;
+    }
 
+    // Настоящее окно настроек, а не затемняющий оверлей поверх приложения.
+    let dialog = PreferencesWindow::new();
+    dialog.set_title(Some("Настройки"));
+    dialog.set_default_width(760);
+    dialog.set_default_height(820);
+    dialog.set_modal(false);
+    dialog.set_destroy_with_parent(true);
+    if let Some(window) = parent.as_ref().root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+        if let Some(app) = window.application() {
+            dialog.set_application(Some(&app));
+        }
+        dialog.set_transient_for(Some(&window));
+    }
+    apply_dialog_theme(&dialog);
+    SETTINGS_WINDOW.with(|cell| *cell.borrow_mut() = Some(dialog.downgrade()));
+
+    // Нативные страницы настроек: заголовки и иконки в шапке диалога
     let page = PreferencesPage::new();
+    page.set_title("Звук");
+    page.set_icon_name(Some("media-playback-start-symbolic"));
+
+    let appearance_page = PreferencesPage::new();
+    appearance_page.set_title("Вид");
+    appearance_page.set_icon_name(Some("applications-graphics-symbolic"));
+
+    let accounts_page = PreferencesPage::new();
+    accounts_page.set_title("Вход");
+    accounts_page.set_icon_name(Some("avatar-default-symbolic"));
+
+    let integrations_page = PreferencesPage::new();
+    integrations_page.set_title("Сервисы");
+    integrations_page.set_icon_name(Some("network-transmit-receive-symbolic"));
+
+    let about_page = PreferencesPage::new();
+    about_page.set_title("О Волне");
+    about_page.set_icon_name(Some("help-about-symbolic"));
 
     // Волна: настроение, характер и язык настраиваются на самом экране волны
     let wave_group = PreferencesGroup::new();
@@ -50,7 +137,7 @@ pub fn show_preferences_dialog(
         });
     }
     wave_group.add(&wave_row);
-    page.add(&wave_group);
+    appearance_page.add(&wave_group);
 
     // Внешний вид
     let appearance_group = PreferencesGroup::new();
@@ -60,7 +147,7 @@ pub fn show_preferences_dialog(
     let nav_style_row = ComboRow::builder()
         .title("Режим интерфейса")
         .subtitle("Расположение навигации: оригинальный верхний бар или левый сайдбар")
-        .model(&gtk4::StringList::new(&["Оригинальный (Wave-First)", "Spotify-Style"]))
+        .model(&gtk4::StringList::new(&["Wave-First", "Spotify-Style"]))
         .build();
     nav_style_row.set_selected(match load_nav_style().as_str() {
         "spotify" => 1,
@@ -83,7 +170,7 @@ pub fn show_preferences_dialog(
     let layout_row = ComboRow::builder()
         .title("Стиль плеера")
         .subtitle("Форма панели воспроизведения: парящая капсула или прижатая полоса")
-        .model(&gtk4::StringList::new(&["Парящий остров", "Прижатый док (Spotify)"]))
+        .model(&gtk4::StringList::new(&["Парящий", "Док"]))
         .build();
     layout_row.set_selected(match load_player_layout().as_str() {
         "dock" => 1,
@@ -107,13 +194,13 @@ pub fn show_preferences_dialog(
         .title("Цветовой акцент")
         .subtitle("Цвет подсветки, элементов плеера и линий волны")
         .model(&gtk4::StringList::new(&[
-            "Динамический (по обложке)",
-            "Spotify Green",
-            "Ruby Red",
-            "Sunset Orange",
-            "Cyber Violet",
-            "Deep Ocean",
-            "Белый монохром",
+            "По обложке",
+            "Spotify",
+            "Ruby",
+            "Sunset",
+            "Violet",
+            "Ocean",
+            "Монохром",
         ]))
         .build();
     accent_row.set_selected(match load_theme_accent().as_str() {
@@ -127,6 +214,7 @@ pub fn show_preferences_dialog(
     });
     {
         let p = player.clone();
+        let d_weak = dialog.downgrade();
         accent_row.connect_selected_notify(move |row| {
             let val = match row.selected() {
                 1 => "spotify",
@@ -138,12 +226,72 @@ pub fn show_preferences_dialog(
                 _ => "dynamic",
             };
             let _ = save_theme_accent(val);
+            if let Some(d) = d_weak.upgrade() {
+                apply_dialog_accent(&d, val);
+            }
             p.emit(crate::player::PlayerUiEvent::ThemeAccentChanged(val.to_string()));
         });
     }
     appearance_group.add(&accent_row);
 
-    page.add(&appearance_group);
+    appearance_page.add(&appearance_group);
+
+    // Питомец на панели плеера: маленькая зверушка, которая гуляет по острову
+    // и прыгает в такт басу из аудиоанализатора.
+    let pet_group = PreferencesGroup::new();
+    pet_group.set_title("Питомец");
+    pet_group.set_description(Some(
+        "Маленький житель панели плеера: гуляет по верхнему краю и реагирует на бит",
+    ));
+
+    let pet_switch = SwitchRow::builder()
+        .title("Питомец на плеере")
+        .subtitle("Ходит по плееру и прыгает в такт музыке")
+        .active(load_pet_enabled())
+        .build();
+
+    let pet_style_row = ComboRow::builder()
+        .title("Кто живёт на плеере")
+        .model(&gtk4::StringList::new(&["Волнёнок", "Кот", "Слизень"]))
+        .build();
+    pet_style_row.set_selected(match load_pet_style().as_str() {
+        "cat" => 1,
+        "slime" => 2,
+        _ => 0,
+    });
+    pet_style_row.set_sensitive(pet_switch.is_active());
+    {
+        let p = player.clone();
+        let style_row = pet_style_row.clone();
+        pet_switch.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            let _ = save_pet_enabled(enabled);
+            style_row.set_sensitive(enabled);
+            p.emit(crate::player::PlayerUiEvent::PetChanged {
+                enabled,
+                style: load_pet_style(),
+            });
+        });
+    }
+    {
+        let p = player.clone();
+        let switch = pet_switch.clone();
+        pet_style_row.connect_selected_notify(move |row| {
+            let style = match row.selected() {
+                1 => "cat",
+                2 => "slime",
+                _ => "wave",
+            };
+            let _ = save_pet_style(style);
+            p.emit(crate::player::PlayerUiEvent::PetChanged {
+                enabled: switch.is_active(),
+                style: style.to_string(),
+            });
+        });
+    }
+    pet_group.add(&pet_switch);
+    pet_group.add(&pet_style_row);
+    appearance_page.add(&pet_group);
 
     // Воспроизведение: качество звука и плавный переход
     let playback_group = PreferencesGroup::new();
@@ -151,8 +299,12 @@ pub fn show_preferences_dialog(
 
     let quality_row = ComboRow::builder()
         .title("Качество звука")
-        .subtitle("Яндекс отдаёт сторонним клиентам только MP3 (сейчас до 192 кбит/с); lossless недоступен. Применится со следующего трека")
-        .model(&gtk4::StringList::new(&["Превосходное", "Оптимальное", "Экономичное"]))
+        .subtitle("FLAC 24-бит, если доступен на сервере, иначе максимальный MP3. Со следующего трека")
+        .model(&gtk4::StringList::new(&[
+            "Lossless FLAC",
+            "MP3 320 кбит/с",
+            "MP3 192 кбит/с",
+        ]))
         .build();
     quality_row.set_selected(match load_quality().as_str() {
         "balanced" => 1,
@@ -163,7 +315,7 @@ pub fn show_preferences_dialog(
         let _ = save_quality(match row.selected() {
             1 => "balanced",
             2 => "economy",
-            _ => "best",
+            _ => "lossless",
         });
     });
     playback_group.add(&quality_row);
@@ -272,72 +424,88 @@ pub fn show_preferences_dialog(
     discord_group.add(&discord_row);
     // свой ID нужен только пока у приложения нет встроенного; потом это скрытая «расширенная» настройка
     discord_group.add(&discord_id_row);
-    page.add(&discord_group);
+    integrations_page.add(&discord_group);
 
     // Память
     let memory_group = PreferencesGroup::new();
-    let clear_row = nav_row("Очистить память", &format!("Обложки и клипы: {}", size_text(covers_cache_size() + clips_cache_size())));
+    memory_group.set_title("Память");
+    memory_group.set_description(Some(
+        "Кэш текстур обложек ограничен 16 МБ: старые картинки вытесняются автоматически",
+    ));
+    let rss_row = ActionRow::builder()
+        .title("Оперативная память")
+        .subtitle(match process_rss_bytes() {
+            Some(bytes) => format!("Сейчас используется: {}", size_text(bytes)),
+            None => "Недоступно".to_string(),
+        })
+        .build();
+    memory_group.add(&rss_row);
+    let (cover_bytes, cover_budget) = crate::ui::collection::cover_cache_usage();
+    let covers_row = ActionRow::builder()
+        .title("Текстуры обложек")
+        .subtitle(format!(
+            "{} из {} — старые вытесняются автоматически",
+            size_text(cover_bytes as u64),
+            size_text(cover_budget as u64)
+        ))
+        .build();
+    memory_group.add(&covers_row);
+    let clear_row = nav_row(
+        "Очистить кэш",
+        &format!(
+            "Обложки и клипы на диске: {}",
+            size_text(covers_cache_size() + clips_cache_size())
+        ),
+    );
     {
         let p = player.clone();
         clear_row.connect_activated(move |row| {
-            let freed = clear_covers_cache() + clear_clips_cache();
-            row.set_subtitle("Обложки и клипы: 0.0 МБ");
-            p.emit(crate::player::PlayerUiEvent::StatusMessage(format!("Освобождено {}", size_text(freed))));
+            let freed_disk = clear_covers_cache() + clear_clips_cache();
+            let freed_mem = crate::ui::collection::clear_cover_memory_cache();
+            crate::trim_allocator();
+            row.set_subtitle("Обложки и клипы на диске: 0.0 МБ");
+            p.emit(crate::player::PlayerUiEvent::StatusMessage(format!(
+                "Освобождено {} на диске и {} в памяти",
+                size_text(freed_disk),
+                size_text(freed_mem as u64)
+            )));
         });
     }
     memory_group.add(&clear_row);
-    page.add(&memory_group);
+    integrations_page.add(&memory_group);
 
     // Авторизация в Яндекс Музыке
     let auth_group = PreferencesGroup::new();
     auth_group.set_title("Авторизация");
 
-    let token_row = ActionRow::builder()
+    auth_group.set_description(Some(
+        "OAuth токен для персональной Волны и высокого битрейта. Хранится в ~/.config/volna/config.json",
+    ));
+    let token_row = PasswordEntryRow::builder()
         .title("OAuth токен")
-        .subtitle("Для персональной Волны и высокого битрейта. Хранится в ~/.config/volna/config.json")
+        .show_apply_button(true)
         .build();
-
-    let entry_box = GtkBox::new(Orientation::Horizontal, 8);
-    let token_entry = Entry::new();
-    token_entry.set_width_chars(24);
-    token_entry.set_visibility(false);
-    token_entry.set_placeholder_text(Some("y0_AgAAAA..."));
-    token_entry.set_valign(gtk4::Align::Center);
-
     if let Some(saved) = load_token() {
-        token_entry.set_text(&saved);
+        token_row.set_text(&saved);
     }
-
-    let save_btn = Button::with_label("Сохранить");
-    save_btn.add_css_class("suggested-action");
-    save_btn.add_css_class("pill");
-    save_btn.set_valign(gtk4::Align::Center);
-
-    let player_clone = player.clone();
-    let entry_clone = token_entry.clone();
-    let dialog_weak = dialog.downgrade();
-    save_btn.connect_clicked(move |_| {
-        let new_token = entry_clone.text().to_string();
-        if !new_token.is_empty() {
-            let _ = save_token(&new_token);
-            if let Ok(mut client) = player_clone.client.lock() {
-                client.set_token(Some(new_token));
+    {
+        let player_clone = player.clone();
+        token_row.connect_apply(move |row| {
+            let new_token = row.text().to_string();
+            if !new_token.is_empty() {
+                let _ = save_token(&new_token);
+                if let Ok(mut client) = player_clone.client.lock() {
+                    client.set_token(Some(new_token));
+                }
+                player_clone.emit(crate::player::PlayerUiEvent::StatusMessage(
+                    "Токен сохранён! Загружаем персональную Волну...".into(),
+                ));
+                player_clone.fetch_wave_tracks("onyourwave");
             }
-            player_clone.emit(crate::player::PlayerUiEvent::StatusMessage(
-                "Токен сохранен! Загружаем персональную Волну...".into(),
-            ));
-            player_clone.fetch_wave_tracks("onyourwave");
-        }
-        if let Some(d) = dialog_weak.upgrade() {
-            d.close();
-        }
-    });
-
-    entry_box.append(&token_entry);
-    entry_box.append(&save_btn);
-    token_row.add_suffix(&entry_box);
+        });
+    }
     auth_group.add(&token_row);
-    page.add(&auth_group);
+    accounts_page.add(&auth_group);
 
     // Сервисы: YouTube Music
     let services_group = PreferencesGroup::new();
@@ -408,7 +576,7 @@ pub fn show_preferences_dialog(
     yt_btn_box.append(&yt_logout_btn);
     yt_status_row.add_suffix(&yt_btn_box);
     services_group.add(&yt_status_row);
-    page.add(&services_group);
+    accounts_page.add(&services_group);
 
     // Genius: справка об исполнителях, которых нет в Википедии
     let genius_group = PreferencesGroup::new();
@@ -433,7 +601,7 @@ pub fn show_preferences_dialog(
         let _ = save_lastfm_key(&row.text());
     });
     genius_group.add(&lastfm_row);
-    page.add(&genius_group);
+    integrations_page.add(&genius_group);
 
     // О приложении
     let about_group = PreferencesGroup::new();
@@ -449,10 +617,14 @@ pub fn show_preferences_dialog(
         .subtitle(format!("Волна {}", env!("CARGO_PKG_VERSION")))
         .build();
     about_group.add(&about_row);
-    page.add(&about_group);
+    about_page.add(&about_group);
 
     dialog.add(&page);
-    dialog.present(Some(parent));
+    dialog.add(&appearance_page);
+    dialog.add(&accounts_page);
+    dialog.add(&integrations_page);
+    dialog.add(&about_page);
+    dialog.present();
 }
 
 /// Отображает диалог входа по Cookie для YouTube Music
@@ -463,6 +635,7 @@ pub fn show_ytmusic_auth_dialog(
 ) {
     let dialog = PreferencesDialog::new();
     dialog.set_title("Вход в YouTube Music");
+    apply_dialog_theme(&dialog);
 
     let page = PreferencesPage::new();
     let on_success = std::rc::Rc::new(on_success);

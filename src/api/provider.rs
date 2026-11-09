@@ -10,11 +10,32 @@ pub enum ProviderId {
     Vk,
 }
 
+impl From<ProviderId> for crate::api::models::TrackSource {
+    fn from(id: ProviderId) -> Self {
+        match id {
+            ProviderId::Yandex => crate::api::models::TrackSource::Yandex,
+            ProviderId::YouTubeMusic => crate::api::models::TrackSource::YouTubeMusic,
+            ProviderId::Vk => crate::api::models::TrackSource::Vk,
+        }
+    }
+}
+
+/// Чип выдачи станции: подпись и вариант сида, который она открывает
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StationChip {
+    /// Подпись чипа как её отдаёт сервис
+    pub label: String,
+    /// Идентификатор варианта станции
+    pub playlist_id: String,
+}
+
 /// Порция треков станции (радио / волны)
 #[derive(Debug, Clone)]
 pub struct StationBatch {
     pub batch_id: String,
     pub tracks: Vec<Track>,
+    /// Чипы, которые сервис предлагает вместе с этой порцией (может быть пусто)
+    pub chips: Vec<StationChip>,
 }
 
 /// События обратной связи воспроизведения для радиостанции
@@ -71,6 +92,22 @@ pub trait MusicProvider: Send + Sync {
 
     /// Получение плейлистов пользователя
     async fn get_playlists(&self) -> Result<Vec<Playlist>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Получение треков плейлиста, если провайдер поддерживает эту операцию.
+    async fn get_playlist_tracks(
+        &self,
+        _playlist: &Playlist,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("Открытие плейлистов не поддерживается этим провайдером".into())
+    }
+
+    /// Получение треков альбома, если провайдер поддерживает эту операцию.
+    async fn get_album_tracks(
+        &self,
+        _album_id: &str,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("Открытие альбомов не поддерживается этим провайдером".into())
+    }
 
     /// Получение порции треков станции
     async fn get_station_tracks(&self, station_id: &str, batch_id: Option<&str>) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>>;
@@ -165,6 +202,15 @@ impl MusicProvider for YandexMusicClient {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
+    async fn get_album_tracks(
+        &self,
+        album_id: &str,
+    ) -> Result<Vec<Track>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_album_tracks(album_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
     async fn get_station_tracks(&self, station_id: &str, _batch_id: Option<&str>) -> Result<StationBatch, Box<dyn std::error::Error + Send + Sync>> {
         let res = self
             .get_station_tracks(station_id)
@@ -174,6 +220,7 @@ impl MusicProvider for YandexMusicClient {
         Ok(StationBatch {
             batch_id: res.batch_id.unwrap_or_default(),
             tracks,
+            chips: Vec::new(),
         })
     }
 

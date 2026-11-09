@@ -14,7 +14,7 @@ use libadwaita::{
 use crate::api::models::{parse_lrc, LrcLine};
 use crate::api::provider::ProviderId;
 use crate::player::{PlayerManager, PlayerUiEvent, RepeatMode};
-use super::auth_dialog::show_auth_dialog;
+use super::auth_dialog::{show_auth_dialog, show_vk_api_captcha_dialog, show_vk_auth_dialog};
 use super::floating_island::{create_floating_island, FloatingIslandWidgets};
 use super::library_view::create_library_view;
 use super::preferences_dialog::{show_preferences_dialog, show_ytmusic_auth_dialog};
@@ -295,7 +295,8 @@ impl VolnaWindow {
         let cur_prov = player.providers.active_id();
         let (initial_icon, initial_label) = match cur_prov {
             crate::api::provider::ProviderId::YouTubeMusic => ("🔴", "YouTube Music"),
-            _ => ("🌊", "Яндекс"),
+            crate::api::provider::ProviderId::Vk => ("🔵", "ВКонтакте"),
+            crate::api::provider::ProviderId::Yandex => ("🌊", "Яндекс"),
         };
 
         let source_icon = Label::new(Some(initial_icon));
@@ -344,6 +345,10 @@ impl VolnaWindow {
         yt_item.add_css_class("flat");
         yt_item.set_halign(Align::Fill);
 
+        let vk_item = Button::with_label("🔵  ВКонтакте");
+        vk_item.add_css_class("flat");
+        vk_item.set_halign(Align::Fill);
+
         {
             let p = player.clone();
             let pop = source_popover.clone();
@@ -360,9 +365,23 @@ impl VolnaWindow {
                 pop.popdown();
             });
         }
+        {
+            let p = player.clone();
+            let pop = source_popover.clone();
+            let window = window.downgrade();
+            vk_item.connect_clicked(move |_| {
+                if p.providers.get(ProviderId::Vk).is_some() {
+                    p.switch_provider(ProviderId::Vk);
+                } else if let Some(window) = window.upgrade() {
+                    show_vk_auth_dialog(&window, &p);
+                }
+                pop.popdown();
+            });
+        }
 
         source_pop_box.append(&ya_item);
         source_pop_box.append(&yt_item);
+        source_pop_box.append(&vk_item);
         source_popover.set_child(Some(&source_pop_box));
         source_btn.set_popover(Some(&source_popover));
 
@@ -737,11 +756,9 @@ impl VolnaWindow {
         }
         {
             let vs = view_stack.clone();
-            let open_liked = library_view.open_liked.clone();
             let u = update_active_nav.clone();
             btn_liked.connect_clicked(move |_| {
                 vs.set_visible_child_name("library");
-                open_liked();
                 u();
             });
         }
@@ -751,6 +768,7 @@ impl VolnaWindow {
         content_overlay.set_hexpand(true);
         content_overlay.set_child(Some(&view_stack));
 
+        let pet_enabled = crate::api::auth::load_pet_enabled();
         let main_content_box = GtkBox::new(Orientation::Vertical, 0);
         main_content_box.set_vexpand(true);
         main_content_box.set_hexpand(true);
@@ -777,6 +795,12 @@ impl VolnaWindow {
         root_overlay.set_child(Some(&app_body_overlay));
         root_overlay.add_overlay(&island.container);
         root_overlay.set_measure_overlay(&island.container, false);
+
+        // Питомец живёт поверх нижней части окна и гуляет по полочке плеера.
+        let pet_style = crate::api::auth::load_pet_style();
+        let pet = super::pet::create_pet_layer(&island.container, &player, pet_enabled, &pet_style);
+        root_overlay.add_overlay(&pet.layer);
+        root_overlay.set_measure_overlay(&pet.layer, false);
 
         // Отслеживаем геометрию: окно/остров меняются при ресайзе и фуллскрине
         {
@@ -836,7 +860,7 @@ impl VolnaWindow {
                     // shortcut: у трека с несколькими артистами открывается первый, для выбора нужен popover
                     let Some(a) = track.artists.first() else { return };
                     vs.set_visible_child_name("search");
-                    show_artist(a.id.clone());
+                    show_artist(a.clone(), track.source);
                 } else {
                     vs.set_visible_child_name("search");
                     show_track(track);
@@ -853,7 +877,7 @@ impl VolnaWindow {
         // Клик по плашке источника («Альбом: …», «Плейлист: …», «По треку: …») открывает этот источник
         {
             let click = gtk4::GestureClick::new();
-            let (vs, target) = (view_stack.clone(), wave_view.source_target.clone());
+            let (vs, target, p) = (view_stack.clone(), wave_view.source_target.clone(), player.clone());
             let (show_artist, show_track, show_album, show_playlist) = (
                 search_view.show_artist.clone(),
                 search_view.show_track.clone(),
@@ -880,7 +904,8 @@ impl VolnaWindow {
                     }
                     Artist(id) => {
                         vs.set_visible_child_name("search");
-                        show_artist(id);
+                        let source = p.providers.active_id().into();
+                        show_artist(crate::api::models::Artist { id, ..Default::default() }, source);
                     }
                     Track(t) => {
                         vs.set_visible_child_name("search");
@@ -1139,6 +1164,51 @@ impl VolnaWindow {
                         } else {
                             let p_inner = p_clone.clone();
                             show_ytmusic_auth_dialog(&w, &p_inner, move || {});
+                        }
+                    } else if active_id == ProviderId::Vk {
+                        let is_auth = p_clone
+                            .providers
+                            .get(ProviderId::Vk)
+                            .is_some_and(|provider| provider.is_authenticated());
+                        if is_auth {
+                            let alert = libadwaita::AlertDialog::new(
+                                Some("ВКонтакте"),
+                                Some("Вы авторизованы в VK Музыке."),
+                            );
+                            alert.add_response("cancel", "Отмена");
+                            alert.add_response("logout", "Выйти из ВКонтакте");
+                            alert.set_response_appearance(
+                                "logout",
+                                libadwaita::ResponseAppearance::Destructive,
+                            );
+                            let p = p_clone.clone();
+                            alert.choose(
+                                Some(&w),
+                                None::<&gtk4::gio::Cancellable>,
+                                move |response| {
+                                    if response == "logout" {
+                                        let token_result = crate::api::vk::auth::clear_vk_token();
+                                        let user_result = crate::api::auth::clear_vk_user_id();
+                                        p.switch_provider(ProviderId::Yandex);
+                                        p.providers.unregister(ProviderId::Vk);
+                                        let clear_error = token_result
+                                            .err()
+                                            .map(|error| error.to_string())
+                                            .or_else(|| user_result.err().map(|error| error.to_string()));
+                                        if let Some(error) = clear_error {
+                                            p.emit(crate::player::PlayerUiEvent::Error(format!(
+                                                "VK отключён, но не все локальные данные удалены: {error}"
+                                            )));
+                                        } else {
+                                            p.emit(crate::player::PlayerUiEvent::StatusMessage(
+                                                "Вы вышли из аккаунта ВКонтакте".to_string(),
+                                            ));
+                                        }
+                                    }
+                                },
+                            );
+                        } else {
+                            show_vk_auth_dialog(&w, &p_clone);
                         }
                     } else {
                         let is_logged_in = p_clone.client.lock().map_or(false, |c| c.has_token());
@@ -1449,6 +1519,7 @@ impl VolnaWindow {
             toast_overlay,
             wave_view,
             island,
+            pet,
             source_icon,
             source_label,
             auth_btn,
@@ -1742,6 +1813,43 @@ fn update_auth_ui(
                 header_auth_btn.add_css_class("suggested-action");
             }
         }
+        ProviderId::Vk => {
+            let is_auth = player
+                .providers
+                .get(ProviderId::Vk)
+                .is_some_and(|provider| provider.is_authenticated());
+            auth_icon.set_text("🔵");
+            auth_name_label.set_text(if is_auth {
+                "ВКонтакте"
+            } else {
+                "Войти во ВКонтакте"
+            });
+            header_auth_btn.set_label(if is_auth {
+                "🔵 ВКонтакте"
+            } else {
+                "🔵 Войти во ВКонтакте"
+            });
+            auth_btn.set_tooltip_text(Some(if is_auth {
+                "VK Музыка подключена"
+            } else {
+                "Войти во ВКонтакте"
+            }));
+            header_auth_btn.set_tooltip_text(Some("VK Музыка"));
+            auth_btn.remove_css_class(if is_auth {
+                "login-required"
+            } else {
+                "logged-in"
+            });
+            auth_btn.add_css_class(if is_auth {
+                "logged-in"
+            } else {
+                "login-required"
+            });
+            header_auth_btn.remove_css_class("flat");
+            header_auth_btn.remove_css_class("login-required");
+            header_auth_btn.remove_css_class("suggested-action");
+            header_auth_btn.add_css_class("logged-in");
+        }
         _ => {
             let is_auth = player.client.lock().map_or(false, |c| c.has_token());
             auth_icon.set_text("🌊");
@@ -1790,6 +1898,7 @@ fn setup_event_listener(
     toast_overlay: ToastOverlay,
     wave_view: WaveViewWidgets,
     island: FloatingIslandWidgets,
+    pet: super::pet::PetWidgets,
     source_icon: Label,
     source_label: Label,
     auth_btn: Button,
@@ -1835,6 +1944,7 @@ fn setup_event_listener(
         while let Ok(event) = receiver.recv().await {
             match event {
                 PlayerUiEvent::TrackStarted { track, .. } => {
+                    island.cover_image.clear();
                     awaiting_start.set(std::env::var_os("VOLNA_DEMO_POS_MS").is_none());
                     // повторный TrackStarted того же трека (замена на студийную версию)
                     // не должен гасить уже показанный клип
@@ -1847,7 +1957,7 @@ fn setup_event_listener(
                     }
                     let artists = track.artists_string();
                     let album = track.albums.first().and_then(|a| a.title.as_ref()).map(|s| s.as_str()).unwrap_or("");
-                    let subtitle = if album.is_empty() {
+                    let subtitle = if album.is_empty() || album.trim().eq_ignore_ascii_case("unnamed") {
                         artists.clone()
                     } else {
                         format!("{} • {}", artists, album)
@@ -1865,6 +1975,9 @@ fn setup_event_listener(
                     } else if let Some((core, deep, ridge)) = get_accent_palette(&accent) {
                         wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
                     }
+
+                    wave_view.refresh();
+                    pet.refresh(&track.title);
 
                     island.title_label.set_markup(&track.title_markup());
                     island.explicit_badge.set_visible(track.is_explicit());
@@ -1903,7 +2016,25 @@ fn setup_event_listener(
                         wave_view.clip.resume();
                     } else {
                         wave_view.clip.pause();
+                        // Глубокий idle: через 30 секунд паузы отдаём heap ОС
+                        // из отдельного потока, не блокируя UI.
+                        let p = player.clone();
+                        gtk4::glib::timeout_add_seconds_local_once(30, move || {
+                            if !p.audio.is_playing() {
+                                std::thread::spawn(|| crate::trim_allocator());
+                            }
+                        });
                     }
+                    wave_view.set_playing(is_playing);
+                    let title = player
+                        .state
+                        .lock()
+                        .ok()
+                        .and_then(|state| {
+                            state.current_track.as_ref().map(|track| track.title.clone())
+                        })
+                        .unwrap_or_default();
+                    pet.set_playing(is_playing, &title);
                     let icon_name = if is_playing {
                         "media-playback-pause-symbolic"
                     } else {
@@ -1912,7 +2043,6 @@ fn setup_event_listener(
 
                     wave_view.play_btn_icon.set_icon_name(Some(icon_name));
                     island.play_btn_icon.set_icon_name(Some(icon_name));
-                    wave_view.drawing_area.queue_draw();
                 }
                 PlayerUiEvent::Progress { current_sec, total_sec } => {
                     island.curr_time_label.set_text(&format_seconds(current_sec));
@@ -1981,6 +2111,9 @@ fn setup_event_listener(
                         update_dynamic_accent_css(&dynamic_provider, c[0], c[1], c[2]);
                     }
                 }
+                PlayerUiEvent::Seeked(_) => {
+                    wave_view.refresh();
+                }
                 PlayerUiEvent::ClipUpdated(update) => {
                     let current = current_clip_track.borrow().clone();
                     match update {
@@ -2030,7 +2163,7 @@ fn setup_event_listener(
                             click.connect_pressed(move |_, _, _, _| {
                                 p.seek_ms(at);
                                 // видео перематываем тем же событием, иначе ждать тик коррекции
-                                clip_for_seek.seek_ms(at.saturating_mul(1000));
+                                clip_for_seek.seek_ms(at);
                                 if !p.audio.is_playing() {
                                     p.resume();
                                 }
@@ -2153,6 +2286,16 @@ fn setup_event_listener(
                     toast.set_use_markup(false);
                     toast_overlay.add_toast(toast);
                 }
+                PlayerUiEvent::VkAuthRequired => {
+                    if let Some(w) = win_weak.upgrade() {
+                        show_vk_auth_dialog(&w, &player);
+                    }
+                }
+                PlayerUiEvent::VkCaptchaRequired { image_url, respond } => {
+                    if let Some(w) = win_weak.upgrade() {
+                        show_vk_api_captcha_dialog(&w, image_url, respond);
+                    }
+                }
                 PlayerUiEvent::CrossfadeChanged { .. } => {}
                 PlayerUiEvent::NavLayoutChanged(style) => {
                     let is_spotify = style == "spotify";
@@ -2173,6 +2316,9 @@ fn setup_event_listener(
                     super::floating_island::apply_player_layout(&island, &layout);
                     // отступ футера пересчитает наблюдатель геометрии
                     main_content_box.set_margin_bottom(if layout == "dock" { 92 } else { 0 });
+                }
+                PlayerUiEvent::PetChanged { enabled, style } => {
+                    super::pet::apply_settings(&pet, enabled, &style);
                 }
                 PlayerUiEvent::ThemeAccentChanged(accent) => {
                     *theme_accent_state.borrow_mut() = accent.clone();
@@ -2203,7 +2349,11 @@ fn setup_event_listener(
                             source_icon.set_text("🔴");
                             source_label.set_text("YouTube Music");
                         }
-                        _ => {
+                        crate::api::provider::ProviderId::Vk => {
+                            source_icon.set_text("🔵");
+                            source_label.set_text("ВКонтакте");
+                        }
+                        crate::api::provider::ProviderId::Yandex => {
                             source_icon.set_text("🌊");
                             source_label.set_text("Яндекс");
                         }

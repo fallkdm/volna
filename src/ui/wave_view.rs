@@ -111,6 +111,8 @@ pub struct WaveViewWidgets {
     pub menu_button: Button,
     pub drawing_area: gtk4::GLArea,
     pub shader_state: Rc<RefCell<WaveShaderState>>,
+    /// Тик анимации: снимается с frame clock на паузе
+    pub tick_control: Rc<super::tick::TickControl>,
     pub content_box: GtkBox,
     pub filter_pill: GtkBox,
     /// Клип на фоне (превью-ролик трека)
@@ -131,6 +133,32 @@ pub struct WaveViewWidgets {
     loading_label: Label,
     /// Текущий акцент плашки — сбрасывается вместе с фильтрами
     accent_color: Rc<RefCell<[f64; 3]>>,
+}
+
+impl WaveViewWidgets {
+    /// Включает/выключает анимацию. На паузе делает один финальный кадр
+    /// и снимает tick с frame clock.
+    pub fn set_playing(&self, playing: bool) {
+        if playing {
+            self.tick_control.wake();
+            return;
+        }
+        {
+            let mut state = self.shader_state.borrow_mut();
+            state.is_playing = false;
+            state.bass = 0.0;
+            state.tick(0.016, 0.0);
+        }
+        self.drawing_area.queue_render();
+        self.tick_control.sleep();
+    }
+
+    /// Один кадр после смены трека/позиции, пока анимация спит.
+    pub fn refresh(&self) {
+        if !self.tick_control.is_active() {
+            self.drawing_area.queue_render();
+        }
+    }
 }
 
 impl WaveViewWidgets {
@@ -272,81 +300,96 @@ pub fn create_wave_view(
     play_btn_icon.set_pixel_size(32);
     play_btn.set_child(Some(&play_btn_icon));
 
-    // Анимация 60 FPS через add_tick_callback на базе GdkFrameClock: шаг состояния и запрос кадра у видеокарты
+    // Анимация 60 FPS через add_tick_callback: на паузе колбэк честно
+    // снимается с frame clock, а не просто возвращает Continue.
+    let tick_control: Rc<super::tick::TickControl>;
     {
         let state_ref = shader_state.clone();
         let is_playing_clone = is_playing_state.clone();
         let audio = player.audio.clone();
         let last_time_ref = Rc::new(RefCell::new(0_i64));
         let play_btn_ref = play_btn.clone();
-        let tick_n = std::cell::Cell::new(0u32);
         let clip_for_tick = clip_shared.clone();
         let clip_for_sync = clip.clone();
         let audio_for_sync = audio.clone();
         let telemetry_for_tick = player.clips.telemetry().clone();
         let last_sync = Rc::new(RefCell::new(std::time::Instant::now()));
+        let area_for_tick = drawing_area.clone();
 
-        drawing_area.add_tick_callback(move |area, frame_clock| {
-            let now = frame_clock.frame_time(); // время в микросекундах
-            let mut last = last_time_ref.borrow_mut();
-            let dt = if *last == 0 {
-                0.016_f64
-            } else {
-                ((now - *last) as f64 / 1_000_000.0).clamp(0.001, 0.1)
-            };
-            *last = now;
+        let installer = move || {
+            let state_ref = state_ref.clone();
+            let is_playing_clone = is_playing_clone.clone();
+            let audio = audio.clone();
+            let last_time_ref = last_time_ref.clone();
+            let play_btn_ref = play_btn_ref.clone();
+            let clip_for_tick = clip_for_tick.clone();
+            let clip_for_sync = clip_for_sync.clone();
+            let audio_for_sync = audio_for_sync.clone();
+            let telemetry_for_tick = telemetry_for_tick.clone();
+            let last_sync = last_sync.clone();
+            let play_center = play_center.clone();
+            let area = area_for_tick.clone();
 
-            {
-                let mut state = state_ref.borrow_mut();
-                state.is_playing = *is_playing_clone.borrow();
-                state.tick(dt, audio.bass_level() as f64);
-            }
+            area.add_tick_callback(move |area, frame_clock| {
+                let now = frame_clock.frame_time();
+                let dt = {
+                    let mut last = last_time_ref.borrow_mut();
+                    let dt = if *last == 0 {
+                        0.016_f64
+                    } else {
+                        ((now - *last) as f64 / 1_000_000.0).clamp(0.001, 0.1)
+                    };
+                    *last = now;
+                    dt
+                };
 
-            // Позиционная коррекция — основной механизм синхронизации (не чаще 500 мс)
-            let now_instant = std::time::Instant::now();
-            if now_instant.duration_since(*last_sync.borrow())
-                >= std::time::Duration::from_millis(500)
-            {
-                *last_sync.borrow_mut() = now_instant;
-                if clip_for_tick.active() {
-                    let position = clip_for_sync.position_ms();
-                    telemetry_for_tick.set_position(position);
-                    // Клип мог прероллиться в паузе (звук ещё не начался): догоняем
-                    if audio_for_sync.is_playing() && !clip_for_sync.is_playing() {
-                        clip_for_sync.resume();
-                    }
-                    if audio_for_sync.is_playing()
-                        && let (Some(audio_ms), Some(clip_ms)) =
-                            (audio_for_sync.position_ms(), position)
-                        && audio_ms.abs_diff(clip_ms) > 300
-                    {
-                        clip_for_sync.seek_ms(audio_ms);
-                    }
-                } else {
-                    telemetry_for_tick.set_position(None);
+                {
+                    let mut state = state_ref.borrow_mut();
+                    state.is_playing = *is_playing_clone.borrow();
+                    state.tick(dt, audio.bass_level() as f64);
                 }
-            }
 
-            // На паузе плазма еле дрейфует: бас затух — кадр каждый 4-й тик (≈15 FPS)
-            let n = tick_n.get().wrapping_add(1);
-            tick_n.set(n);
-            let idle = {
-                let st = state_ref.borrow();
-                !st.is_playing && st.bass < 0.005 && !clip_for_tick.active()
-            };
-            if idle && n % 4 != 0 {
-                return glib::ControlFlow::Continue;
-            }
+                // Позиционная коррекция — не чаще 500 мс
+                let now_instant = std::time::Instant::now();
+                if now_instant.duration_since(*last_sync.borrow())
+                    >= std::time::Duration::from_millis(500)
+                {
+                    *last_sync.borrow_mut() = now_instant;
+                    if clip_for_tick.active() {
+                        let position = clip_for_sync.position_ms();
+                        telemetry_for_tick.set_position(position);
+                        if audio_for_sync.is_playing() && !clip_for_sync.is_playing() {
+                            clip_for_sync.resume();
+                        }
+                        if clip_for_tick.full()
+                            && audio_for_sync.is_playing()
+                            && let (Some(audio_ms), Some(clip_ms)) =
+                                (audio_for_sync.position_ms(), position)
+                            && audio_ms.abs_diff(clip_ms) > 300
+                        {
+                            clip_for_sync.seek_ms(audio_ms);
+                        }
+                    } else {
+                        telemetry_for_tick.set_position(None);
+                    }
+                }
 
-            // Центр кнопки Play в координатах фона
-            let center = play_btn_ref
-                .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
-                .map(|p| (p.x() as f64, p.y() as f64))
-                .unwrap_or((area.width() as f64 / 2.0, area.height() as f64 * 0.38));
-            play_center.set(center);
-            area.queue_render();
-            glib::ControlFlow::Continue
-        });
+                let center = play_btn_ref
+                    .compute_point(area, &gtk4::graphene::Point::new(36.0, 36.0))
+                    .map(|p| (p.x() as f64, p.y() as f64))
+                    .unwrap_or((area.width() as f64 / 2.0, area.height() as f64 * 0.38));
+                play_center.set(center);
+                area.queue_render();
+                glib::ControlFlow::Continue
+            })
+        };
+
+        tick_control = super::tick::TickControl::new(installer);
+        if *is_playing_state.borrow() {
+            tick_control.wake();
+        } else {
+            drawing_area.queue_render();
+        }
     }
 
     root_overlay.set_child(Some(&fallback));
@@ -760,6 +803,7 @@ pub fn create_wave_view(
         menu_button,
         drawing_area,
         shader_state,
+        tick_control,
         content_box,
         clip,
         filter_pill,

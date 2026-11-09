@@ -8,9 +8,13 @@ use crate::api::client::YandexMusicClient;
 use crate::api::models::{Album, Playlist, Track, TrackSource};
 use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId};
 use crate::api::provider_manager::ProviderManager;
+use crate::api::vk::provider::VkProvider;
 use crate::api::ytmusic::YtMusicClient;
 use super::audio::AudioBackend;
 use super::wave_engine::WaveEngine;
+
+static AUDIO_DOWNLOAD_LOCKS: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// Режим повтора: нет, один трек, вся очередь (для Волны «вся очередь» недоступна)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,6 +115,13 @@ pub enum PlayerUiEvent {
     UserLoggedOut,
     StatusMessage(String),
     Error(String),
+    /// VK отозвал авторизацию (API error 5): нужно повторить Direct Auth.
+    VkAuthRequired,
+    /// Обычный `audio.*`-запрос получил captcha; ответ вернёт ожидающий запрос в VK API.
+    VkCaptchaRequired {
+        image_url: Option<String>,
+        respond: async_channel::Sender<String>,
+    },
     /// Станция привязана (имя) или отвязана
     CastChanged(Option<String>),
     /// Откуда играет очередь: «Плейлист: …», «Альбом: …», «Популярное: …»; `None` — подписи нет
@@ -128,6 +139,11 @@ pub enum PlayerUiEvent {
     NavLayoutChanged(String),
     /// Изменился стиль плеера: "dock" или "floating"
     PlayerLayoutChanged(String),
+    /// Питомец на плеере: включение/выключение и облик ("wave", "cat", "slime")
+    PetChanged {
+        enabled: bool,
+        style: String,
+    },
     /// Изменился цветовой акцент: "dynamic", "spotify", "ruby", "sunset", "violet", "ocean", "monochrome"
     ThemeAccentChanged(String),
     /// Изменился активный музыкальный провайдер
@@ -175,6 +191,8 @@ pub struct PlayerState {
     pub wave_dead: bool,
     /// Сколько догрузок Волны подряд не дали новых треков (сбрасывается при удаче)
     pub refill_failures: usize,
+    /// Выполняется ли догрузка треков волны прямо сейчас
+    pub wave_refill_in_flight: bool,
     /// Полные объекты любимых треков — источник сидов для алгоритмических фильтров
     pub liked_tracks_cache: Vec<Track>,
 }
@@ -243,6 +261,7 @@ impl Default for PlayerState {
             pending_advance: false,
             wave_dead: false,
             refill_failures: 0,
+            wave_refill_in_flight: false,
             liked_tracks_cache: Vec::new(),
         }
     }
@@ -291,7 +310,7 @@ const PREFETCH_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(20 
 
 /// Сколько идентификаторов сыгранного отправляем Ротору в `?queue=`: сервер учтёт их
 /// и не предложит повторно в новой порции.
-const ROTOR_QUEUE_IDS: usize = 5;
+const ROTOR_QUEUE_IDS: usize = 20;
 
 /// Сколько раз подряд пробуем продлить Волну, прежде чем считать её исчерпанной.
 /// Ротор иногда отдаёт порцию из одних повторов — одиночный пустой ответ ещё не приговор.
@@ -325,6 +344,58 @@ pub struct PlayerManager {
     tail_swap_epoch: Arc<AtomicU64>,
     /// Настройки плавного перехода: (включен, длительность в секундах)
     crossfade: Arc<Mutex<(bool, u32)>>,
+}
+
+async fn resolve_stream_for_source(
+    providers: &ProviderManager,
+    client: &YandexMusicClient,
+    track_id: &str,
+    source: TrackSource,
+) -> Result<(String, String), String> {
+    match source {
+        TrackSource::YouTubeMusic => {
+            let provider = providers
+                .get(ProviderId::YouTubeMusic)
+                .ok_or_else(|| "Провайдер YouTube Music не найден".to_string())?;
+            provider
+                .get_stream_url(track_id)
+                .await
+                .map(|url| (url, "Opus 160".to_string()))
+                .map_err(|error| format!("Ошибка YouTube Music: {error}"))
+        }
+        TrackSource::Vk => {
+            let provider = providers
+                .get(ProviderId::Vk)
+                .ok_or_else(|| "Требуется вход во ВКонтакте".to_string())?;
+            let url = provider
+                .get_stream_url(track_id)
+                .await
+                .map_err(|error| format!("Ошибка VK Музыки: {error}"))?;
+            let label = if url.contains(".flac") || url.contains("type=flac") || url.contains("type=3") {
+                "FLAC"
+            } else if crate::player::audio::is_hls_url(&url) {
+                "HLS"
+            } else if url.ends_with(".mp3") || url.contains("type=2") {
+                "MP3 320"
+            } else {
+                "AAC"
+            };
+            Ok((url, label.to_string()))
+        }
+        TrackSource::Yandex => client
+            .get_track_direct_url(track_id)
+            .await
+            .map_err(|error| error.to_string()),
+    }
+}
+
+pub async fn get_stream_url_internal(
+    providers: &ProviderManager,
+    client: &YandexMusicClient,
+    track_id: &str,
+    source: TrackSource,
+) -> Result<(String, String), String> {
+    resolve_stream_for_source(providers, client, track_id, source).await
 }
 
 impl PlayerManager {
@@ -370,7 +441,8 @@ impl PlayerManager {
         let yt_client_arc = Arc::new(yt_client.clone());
         let clip_telemetry = Arc::new(super::clip_telemetry::ClipTelemetry::new());
         clip_telemetry.set_enabled(crate::api::auth::load_clips());
-        let clip_events = Arc::new(Mutex::new(event_senders.clone()));
+        let event_senders_arc = Arc::new(Mutex::new(event_senders));
+        let clip_events = event_senders_arc.clone();
         let clips = super::clip::ClipBackground::new(
             yt_client_arc.clone(),
             clip_telemetry,
@@ -380,6 +452,22 @@ impl PlayerManager {
         let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
         let ytmusic_provider = Arc::new(yt_client) as Arc<dyn MusicProvider>;
         let provider_manager = ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+        if let Some(token) = crate::api::vk::auth::load_vk_token() {
+            let owner_id = crate::api::auth::load_vk_user_id().unwrap_or(0);
+            if let Ok(vk) = VkProvider::new(token, owner_id) {
+                let senders = event_senders_arc.clone();
+                vk.set_captcha_handler(Arc::new(move |challenge, respond| {
+                    emit_all(
+                        &senders,
+                        PlayerUiEvent::VkCaptchaRequired {
+                            image_url: challenge.image_url,
+                            respond,
+                        },
+                    );
+                }));
+                provider_manager.register(Arc::new(vk));
+            }
+        }
         let active_provider = crate::api::auth::load_active_provider();
         provider_manager.switch_provider(active_provider);
         let providers = Arc::new(provider_manager);
@@ -392,7 +480,7 @@ impl PlayerManager {
             clips,
             state,
             wave_engine,
-            event_senders: Arc::new(Mutex::new(event_senders)),
+            event_senders: event_senders_arc,
             cast: Arc::default(),
             prefetch: Arc::default(),
             prefetch_inflight: Arc::default(),
@@ -489,7 +577,16 @@ impl PlayerManager {
 
     /// Показывает последний проигранный трек: заголовок, цвета, обложку и текст. Воспроизведение не стартует
     fn restore_last_track(&self) {
+        let active_provider = self.providers.active_id();
         let Some(track) = crate::api::history::load_last_track() else { return };
+        let track_matches_provider = match active_provider {
+            ProviderId::Vk => track.source == TrackSource::Vk,
+            ProviderId::YouTubeMusic => track.source == TrackSource::YouTubeMusic,
+            ProviderId::Yandex => track.source == TrackSource::Yandex,
+        };
+        if !track_matches_provider {
+            return;
+        }
         // последняя очередь (альбом, плейлист): после перезапуска Play продолжает её, а не включает Волну по треку
         if let Some((queue, index, source)) = crate::cache::load_session() {
             if queue.get(index).is_some_and(|t| t.id == track.id) {
@@ -507,7 +604,7 @@ impl PlayerManager {
                 self.emit(PlayerUiEvent::SourceContext(source));
                 self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index, total_queue: total });
                 let client = self.client.lock().unwrap().clone();
-                spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation, &self.clips);
+                spawn_cover_and_lyrics(&self.event_senders, self.providers.clone(), client, &track, self.generation.load(Ordering::SeqCst), &self.generation, &self.clips);
                 return;
             }
         }
@@ -522,7 +619,7 @@ impl PlayerManager {
         self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
         self.emit(PlayerUiEvent::TrackStarted { track: track.clone(), index: 0, total_queue: 1 });
         let client = self.client.lock().unwrap().clone();
-        spawn_cover_and_lyrics(&self.event_senders, client, &track, self.generation.load(Ordering::SeqCst), &self.generation, &self.clips);
+        spawn_cover_and_lyrics(&self.event_senders, self.providers.clone(), client, &track, self.generation.load(Ordering::SeqCst), &self.generation, &self.clips);
     }
 
     /// Если на экране сохранённый трек, первое нажатие Play/вперёд/назад запускает его (с продолжением Волной по треку)
@@ -588,30 +685,61 @@ impl PlayerManager {
         removed
     }
 
+    /// Регистрирует VK после входа и подключает captcha к живому GTK-циклу.
+    pub fn register_vk_provider(&self, provider: VkProvider) {
+        let senders = self.event_senders.clone();
+        provider.set_captcha_handler(Arc::new(move |challenge, respond| {
+            emit_all(
+                &senders,
+                PlayerUiEvent::VkCaptchaRequired {
+                    image_url: challenge.image_url,
+                    respond,
+                },
+            );
+        }));
+        self.providers.register(Arc::new(provider));
+    }
+
     /// Переключает активного музыкального провайдера
     pub fn switch_provider(&self, id: ProviderId) {
         if self.providers.switch_provider(id) {
             let _ = crate::api::auth::save_active_provider(id);
+            let default_station = match id {
+                ProviderId::Vk => crate::api::vk::provider::VK_MIX_STATION_ID.to_string(),
+                _ => "user:onyourwave".to_string(),
+            };
             if let Ok(mut state) = self.state.lock() {
                 state.liked_loaded = false;
-                // Фильтры не переносятся между сервисами: у Яндекса это нативный
-                // Ротор, у YouTube Music — локальный алгоритм. Токен продолжения
-                // тоже принадлежит прежнему провайдеру.
                 state.current_mood = None;
                 state.current_language = None;
                 state.current_character = None;
                 state.wave_label = None;
                 state.batch_id = None;
-                state.station_id = "user:onyourwave".to_string();
+                state.station_id = default_station.clone();
                 state.wave_dead = false;
                 state.refill_failures = 0;
                 state.pending_advance = false;
+                state.queue.clear();
+                state.current_index = 0;
+                state.current_track = None;
+                state.restored = false;
             }
+            self.audio.stop();
+            self.emit(PlayerUiEvent::QueueUpdated(Vec::new()));
+            self.emit(PlayerUiEvent::PlaybackToggled(false));
             let me = self.clone();
             tokio::spawn(async move {
                 me.ensure_liked_loaded().await;
             });
             self.emit(PlayerUiEvent::ProviderChanged(id));
+            let station_title = match id {
+                ProviderId::Vk => "VK Стрим-микс".to_string(),
+                ProviderId::YouTubeMusic => "YouTube Music Волна".to_string(),
+                ProviderId::Yandex => "Моя Волна".to_string(),
+            };
+            self.start_station(default_station, None, station_title);
+        } else if id == ProviderId::Vk {
+            self.emit(PlayerUiEvent::VkAuthRequired);
         }
     }
 
@@ -627,26 +755,28 @@ impl PlayerManager {
             return;
         }
 
-        // Если активен YouTube Music: загружаем понравившиеся треки из YouTube Music
+        // Если активен YouTube Music или VK: загружаем понравившиеся треки из соответствующего провайдера
         let provider = self.providers.current();
-        if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
-            if let Ok(tracks) = provider.get_liked_tracks().await {
-                let tracks: Vec<Track> = tracks.into_iter().filter(|t| !t.id.is_empty()).collect();
-                let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
-                let current_liked = {
-                    let mut state = self.state.lock().unwrap();
-                    state.liked_loaded = true;
-                    state.merge_server_likes(ids);
-                    // Полные объекты нужны фильтрам для выбора сида
-                    state.liked_tracks_cache = tracks;
-                    let track_id = state.current_track.as_ref().map(|t| t.id.clone());
-                    track_id.map(|id| state.sync_track_like_status(&id))
-                };
-                if let Some(liked) = current_liked {
-                    self.emit(PlayerUiEvent::LikeStateChanged(liked));
+        if provider.provider_id() == ProviderId::YouTubeMusic || provider.provider_id() == ProviderId::Vk {
+            if provider.is_authenticated() {
+                if let Ok(tracks) = provider.get_liked_tracks().await {
+                    let tracks: Vec<Track> = tracks.into_iter().filter(|t| !t.id.is_empty()).collect();
+                    let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+                    let current_liked = {
+                        let mut state = self.state.lock().unwrap();
+                        state.liked_loaded = true;
+                        state.merge_server_likes(ids);
+                        // Полные объекты нужны фильтрам для выбора сида
+                        state.liked_tracks_cache = tracks;
+                        let track_id = state.current_track.as_ref().map(|t| t.id.clone());
+                        track_id.map(|id| state.sync_track_like_status(&id))
+                    };
+                    if let Some(liked) = current_liked {
+                        self.emit(PlayerUiEvent::LikeStateChanged(liked));
+                    }
                 }
-                return;
             }
+            return;
         }
 
         let client = self.client.lock().unwrap().clone();
@@ -678,6 +808,33 @@ impl PlayerManager {
         let me = self.clone();
 
         tokio::spawn(async move {
+            let active_id = me.providers.active_id();
+            if active_id == ProviderId::Vk {
+                let provider = me.providers.get(ProviderId::Vk);
+                if provider.as_ref().is_some_and(|p| p.is_authenticated()) {
+                    emit_all(&senders, PlayerUiEvent::StatusMessage(
+                        "Подключен ВКонтакте 🔵".to_string(),
+                    ));
+                    me.ensure_liked_loaded().await;
+                } else {
+                    emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                }
+                return;
+            }
+
+            if active_id == ProviderId::YouTubeMusic {
+                let provider = me.providers.get(ProviderId::YouTubeMusic);
+                if provider.as_ref().is_some_and(|p| p.is_authenticated()) {
+                    emit_all(&senders, PlayerUiEvent::StatusMessage(
+                        "Подключен Google (YouTube Music) 🔴".to_string(),
+                    ));
+                    me.ensure_liked_loaded().await;
+                } else {
+                    emit_all(&senders, PlayerUiEvent::AuthRequired);
+                }
+                return;
+            }
+
             let client = client_clone.lock().unwrap().clone();
             if client.has_token() {
                 match client.get_account_status().await {
@@ -712,15 +869,7 @@ impl PlayerManager {
                     }
                 }
             } else {
-                let provider = me.providers.current();
-                if provider.provider_id() == ProviderId::YouTubeMusic && provider.is_authenticated() {
-                    emit_all(&senders, PlayerUiEvent::StatusMessage(
-                        "Подключен Google (YouTube Music) 🔴".to_string(),
-                    ));
-                    me.ensure_liked_loaded().await;
-                } else {
-                    emit_all(&senders, PlayerUiEvent::AuthRequired);
-                }
+                emit_all(&senders, PlayerUiEvent::AuthRequired);
             }
         });
     }
@@ -833,20 +982,41 @@ impl PlayerManager {
 
     /// Запускает или переключает воспроизведение (Play/Pause)
     pub fn toggle_play(&self) {
-        if !self.is_playing() && self.providers.active_id() == ProviderId::YouTubeMusic {
-            let is_yandex_track = {
-                let state = self.state.lock().unwrap();
-                state.current_track.as_ref()
-                    .or_else(|| state.queue.get(state.current_index))
-                    .map(|t| t.source == TrackSource::Yandex)
-                    .unwrap_or(false)
-            };
-            if is_yandex_track && !self.client.lock().unwrap().has_token() {
-                if let Ok(mut state) = self.state.lock() {
-                    state.restored = false;
+        let active_id = self.providers.active_id();
+        if !self.is_playing() {
+            if active_id == ProviderId::Vk {
+                let is_not_vk = {
+                    let state = self.state.lock().unwrap();
+                    state.current_track.as_ref()
+                        .or_else(|| state.queue.get(state.current_index))
+                        .map(|t| t.source != TrackSource::Vk)
+                        .unwrap_or(true)
+                };
+                if is_not_vk {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.restored = false;
+                        state.queue.clear();
+                        state.current_index = 0;
+                        state.current_track = None;
+                    }
+                    self.start_station(crate::api::vk::provider::VK_MIX_STATION_ID.to_string(), None, "VK Стрим-микс".to_string());
+                    return;
                 }
-                self.start_station("user:onyourwave".to_string(), None, "Моя Волна".to_string());
-                return;
+            } else if active_id == ProviderId::YouTubeMusic {
+                let is_yandex_track = {
+                    let state = self.state.lock().unwrap();
+                    state.current_track.as_ref()
+                        .or_else(|| state.queue.get(state.current_index))
+                        .map(|t| t.source == TrackSource::Yandex)
+                        .unwrap_or(false)
+                };
+                if is_yandex_track && !self.client.lock().unwrap().has_token() {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.restored = false;
+                    }
+                    self.start_station("user:onyourwave".to_string(), None, "Моя Волна".to_string());
+                    return;
+                }
             }
         }
 
@@ -860,8 +1030,19 @@ impl PlayerManager {
 
         if !has_tracks {
             let provider = self.providers.current();
-            let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
-            if is_yt {
+            if provider.provider_id() == ProviderId::Vk {
+                if !provider.is_authenticated() {
+                    self.emit(PlayerUiEvent::VkAuthRequired);
+                    self.emit(PlayerUiEvent::StatusMessage(
+                        "Для запуска Волны выполните вход через VK ID".to_string(),
+                    ));
+                } else {
+                    self.emit(PlayerUiEvent::StatusMessage(
+                        "Загружаем Стрим-микс VK... ⚡".to_string(),
+                    ));
+                    self.start_station(crate::api::vk::provider::VK_MIX_STATION_ID.to_string(), None, "VK Стрим-микс".to_string());
+                }
+            } else if provider.provider_id() == ProviderId::YouTubeMusic {
                 if !provider.is_authenticated() {
                     self.emit(PlayerUiEvent::StatusMessage(
                         "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
@@ -898,31 +1079,53 @@ impl PlayerManager {
 
     /// Обработчик естественного окончания воспроизведения трека (EndOfStream)
     pub fn on_track_finished(&self) {
-        let (station_id, track_id, total_secs, batch_id) = {
+        let (track, station_id, total_secs, batch_id) = {
             let state = self.state.lock().unwrap();
-            let track_id = state.current_track.as_ref().map(|t| t.id.clone());
-            let total_secs = state
-                .current_track
+            let track = state.current_track.clone();
+            let total_secs = track
                 .as_ref()
                 .and_then(|t| t.duration_ms)
                 .map(|ms| ms as f64 / 1000.0)
                 .unwrap_or(state.played_seconds);
             (
+                track,
                 state.station_id.clone(),
-                track_id,
                 total_secs,
                 state.batch_id.clone(),
             )
         };
 
-        if let Some(t_id) = track_id {
+        if let Some(track) = track {
             let client = self.client.clone();
+            let providers = self.providers.clone();
             tokio::spawn(async move {
-                let client_guard = client.lock().unwrap().clone();
-                if client_guard.has_token() {
-                    let _ = client_guard
-                        .feedback_track_finished(&station_id, &t_id, total_secs, batch_id)
-                        .await;
+                let track_id = track.id;
+                match track.source {
+                    TrackSource::YouTubeMusic | TrackSource::Vk => {
+                        let provider_id = match track.source {
+                            TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                            TrackSource::Vk => ProviderId::Vk,
+                            TrackSource::Yandex => unreachable!(),
+                        };
+                        if let Some(provider) = providers.get(provider_id) {
+                            let _ = provider
+                                .send_feedback(FeedbackEvent::TrackFinished {
+                                    track_id,
+                                    station_id,
+                                    duration_secs: total_secs as u32,
+                                    batch_id,
+                                })
+                                .await;
+                        }
+                    }
+                    TrackSource::Yandex => {
+                        let client_guard = client.lock().unwrap().clone();
+                        if client_guard.has_token() {
+                            let _ = client_guard
+                                .feedback_track_finished(&station_id, &track_id, total_secs, batch_id)
+                                .await;
+                        }
+                    }
                 }
             });
         }
@@ -1016,6 +1219,12 @@ impl PlayerManager {
             return;
         }
 
+        let is_empty = self.state.lock().unwrap().queue.is_empty();
+        if is_empty {
+            self.toggle_play();
+            return;
+        }
+
         let decision = {
             let state = self.state.lock().unwrap();
             if state.queue.is_empty() {
@@ -1088,17 +1297,17 @@ impl PlayerManager {
             (track, idx, state.queue.len(), is_liked)
         };
 
-        // Если очередь подходит к концу (осталось <= 3 треков) и включен режим волны,
+        // Если очередь подходит к концу (осталось < 7 треков) и включен режим волны,
         // автоматически в фоне запрашиваем следующую порцию радио
         let remaining = total.saturating_sub(idx + 1);
         let is_wave = self.state.lock().unwrap().wave;
-        let refill_needed = self.wave_engine.lock().unwrap().refill_needed(total, idx);
+        let refill_needed = remaining < 7 || self.wave_engine.lock().unwrap().refill_needed(total, idx);
         // Seed Drift не ждёт исчерпания хвоста: иначе сид застревает на весь текущий
         // батч, то есть на десятки треков. Только для YouTube Music: у Яндекса понятия
         // «сид» нет, и лишние догрузки там ни к чему.
         let drift_due = self.providers.current().provider_id() == ProviderId::YouTubeMusic
             && self.wave_engine.lock().unwrap().seed_drift_due();
-        if is_wave && (remaining <= 3 || refill_needed || drift_due) {
+        if is_wave && (remaining < 7 || refill_needed || drift_due) {
             self.load_more_wave_tracks();
         }
 
@@ -1111,13 +1320,13 @@ impl PlayerManager {
         });
 
         self.play_track_stream(&next_track);
-        self.prefetch_next_track();
     }
 
     /// Догрузка вернулась: если мы ждали продления в конце очереди — самое время перейти.
     fn finish_pending_advance(&self) {
         let has_next = {
             let mut state = self.state.lock().unwrap();
+            state.wave_refill_in_flight = false;
             let waiting = std::mem::take(&mut state.pending_advance);
             waiting && state.current_index + 1 < state.queue.len()
         };
@@ -1143,6 +1352,7 @@ impl PlayerManager {
     /// можно спросить заново.
     fn mark_wave_refill_dead(&self) {
         let mut state = self.state.lock().unwrap();
+        state.wave_refill_in_flight = false;
         let waiting = std::mem::take(&mut state.pending_advance);
         if waiting {
             state.wave_dead = true;
@@ -1189,21 +1399,14 @@ impl PlayerManager {
         let audio = self.audio.clone();
         let client = self.client.lock().unwrap().clone();
         let providers = self.providers.clone();
-        let is_yt = next.source == TrackSource::YouTubeMusic;
+        let track_source = next.source;
+        let is_yt = track_source == TrackSource::YouTubeMusic;
         let track_id = next.id.clone();
         let track_title = next.title.clone();
 
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let stream_res: Result<(String, String), String> = if is_yt {
-                if let Some(yt) = providers.get(ProviderId::YouTubeMusic) {
-                    yt.get_stream_url(&track_id).await.map(|u| (u, "Opus 160".to_string())).map_err(|e| e.to_string())
-                } else {
-                    Err("YouTube Music недоступен".to_string())
-                }
-            } else {
-                client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
-            };
+            let stream_res = resolve_stream_for_source(&providers, &client, &track_id, track_source).await;
 
             let (stream_url, label) = match stream_res {
                 Ok((url, lbl)) => (url, lbl),
@@ -1222,14 +1425,20 @@ impl PlayerManager {
                 at: std::time::Instant::now(),
             });
 
-            audio.preroll_next_url(&stream_url);
+            let is_hls = (track_source == TrackSource::Vk && crate::player::audio::is_hls_url(&stream_url)) || stream_url.contains(".m3u8");
+            let ext = if is_hls {
+                "mka"
+            } else if is_yt {
+                "opus"
+            } else if stream_url.contains(".flac") || stream_url.contains("type=flac") || stream_url.contains("type=3") {
+                "flac"
+            } else {
+                "mp3"
+            };
 
-            let ext = if is_yt { "opus" } else { "mp3" };
+            // Скачиваем трек на диск (для HLS — ffmpeg remux в .mka, для остальных — прямой download)
             if let Some(path) = download_audio_to_cache(&stream_url, &track_id, ext).await {
                 let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
-                // Слот теперь прогрет локальным файлом: обновляем и саму prefetch-ссылку, иначе
-                // play_track_stream отдаст в crossfade сетевой URL, тот не совпадёт с file://
-                // в слоте — и мгновенный старт снова превратится в полную переинициализацию.
                 if let Ok(mut entry) = prefetch_arc.lock() {
                     if let Some(p) = entry.as_mut().filter(|p| p.track_id == track_id) {
                         p.url = local_uri.to_string();
@@ -1237,7 +1446,9 @@ impl PlayerManager {
                     }
                 }
                 audio.preroll_next_url(&local_uri);
-                eprintln!("[prefetch] «{}» скачан на диск и переведен в локальный preroll: {}", track_title, local_uri);
+                eprintln!("[prefetch] «{}» сохранен на диск и переведен в локальный preroll: {}", track_title, local_uri);
+            } else {
+                audio.preroll_next_url(&stream_url);
             }
             clear_inflight();
         });
@@ -1261,6 +1472,14 @@ impl PlayerManager {
 
     /// Подгружает следующую порцию треков Волны и добавляет в хвост очереди
     pub fn load_more_wave_tracks(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.wave_refill_in_flight {
+                return;
+            }
+            state.wave_refill_in_flight = true;
+        }
+
         let client_clone = self.client.clone();
         let providers_clone = self.providers.clone();
         let state_clone = self.state.clone();
@@ -1286,6 +1505,9 @@ impl PlayerManager {
             let provider = providers_clone.current();
             if provider.provider_id() == ProviderId::YouTubeMusic {
                 if !provider.is_authenticated() {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.wave_refill_in_flight = false;
+                    }
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     return;
                 }
@@ -1413,6 +1635,9 @@ impl PlayerManager {
 
                 // Пока тянули батч, пользователь мог сменить фильтр: хвост уже обрезан
                 if me.tail_swap_epoch.load(Ordering::SeqCst) != epoch_snapshot {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.wave_refill_in_flight = false;
+                    }
                     emit_all(&senders, PlayerUiEvent::LoadingState(false));
                     return;
                 }
@@ -1457,8 +1682,92 @@ impl PlayerManager {
                 return;
             }
 
+            if provider.provider_id() == ProviderId::Vk {
+                if !provider.is_authenticated() {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.wave_refill_in_flight = false;
+                    }
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                    return;
+                }
+
+                let batch_opt = batch_id.as_deref().filter(|b| !b.is_empty());
+                let station_batch = provider
+                    .get_station_tracks(&station_id, batch_opt)
+                    .await
+                    .ok();
+
+                let Some(station_batch) = station_batch.filter(|b| !b.tracks.is_empty()) else {
+                    eprintln!("[vk wave] волна VK не дала новых треков");
+                    emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                    me.mark_wave_refill_dead();
+                    return;
+                };
+
+                let raw = station_batch.tracks.len();
+                let (updated_queue, grew, added, should_start) = {
+                    let mut state = state_clone.lock().unwrap();
+                    state.batch_id = if station_batch.batch_id.is_empty() {
+                        None
+                    } else {
+                        Some(station_batch.batch_id)
+                    };
+                    let incoming = station_batch.tracks;
+                    let start = state.current_index.saturating_sub(15);
+                    let active_window = &state.queue[start..];
+                    let mut new_tracks = dedup_tracks(active_window, incoming.clone());
+                    if new_tracks.is_empty() {
+                        let unplayed = &state.queue[state.current_index..];
+                        new_tracks = dedup_tracks(unplayed, incoming);
+                    }
+                    let before = state.queue.len();
+                    let added = new_tracks.len();
+                    state.queue.extend(new_tracks);
+                    let should_start = state.current_track.is_none() && !state.queue.is_empty();
+                    (state.queue.clone(), state.queue.len() > before, added, should_start)
+                };
+                eprintln!("[vk wave] raw={} added={} queue={}", raw, added, updated_queue.len());
+                emit_all(&senders, PlayerUiEvent::QueueUpdated(updated_queue));
+                emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                if grew {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.refill_failures = 0;
+                    }
+                    if should_start {
+                        let (track, total, is_liked) = {
+                            let mut state = state_clone.lock().unwrap();
+                            state.wave_refill_in_flight = false;
+                            state.current_index = 0;
+                            let track = state.queue[0].clone();
+                            state.current_track = Some(track.clone());
+                            let is_liked = state.sync_track_like_status(&track.id);
+                            (track, state.queue.len(), is_liked)
+                        };
+                        emit_all(&senders, PlayerUiEvent::LikeStateChanged(is_liked));
+                        emit_all(&senders, PlayerUiEvent::TrackStarted {
+                            track: track.clone(),
+                            index: 0,
+                            total_queue: total,
+                        });
+                        me.play_track_stream(&track);
+                    } else {
+                        me.finish_pending_advance();
+                    }
+                } else {
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.refill_failures += 1;
+                    }
+                    me.mark_wave_refill_dead();
+                }
+                return;
+            }
+
             let client = client_clone.lock().unwrap().clone();
             if !client.has_token() {
+                if let Ok(mut state) = state_clone.lock() {
+                    state.wave_refill_in_flight = false;
+                }
                 emit_all(&senders, PlayerUiEvent::LoadingState(false));
                 return;
             }
@@ -1493,13 +1802,23 @@ impl PlayerManager {
                 match fetched {
                     Ok(station_tracks) => {
                         raw = station_tracks.sequence.len();
-                        let new_tracks: Vec<Track> =
+                        let incoming: Vec<Track> =
                             station_tracks.sequence.into_iter().map(|s| s.track).collect();
                         let mut state = state_clone.lock().unwrap();
                         state.batch_id = station_tracks.batch_id;
-                        // Пост-фильтра здесь нет намеренно: станцию считает сервер,
-                        // а локальная история прослушиваний выбрасывала бы валидные треки.
-                        let new_tracks = dedup_tracks(&state.queue, new_tracks);
+
+                        // 1. Дедуплицируем против скользящего окна (несыгранный хвост + 15 недавних треков)
+                        let start = state.current_index.saturating_sub(15);
+                        let active_window = &state.queue[start..];
+                        let mut new_tracks = dedup_tracks(active_window, incoming.clone());
+
+                        // 2. Если все кандидаты совпали со старой историей,
+                        // не даём волне выдохнуться: берём треки, которых нет только в ещё не сыгранном хвосте
+                        if new_tracks.is_empty() {
+                            let unplayed = &state.queue[state.current_index..];
+                            new_tracks = dedup_tracks(unplayed, incoming);
+                        }
+
                         added = new_tracks.len();
                         state.queue.extend(new_tracks);
                     }
@@ -1608,7 +1927,15 @@ impl PlayerManager {
     /// а треки станции дописываются в очередь следом.
     pub fn start_station(&self, station_id: String, first: Option<Track>, label: String) {
         let provider = self.providers.current();
-        if provider.provider_id() == ProviderId::YouTubeMusic
+        if provider.provider_id() == ProviderId::Vk {
+            if !provider.is_authenticated() {
+                self.emit(PlayerUiEvent::VkAuthRequired);
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Войдите в VK ID для запуска Стрим-микса".to_string(),
+                ));
+                return;
+            }
+        } else if provider.provider_id() == ProviderId::YouTubeMusic
             && first.is_none()
             && (station_id == "user:onyourwave" || station_id.contains("onyourwave"))
             && !provider.is_authenticated()
@@ -1664,9 +1991,18 @@ impl PlayerManager {
         let me = self.clone();
         tokio::spawn(async move {
             let provider = me.providers.current();
+            let is_vk = provider.provider_id() == ProviderId::Vk;
             let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
 
-            let mut result: Result<(Vec<Track>, Option<String>), String> = if is_yt {
+            let mut result: Result<(Vec<Track>, Option<String>), String> = if is_vk {
+                match provider.get_station_tracks(&station_id, None).await {
+                    Ok(batch) => {
+                        let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                        Ok((batch.tracks, b_id))
+                    }
+                    Err(e) => Err(format!("Ошибка VK Музыки: {}", e)),
+                }
+            } else if is_yt {
                 match provider.get_station_tracks(&station_id, None).await {
                     Ok(batch) => {
                         let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
@@ -1708,7 +2044,7 @@ impl PlayerManager {
             }
             match result {
                 Ok((tracks, batch_id)) => {
-                    let tracks = pick_candidates(is_yt, &me.wave_engine, tracks);
+                    let tracks = pick_candidates(is_yt || is_vk, &me.wave_engine, tracks);
                     let tracks = dedup_tracks(&[], tracks);
                     if tracks.is_empty() && first.is_none() {
                         me.emit(PlayerUiEvent::StatusMessage(
@@ -1781,6 +2117,7 @@ impl PlayerManager {
             index,
             total_queue: tracks.len(),
         });
+        self.audio.stop();
         self.play_track_stream(&track);
     }
 
@@ -1817,6 +2154,7 @@ impl PlayerManager {
 
     /// Установка громкости (обновляет целевую громкость user_volume)
     pub fn set_volume(&self, volume: f64) {
+        crate::api::auth::save_volume(volume);
         if self.cast_set_volume(volume) {
             return;
         }
@@ -1883,6 +2221,14 @@ impl PlayerManager {
             || providers_clone.active_id() == ProviderId::YouTubeMusic;
 
         tokio::spawn(async move {
+            if track_source == TrackSource::Vk {
+                if let Some(vk) = providers_clone.get(ProviderId::Vk) {
+                    if let Err(error) = vk.set_track_like(&track_id, liked).await {
+                        eprintln!("[vk] Ошибка синхронизации лайка: {error}");
+                    }
+                }
+                return;
+            }
             if is_yt {
                 let yt_video_id = if track_id.len() == 11 {
                     Some(track_id.clone())
@@ -1990,6 +2336,19 @@ impl PlayerManager {
                 || providers_clone.active_id() == ProviderId::YouTubeMusic;
 
             tokio::spawn(async move {
+                if track_source == TrackSource::Vk {
+                    if let Some(vk) = providers_clone.get(ProviderId::Vk) {
+                        if was_liked {
+                            let _ = vk.set_track_like(&track_id, false).await;
+                        }
+                        if new_dislike {
+                            if let Err(error) = vk.set_track_dislike(&track_id).await {
+                                eprintln!("[vk] Ошибка синхронизации дизлайка: {error}");
+                            }
+                        }
+                    }
+                    return;
+                }
                 if is_yt {
                     let yt_video_id = if track_id.len() == 11 {
                         Some(track_id.clone())
@@ -2078,7 +2437,7 @@ impl PlayerManager {
         eprintln!("[play] #{} {} — {} ({})", epoch, track.title, track.artists_string(), track.id);
 
         let client = self.client.lock().unwrap().clone();
-        spawn_cover_and_lyrics(&self.event_senders, client.clone(), track, epoch, &self.generation, &self.clips);
+        spawn_cover_and_lyrics(&self.event_senders, self.providers.clone(), client.clone(), track, epoch, &self.generation, &self.clips);
         crate::api::history::save_last_track(track);
         crate::api::history::remember_played(&track.id);
         // Историю для пост-фильтра ведём только на стороне YouTube Music: у Яндекса
@@ -2111,16 +2470,20 @@ impl PlayerManager {
         if let Some((path, is_offline)) = cached_opt {
             let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
             emit_all(&senders, PlayerUiEvent::LoadingState(false));
-            let label = if is_offline { "Офлайн" } else { "Диск (0 мс)" };
+            let ext_label = path.extension().and_then(|e| e.to_str()).map(|ext| {
+                match ext {
+                    "flac" => "FLAC (диск)",
+                    "mp3" => "MP3 320 (диск)",
+                    "opus" => "Opus (диск)",
+                    "mka" => "Диск (0 мс)",
+                    _ => "Диск (0 мс)",
+                }
+            }).unwrap_or("Диск (0 мс)");
+            let label = if is_offline { "Офлайн" } else { ext_label };
             emit_all(&senders, PlayerUiEvent::StreamQuality(label.to_string()));
 
-            if crossfade {
-                if was_playing {
-                    audio_clone.crossfade_to_url(&uri, fade_ms);
-                } else {
-                    audio_clone.stop();
-                    audio_clone.play_url_fade_in(&uri, fade_ms);
-                }
+            if crossfade && was_playing {
+                audio_clone.crossfade_to_url(&uri, fade_ms);
             } else {
                 audio_clone.stop();
                 audio_clone.play_url(&uri);
@@ -2152,7 +2515,13 @@ impl PlayerManager {
 
         tokio::spawn(async move {
             let is_yt = track_source == TrackSource::YouTubeMusic;
-            let can_play = is_yt || client.has_token();
+            let can_play = match track_source {
+                TrackSource::YouTubeMusic => true,
+                TrackSource::Vk => providers_clone
+                    .get(ProviderId::Vk)
+                    .is_some_and(|provider| provider.is_authenticated()),
+                TrackSource::Yandex => client.has_token(),
+            };
 
             if can_play {
                 emit_all(&senders, PlayerUiEvent::LoadingState(true));
@@ -2163,40 +2532,50 @@ impl PlayerManager {
                 let result: Result<(String, String), String> = match ready {
                     Some(p) => Ok((p.url, p.label)),
                     None => {
-                        if is_yt {
-                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                match yt.get_stream_url(&track_id).await {
-                                    Ok(url) => Ok((url, "Opus 160".to_string())),
-                                    Err(e) => Err(format!("Ошибка YouTube Music: {}", e)),
-                                }
-                            } else {
-                                Err("Провайдер YouTube Music не найден".to_string())
-                            }
-                        } else {
-                            client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
-                        }
+                        resolve_stream_for_source(
+                            &providers_clone,
+                            &client,
+                            &track_id,
+                            track_source,
+                        )
+                        .await
                     }
                 };
                 eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "ошибка" });
                 if is_stale() {
                     eprintln!("[play] #{} устарел, поток не запускаем", epoch);
-                    if let Ok(mut state) = state_arc.lock() {
-                        state.is_transitioning = false;
-                    }
                     return;
                 }
                 match result {
-                    Ok((url, label)) => {
+                    Ok((mut url, label)) => {
+                        if track_source == TrackSource::Vk && !url.starts_with("file://") {
+                            if let Some(cached_path) = crate::cache::cached_audio_path(&track_id) {
+                                let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&cached_path)).to_string();
+                                eprintln!("[play] Используем закэшированный трек: {}", local_uri);
+                                url = local_uri;
+                            } else if crate::player::audio::is_hls_url(&url) || url.contains(".m3u8") {
+                                // Холодный старт VK HLS трека: скачиваем и упаковываем в .mka перед стартом,
+                                // чтобы исключить разрывы потока на 2-й секунде
+                                eprintln!("[play] Холодный remux HLS трека в mka...");
+                                audio_clone.fade_out(300);
+                                if let Some(cached_path) = download_audio_to_cache(&url, &track_id, "mka").await {
+                                    let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&cached_path)).to_string();
+                                    eprintln!("[play] HLS трек сконвертирован и запущен локально: {}", local_uri);
+                                    url = local_uri;
+                                }
+                            }
+                        }
+
+                        if is_stale() {
+                            eprintln!("[play] #{} устарел после подготовки потока, не запускаем", epoch);
+                            return;
+                        }
+
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
                         emit_all(&senders, PlayerUiEvent::StreamQuality(label));
 
-                        if crossfade {
-                            if was_playing {
-                                audio_clone.crossfade_to_url(&url, fade_ms);
-                            } else {
-                                audio_clone.stop();
-                                audio_clone.play_url_fade_in(&url, fade_ms);
-                            }
+                        if crossfade && was_playing {
+                            audio_clone.crossfade_to_url(&url, fade_ms);
                         } else {
                             audio_clone.stop();
                             audio_clone.play_url(&url);
@@ -2211,23 +2590,43 @@ impl PlayerManager {
                         // Фоновое сохранение играющего трека в audio_cache
                         let cache_tid = track_id.clone();
                         let cache_url = url.clone();
-                        let cache_ext = if is_yt { "opus" } else { "mp3" };
-                        tokio::spawn(async move {
-                            download_audio_to_cache(&cache_url, &cache_tid, cache_ext).await;
-                        });
+                        let cache_ext = if is_yt {
+                            "opus"
+                        } else if cache_url.contains(".flac") || cache_url.contains("type=flac") || cache_url.contains("type=3") {
+                            "flac"
+                        } else {
+                            "mp3"
+                        };
+                        let is_hls = (track_source == TrackSource::Vk && crate::player::audio::is_hls_url(&cache_url)) || cache_url.contains(".m3u8");
+                        if !cache_url.starts_with("file://") && !is_hls {
+                            tokio::spawn(async move {
+                                // Даем 4 секунды конвейеру GStreamer спокойно наполнить буфер звука без конкуренции за сеть
+                                tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                                download_audio_to_cache(&cache_url, &cache_tid, cache_ext).await;
+                            });
+                        }
 
                         // Предзагрузка следующего трека
                         mgr_clone.prefetch_next_track();
-                        if is_yt {
-                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
-                                    track_id: track_id.clone(),
-                                    station_id: station_id.clone(),
-                                    batch_id: batch_id.clone(),
-                                }).await;
+                        match track_source {
+                            TrackSource::YouTubeMusic | TrackSource::Vk => {
+                                if let Some(provider) = providers_clone.get(match track_source {
+                                    TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                                    TrackSource::Vk => ProviderId::Vk,
+                                    TrackSource::Yandex => unreachable!(),
+                                }) {
+                                    let _ = provider
+                                        .send_feedback(FeedbackEvent::TrackStarted {
+                                            track_id: track_id.clone(),
+                                            station_id: station_id.clone(),
+                                            batch_id: batch_id.clone(),
+                                        })
+                                        .await;
+                                }
                             }
-                        } else {
-                            let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
+                            TrackSource::Yandex => {
+                                let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
+                            }
                         }
                     }
                     Err(e) => {
@@ -2235,6 +2634,9 @@ impl PlayerManager {
                             state.is_transitioning = false;
                         }
                         emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                        if track_source == TrackSource::Vk && e.contains("Требуется повторный вход") {
+                            emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                        }
                         emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка получения потока: {}", e)));
                     }
                 }
@@ -2300,15 +2702,12 @@ impl PlayerManager {
                         });
 
                         // Загружаем обложку и текст выбранного трека
-                        spawn_cover_and_lyrics(&senders, client.clone(), &track_to_play, epoch, &stale_gen, &mgr_clone.clips);
+                        spawn_cover_and_lyrics(&senders, providers_clone.clone(), client.clone(), &track_to_play, epoch, &stale_gen, &mgr_clone.clips);
 
                         match yt.get_stream_url(&track_to_play.id).await {
                             Ok(url) => {
                                 if is_stale() {
                                     eprintln!("[play] #{} устарел, поток YT не запускаем", epoch);
-                                    if let Ok(mut state) = state_arc.lock() {
-                                        state.is_transitioning = false;
-                                    }
                                     return;
                                 }
                                 emit_all(&senders, PlayerUiEvent::LoadingState(false));
@@ -2399,6 +2798,39 @@ impl PlayerManager {
         }
 
         let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
+        let is_vk = provider.provider_id() == ProviderId::Vk;
+
+        if is_vk {
+            if !provider.is_authenticated() {
+                self.emit(PlayerUiEvent::VkAuthRequired);
+                self.emit(PlayerUiEvent::StatusMessage(
+                    "Войдите в VK ID для запуска Стрим-микса".to_string(),
+                ));
+                return;
+            }
+            let is_reset = mood.is_none() && language.is_none() && character.is_none();
+            let station_id = if is_reset {
+                crate::api::vk::provider::VK_MIX_STATION_ID.to_string()
+            } else {
+                let mut settings = Vec::new();
+                if let Some(m) = mood.as_deref().filter(|s| !s.is_empty()) {
+                    settings.push(m);
+                }
+                if let Some(l) = language.as_deref().filter(|s| !s.is_empty()) {
+                    settings.push(l);
+                }
+                if let Some(c) = character.as_deref().filter(|s| !s.is_empty()) {
+                    settings.push(c);
+                }
+                if settings.is_empty() {
+                    crate::api::vk::provider::VK_MIX_STATION_ID.to_string()
+                } else {
+                    format!("vk:mix?settings={}", settings.join(","))
+                }
+            };
+            self.apply_wave_station(station_id, mood, language, character);
+            return;
+        }
 
         // YouTube Music: фильтры языка/характера применяются локально и бесшовно
         // (хвост очереди меняется, текущий трек продолжает играть).
@@ -2767,13 +3199,24 @@ impl PlayerManager {
         let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let current_gen = self.generation.clone();
         let clips_clone = self.clips.clone();
+        let me = self.clone();
 
         tokio::spawn(async move {
             let provider = providers_clone.current();
+            let is_vk = provider.provider_id() == ProviderId::Vk;
             let is_yt = provider.provider_id() == ProviderId::YouTubeMusic;
             let client = client_clone.lock().unwrap().clone();
 
-            if is_yt {
+            if is_vk {
+                if !provider.is_authenticated() {
+                    emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                    emit_all(&senders, PlayerUiEvent::StatusMessage(
+                        "Войдите в VK ID для запуска персональной Волны".to_string(),
+                    ));
+                    emit_all(&senders, PlayerUiEvent::WaveLoading(None));
+                    return;
+                }
+            } else if is_yt {
                 if !provider.is_authenticated() {
                     emit_all(&senders, PlayerUiEvent::StatusMessage(
                         "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
@@ -2791,7 +3234,15 @@ impl PlayerManager {
             }
 
             emit_all(&senders, PlayerUiEvent::LoadingState(true));
-            let mut fetch_res: Result<(Vec<Track>, Option<String>), String> = if is_yt {
+            let mut fetch_res: Result<(Vec<Track>, Option<String>), String> = if is_vk {
+                match provider.get_station_tracks(&station_id, None).await {
+                    Ok(batch) => {
+                        let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
+                        Ok((batch.tracks, b_id))
+                    }
+                    Err(e) => Err(format!("Ошибка VK Музыки: {}", e)),
+                }
+            } else if is_yt {
                 match provider.get_station_tracks(&station_id, None).await {
                     Ok(batch) => {
                         let b_id = if batch.batch_id.is_empty() { None } else { Some(batch.batch_id) };
@@ -2864,21 +3315,19 @@ impl PlayerManager {
                         });
 
                         // Обложка и текст первого трека Волны (в остальных случаях их грузит play_track_stream)
-                        spawn_cover_and_lyrics(&senders, client.clone(), &track, epoch, &current_gen, &clips_clone);
+                        spawn_cover_and_lyrics(&senders, providers_clone.clone(), client.clone(), &track, epoch, &current_gen, &clips_clone);
                         crate::api::history::save_last_track(&track);
 
                         // Сразу запускаем воспроизведение первого трека Волны
                         let track_id = track.id.clone();
                         let b_id = batch_id.clone();
-                        let result: Result<(String, String), String> = if track.source == TrackSource::YouTubeMusic {
-                            if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                yt.get_stream_url(&track_id).await.map(|u| (u, "Opus 160".to_string())).map_err(|e| e.to_string())
-                            } else {
-                                Err("YouTube Music недоступен".to_string())
-                            }
-                        } else {
-                            client.get_track_direct_url(&track_id).await.map_err(|e| e.to_string())
-                        };
+                        let result: Result<(String, String), String> = resolve_stream_for_source(
+                            &providers_clone,
+                            &client,
+                            &track_id,
+                            track.source,
+                        )
+                        .await;
 
                         if current_gen.load(Ordering::SeqCst) != epoch {
                             return;
@@ -2894,19 +3343,35 @@ impl PlayerManager {
                                     audio_clone.set_volume(audio_clone.user_volume());
                                 }
                                 emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-                                if track.source == TrackSource::YouTubeMusic {
-                                    if let Some(yt) = providers_clone.get(ProviderId::YouTubeMusic) {
-                                        let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
-                                            track_id: track_id.clone(),
-                                            station_id: station_id.clone(),
-                                            batch_id: b_id,
-                                        }).await;
+                                match track.source {
+                                    TrackSource::YouTubeMusic | TrackSource::Vk => {
+                                        let provider_id = match track.source {
+                                            TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                                            TrackSource::Vk => ProviderId::Vk,
+                                            TrackSource::Yandex => unreachable!(),
+                                        };
+                                        if let Some(provider) = providers_clone.get(provider_id) {
+                                            let _ = provider
+                                                .send_feedback(FeedbackEvent::TrackStarted {
+                                                    track_id: track_id.clone(),
+                                                    station_id: station_id.clone(),
+                                                    batch_id: b_id,
+                                                })
+                                                .await;
+                                        }
                                     }
-                                } else {
-                                    let _ = client.feedback_track_started(&station_id, &track_id, b_id).await;
+                                    TrackSource::Yandex => {
+                                        let _ = client.feedback_track_started(&station_id, &track_id, b_id).await;
+                                    }
+                                }
+                                if tracks.len() < 8 {
+                                    me.load_more_wave_tracks();
                                 }
                             }
                             Err(e) => {
+                                if track.source == TrackSource::Vk && e.contains("Требуется повторный вход") {
+                                    emit_all(&senders, PlayerUiEvent::VkAuthRequired);
+                                }
                                 emit_all(&senders, PlayerUiEvent::Error(format!("Ошибка старта Волны: {}", e)));
                             }
                         }
@@ -2928,6 +3393,9 @@ impl PlayerManager {
 
 /// Скачивает аудиопоток в дисковый кэш (~/.cache/volna/audio/) и очищает старые треки по LRU
 async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option<std::path::PathBuf> {
+    if url.starts_with("file://") {
+        return None;
+    }
     let final_path = crate::cache::final_audio_cache_path(track_id, ext);
     if final_path.exists() {
         if let Ok(meta) = final_path.metadata() {
@@ -2936,7 +3404,79 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
             }
         }
     }
+    let _guard = {
+        let mut locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
+        while locks.contains(track_id) {
+            drop(locks);
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Если пока мы ждали, другой поток уже скачал файл:
+            let final_path = crate::cache::final_audio_cache_path(track_id, ext);
+            if final_path.exists() {
+                if let Ok(meta) = final_path.metadata() {
+                    if meta.len() > 128 * 1024 {
+                        return Some(final_path);
+                    }
+                }
+            }
+            locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
+        }
+        locks.insert(track_id.to_string());
+        // Возвращаем RAII guard, который при выходе из функции удалит track_id из locks
+        struct DownloadGuard(String);
+        impl Drop for DownloadGuard {
+            fn drop(&mut self) {
+                let id = self.0.clone();
+                tokio::spawn(async move {
+                    let mut locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
+                    locks.remove(&id);
+                });
+            }
+        }
+        DownloadGuard(track_id.to_string())
+    };
+
     let tmp = crate::cache::temp_audio_cache_path(track_id, ext);
+
+    if crate::player::audio::is_hls_url(url) || ext == "mka" {
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.arg("-y")
+            .arg("-nostdin")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-user_agent")
+            .arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15")
+            .arg("-rw_timeout")
+            .arg("15000000") // 15 секунд в микросекундах
+            .arg("-i")
+            .arg(url)
+            .arg("-vn")
+            .arg("-map")
+            .arg("0:a:0")
+            .arg("-c")
+            .arg("copy")
+            .arg("-f")
+            .arg("matroska")
+            .arg(&tmp);
+        cmd.kill_on_drop(true);
+
+        let output = cmd.output().await.ok()?;
+        if output.status.success() && tmp.exists() {
+            if let Ok(meta) = tmp.metadata() {
+                if meta.len() > 128 * 1024 {
+                    std::fs::rename(&tmp, &final_path).ok()?;
+                    crate::cache::clean_audio_cache_lru(600 * 1024 * 1024);
+                    eprintln!("[cache] HLS трек успешно сохранен в mka: {:?}", final_path);
+                    return Some(final_path);
+                }
+            }
+        } else {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[cache] ffmpeg remux ошибка: {}", err_msg);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -2959,6 +3499,7 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
 /// Если у трека текста нет, UI получает пустую строку: старый текст предыдущего трека не остаётся.
 fn spawn_cover_and_lyrics(
     senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
+    providers: Arc<ProviderManager>,
     client: YandexMusicClient,
     track: &Track,
     epoch: u64,
@@ -2994,7 +3535,7 @@ fn spawn_cover_and_lyrics(
         });
     }
 
-    if crate::api::auth::load_clips() {
+    if crate::api::auth::load_clips() && track.source != TrackSource::Vk {
         let (senders, generation, client, clip_track) = (senders.clone(), generation.clone(), client.clone(), track.clone());
         tokio::spawn(async move {
             // свои клипы альбома важнее клипов Яндекса
@@ -3011,7 +3552,7 @@ fn spawn_cover_and_lyrics(
                 return;
             }
             // клипом YouTube Music занимается ClipBackground: резолв, кэш и арт-треки
-            if clip_track.source == TrackSource::YouTubeMusic {
+            if clip_track.source == TrackSource::YouTubeMusic || clip_track.source == TrackSource::Vk {
                 return;
             }
             let path = match client.get_clip_url_for_track(&clip_track).await {
@@ -3047,6 +3588,7 @@ fn spawn_cover_and_lyrics(
     let (track_id, title, artist) = (track.id.clone(), track.title.clone(), track.artists_string());
     let duration = track.duration_ms.map(|d| d / 1000);
     let track_source = track.source;
+    let track_for_lyrics = track.clone();
     tokio::spawn(async move {
         // Клиент YouTube Music нужен и для длительности, и для фолбэка на официальный текст
         let ytm = crate::api::ytmusic::YtMusicClient::new();
@@ -3066,7 +3608,15 @@ fn spawn_cover_and_lyrics(
             None => None,
         };
 
-        let text = if is_yt {
+        let text = if track_source == TrackSource::Vk {
+            match providers.get(ProviderId::Vk) {
+                Some(provider) => provider
+                    .get_track_lyrics(&track_for_lyrics)
+                    .await
+                    .unwrap_or_default(),
+                None => String::new(),
+            }
+        } else if is_yt {
             static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
             let http = HTTP.get_or_init(|| {
                 reqwest::Client::builder()

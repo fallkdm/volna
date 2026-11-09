@@ -244,7 +244,7 @@ impl ClipController {
                             let position = provider.as_ref().and_then(|f| f());
                             let (start_ms, playing) = position.unwrap_or((0, false));
                             playing_out.set(playing);
-                            if start_ms > 100 {
+                            if kind == crate::player::ClipKind::YouTubeFull && start_ms > 100 {
                                 let _ = pipeline.seek_simple(
                                     gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::ACCURATE,
                                     gstreamer::ClockTime::from_mseconds(start_ms),
@@ -400,6 +400,9 @@ impl ClipController {
 
     /// Точная перемотка (караоке, слайдер)
     pub fn seek_ms(&self, ms: u64) {
+        if self.kind.get() != crate::player::ClipKind::YouTubeFull {
+            return;
+        }
         if let Some(pipeline) = self.pipeline.borrow().as_ref() {
             let _ = pipeline.seek_simple(
                 gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::ACCURATE,

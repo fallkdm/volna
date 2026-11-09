@@ -17,7 +17,48 @@ use crate::ui::VolnaWindow;
 
 const APP_ID: &str = "io.github.fallkdm.Volna";
 
+/// Ограничивает число malloc-арен glibc.
+///
+/// У плеера много потоков (GTK, GStreamer, Tokio, сеть), и glibc создаёт
+/// отдельную арену почти под каждый. К моменту, когда все они разрастаются,
+/// в памяти висит 200+ МБ пустых арен. Двух арен хватает с запасом.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_allocator() {
+    unsafe extern "C" {
+        fn mallopt(param: std::os::raw::c_int, value: std::os::raw::c_int) -> std::os::raw::c_int;
+    }
+    // M_ARENA_MAX из <malloc.h>; тестовый harness может задать 2/4/env.
+    const M_ARENA_MAX: std::os::raw::c_int = -8;
+    let arena_max = std::env::var("M_ARENA_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(2)
+        .clamp(1, 64);
+    unsafe {
+        let _ = mallopt(M_ARENA_MAX, arena_max);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_allocator() {}
+
+/// Возвращает освободившуюся heap-память системе (glibc не делает это сам).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn trim_allocator() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+    }
+    unsafe {
+        let _ = malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn trim_allocator() {}
+
 fn main() {
+    tune_allocator();
+
     // Инициализируем многопоточный Tokio runtime для фоновых сетевых запросов и MPRIS D-Bus
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -142,6 +183,12 @@ fn main() {
                 // Создаем и отображаем главное окно приложения
                 let window = VolnaWindow::new(app, player, ui_rx);
                 window.present();
+
+                // Фоновый возврат освободившейся памяти ОС каждые 45 секунд
+                gtk4::glib::timeout_add_seconds_local(45, || {
+                    std::thread::spawn(|| crate::trim_allocator());
+                    glib::ControlFlow::Continue
+                });
             }
             Err(e) => {
                 eprintln!("Ошибка инициализации аудио-движка: {}", e);

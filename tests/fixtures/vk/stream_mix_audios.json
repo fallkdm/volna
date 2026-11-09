@@ -1,0 +1,23 @@
+{
+  "response": {
+    "items": [
+      {
+        "id": 456240200,
+        "owner_id": 1234567,
+        "artist": "Mix Artist",
+        "title": "Mix Track One",
+        "duration": 173,
+        "url": "https://audio.example.invalid/mix/one.m3u8"
+      },
+      {
+        "id": 456240201,
+        "owner_id": 1234567,
+        "artist": "Mix Artist",
+        "title": "Mix Track Two",
+        "duration": 188,
+        "url": "https://audio.example.invalid/mix/two.mp3"
+      }
+    ],
+    "context": "eyJjb250cmFjdF9maXh0dXJlIjp0cnVlfQ=="
+  }
+}
