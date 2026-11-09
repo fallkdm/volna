@@ -302,3 +302,29 @@ fn test_vk_history_roundtrip() {
     assert!(after_clear.is_empty(), "После clear_history_for история VK должна быть пуста");
 }
 
+#[test]
+fn test_vk_playlist_dto_parses_access_key() {
+    let json_data = r#"{
+        "id": 42,
+        "owner_id": 123456,
+        "title": "Плейлист с access_key",
+        "access_key": "abc123"
+    }"#;
+    let playlist: volna::api::vk::models::VkPlaylistDto =
+        serde_json::from_str(json_data).expect("Failed to deserialize VkPlaylistDto with access_key");
+    assert_eq!(playlist.id, 42);
+    assert_eq!(playlist.owner_id, 123456);
+    assert_eq!(playlist.title, "Плейлист с access_key");
+    assert_eq!(playlist.access_key.as_deref(), Some("abc123"));
+
+    // Проверяем дефолтное значение Option (None), если access_key отсутствует
+    let json_without_key = r#"{
+        "id": 43,
+        "owner_id": 123456,
+        "title": "Плейлист без access_key"
+    }"#;
+    let playlist_no_key: volna::api::vk::models::VkPlaylistDto =
+        serde_json::from_str(json_without_key).expect("Failed to deserialize VkPlaylistDto without access_key");
+    assert_eq!(playlist_no_key.access_key, None);
+}
+

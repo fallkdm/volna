@@ -324,6 +324,42 @@ impl VkClient {
         .await
     }
 
+    pub async fn get_playlist_audios(
+        &self,
+        owner_id: i64,
+        playlist_id: i64,
+        access_key: Option<&str>,
+    ) -> Result<Vec<VkAudioDto>, VkError> {
+        let owner_str = owner_id.to_string();
+        let playlist_str = playlist_id.to_string();
+        let mut audios = Vec::new();
+        let mut offset = 0u32;
+        loop {
+            let offset_str = offset.to_string();
+            let mut params = vec![
+                ("owner_id", owner_str.as_str()),
+                ("playlist_id", playlist_str.as_str()),
+                ("album_id", playlist_str.as_str()),
+                ("offset", offset_str.as_str()),
+                ("count", "100"),
+            ];
+            if let Some(key) = access_key {
+                params.push(("access_key", key));
+            }
+            let res: VkAudioListDto = self.call("audio.get", &params).await?;
+            if res.items.is_empty() {
+                break;
+            }
+            let count = res.items.len() as u32;
+            audios.extend(res.items);
+            if audios.len() as u64 >= res.count || count < 100 {
+                break;
+            }
+            offset += count;
+        }
+        Ok(audios)
+    }
+
     /// Обновляет до 100 аудиозаписей за один вызов `audio.getById`.
     pub async fn get_audio_by_id(&self, track_ids: &[String]) -> Result<Vec<VkAudioDto>, VkError> {
         if track_ids.is_empty() {

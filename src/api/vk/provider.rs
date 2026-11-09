@@ -547,14 +547,30 @@ impl MusicProvider for VkProvider {
                 return Ok(liked);
             }
         }
-        let pl_meta = self
+
+        // 1. Пробуем получить треки напрямую через audio.get(owner_id, playlist_id)
+        let mut audios = self
             .client
-            .get_playlist_by_id(id.owner_id, id.audio_id)
+            .get_playlist_audios(id.owner_id, id.audio_id, None)
             .await
-            .map_err(boxed)?;
-        if !pl_meta.audios.is_empty() {
+            .unwrap_or_default();
+
+        // 2. Если пусто, пробуем запросить метаданные плейлиста для получения access_key (если плейлист закрытый/сообщества)
+        if audios.is_empty() {
+            if let Ok(pl_meta) = self.client.get_playlist_by_id(id.owner_id, id.audio_id).await {
+                if !pl_meta.audios.is_empty() {
+                    audios = pl_meta.audios;
+                } else if let Some(ref key) = pl_meta.access_key {
+                    if let Ok(items) = self.client.get_playlist_audios(id.owner_id, id.audio_id, Some(key)).await {
+                        audios = items;
+                    }
+                }
+            }
+        }
+
+        if !audios.is_empty() {
             if let Ok(mut cache) = self.stream_urls.write() {
-                for audio in &pl_meta.audios {
+                for audio in &audios {
                     if !audio.is_playable() {
                         continue;
                     }
@@ -563,8 +579,9 @@ impl MusicProvider for VkProvider {
                     }
                 }
             }
-            return Ok(deduplicate_tracks(pl_meta.audios));
+            return Ok(deduplicate_tracks(audios));
         }
+
         if id.audio_id == 7 || playlist.title.contains("Мне нравится") {
             return self.get_liked_tracks().await;
         }

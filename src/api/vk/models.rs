@@ -372,6 +372,8 @@ pub struct VkPlaylistDto {
     pub photo: Option<VkThumbDto>,
     #[serde(default)]
     pub audios: Vec<VkAudioDto>,
+    #[serde(default)]
+    pub access_key: Option<String>,
 }
 
 /// Список плейлистов с общим количеством результатов.
