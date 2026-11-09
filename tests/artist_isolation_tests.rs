@@ -272,4 +272,33 @@ fn test_listeners_metric_formatting() {
     assert_eq!(group_digits(10_000), "10\u{a0}000");
 }
 
+#[test]
+fn test_vk_history_roundtrip() {
+    use volna::api::history::{clear_history_for, load_history_for, push_history_for, HistoryItem};
+    use volna::api::models::Artist;
+    use volna::api::provider::ProviderId;
+
+    clear_history_for(ProviderId::Vk);
+    let artist_item = HistoryItem::Artist(Artist {
+        id: "vk:123".into(),
+        name: "VK Artist".into(),
+        cover: None,
+    });
+    push_history_for(ProviderId::Vk, artist_item);
+
+    let loaded = load_history_for(ProviderId::Vk);
+    assert!(!loaded.is_empty(), "История VK должна содержать элементы");
+    let found = loaded.iter().any(|item| match item {
+        HistoryItem::Artist(a) => a.id == "vk:123" && a.name == "VK Artist",
+        _ => false,
+    });
+    assert!(
+        found,
+        "Сохраненный артист с id vk:123 должен возвращаться load_history_for(ProviderId::Vk)"
+    );
+
+    clear_history_for(ProviderId::Vk);
+    let after_clear = load_history_for(ProviderId::Vk);
+    assert!(after_clear.is_empty(), "После clear_history_for история VK должна быть пуста");
+}
 

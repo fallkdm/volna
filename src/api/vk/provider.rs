@@ -188,11 +188,157 @@ impl MusicProvider for VkProvider {
                         }
                     }
                 }
+
+                let tracks = deduplicate_tracks(response.items.clone());
+
+                let mut artist_counts: HashMap<(Option<i64>, String), (usize, Option<String>)> =
+                    HashMap::new();
+
+                for audio in &response.items {
+                    let audio_cover = audio
+                        .album
+                        .as_ref()
+                        .and_then(|alb| alb.thumb.as_ref())
+                        .and_then(|th| th.best_url())
+                        .map(str::to_owned);
+
+                    if let Some(ref main_artists) = audio.main_artists {
+                        if !main_artists.is_empty() {
+                            for a in main_artists {
+                                let name = a.name.trim();
+                                if !name.is_empty() {
+                                    let vk_artist_id =
+                                        a.id.as_deref().and_then(|id_str| id_str.parse::<i64>().ok());
+                                    let entry = artist_counts
+                                        .entry((vk_artist_id, name.to_string()))
+                                        .or_insert((0, None));
+                                    entry.0 += 1;
+                                    if entry.1.is_none() && audio_cover.is_some() {
+                                        entry.1 = audio_cover.clone();
+                                    }
+                                }
+                            }
+                        } else {
+                            for part in audio.artist.split([',', '&', '/']) {
+                                let name = part.trim();
+                                if !name.is_empty() {
+                                    let entry = artist_counts
+                                        .entry((None, name.to_string()))
+                                        .or_insert((0, None));
+                                    entry.0 += 1;
+                                    if entry.1.is_none() && audio_cover.is_some() {
+                                        entry.1 = audio_cover.clone();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for part in audio.artist.split([',', '&', '/']) {
+                            let name = part.trim();
+                            if !name.is_empty() {
+                                let entry = artist_counts
+                                    .entry((None, name.to_string()))
+                                    .or_insert((0, None));
+                                entry.0 += 1;
+                                if entry.1.is_none() && audio_cover.is_some() {
+                                    entry.1 = audio_cover.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let query_lower = query_clean.to_lowercase();
+                let mut artist_list: Vec<((Option<i64>, String), (usize, Option<String>))> =
+                    artist_counts.into_iter().collect();
+
+                artist_list.sort_by(|((_, name_a), (count_a, _)), ((_, name_b), (count_b, _))| {
+                    let rank_a = if name_a.eq_ignore_ascii_case(query_clean)
+                        || name_a.to_lowercase() == query_lower
+                    {
+                        0
+                    } else if name_a.to_lowercase().contains(&query_lower) {
+                        1
+                    } else {
+                        2
+                    };
+                    let rank_b = if name_b.eq_ignore_ascii_case(query_clean)
+                        || name_b.to_lowercase() == query_lower
+                    {
+                        0
+                    } else if name_b.to_lowercase().contains(&query_lower) {
+                        1
+                    } else {
+                        2
+                    };
+
+                    rank_a
+                        .cmp(&rank_b)
+                        .then_with(|| count_b.cmp(count_a))
+                        .then_with(|| name_a.cmp(name_b))
+                });
+
+                let artists: Vec<crate::api::models::Artist> = artist_list
+                    .into_iter()
+                    .take(10)
+                    .map(|((vk_artist_id, name), (_count, cover))| {
+                        let id = match vk_artist_id {
+                            Some(id) => format!("vk:{}", id),
+                            None => {
+                                format!("vk:name:{}", glib::Uri::escape_string(&name, None, true))
+                            }
+                        };
+                        let cover = cover.map(|uri| crate::api::models::ArtistCover { uri: Some(uri) });
+                        crate::api::models::Artist { id, name, cover }
+                    })
+                    .collect();
+
+                let mut albums_map: HashMap<(i64, i64), (Album, usize)> = HashMap::new();
+                for audio in &response.items {
+                    if let Some(alb) = &audio.album {
+                        let key = (alb.owner_id.unwrap_or(self.owner_id), alb.id);
+                        let entry = albums_map
+                            .entry(key)
+                            .or_insert_with(|| (alb.clone().into_album(), 0));
+                        entry.1 += 1;
+                    }
+                }
+
+                let mut albums_sorted: Vec<(Album, usize)> = albums_map.into_values().collect();
+                albums_sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                let albums: Vec<Album> =
+                    albums_sorted.into_iter().take(12).map(|(a, _)| a).collect();
+
+                let mut playlists = Vec::new();
+                if let Ok(pl_res) = self.client.search_playlists(query_clean, 10).await {
+                    for pl in pl_res.items {
+                        if pl.owner_id < 0 {
+                            playlists.push(into_playlist(pl));
+                        }
+                    }
+                }
+
                 Ok(SearchResult {
-                    tracks: Some(SearchSection {
-                        results: deduplicate_tracks(response.items),
-                    }),
-                    ..Default::default()
+                    tracks: if tracks.is_empty() {
+                        None
+                    } else {
+                        Some(SearchSection { results: tracks })
+                    },
+                    artists: if artists.is_empty() {
+                        None
+                    } else {
+                        Some(SearchSection { results: artists })
+                    },
+                    albums: if albums.is_empty() {
+                        None
+                    } else {
+                        Some(SearchSection { results: albums })
+                    },
+                    playlists: if playlists.is_empty() {
+                        None
+                    } else {
+                        Some(SearchSection { results: playlists })
+                    },
                 })
             }
             Err(VkError::Api { code: 3, .. }) | Err(VkError::Api { code: 15, .. }) => {

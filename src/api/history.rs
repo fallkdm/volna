@@ -32,28 +32,36 @@ impl HistoryItem {
     pub fn provider(&self) -> ProviderId {
         match self {
             Self::Track(t) => {
-                if t.source == crate::api::models::TrackSource::YouTubeMusic || t.id.len() == 11 {
+                if t.source == crate::api::models::TrackSource::Vk || t.id.starts_with("vk:") {
+                    ProviderId::Vk
+                } else if t.source == crate::api::models::TrackSource::YouTubeMusic || t.id.len() == 11 {
                     ProviderId::YouTubeMusic
                 } else {
                     ProviderId::Yandex
                 }
             }
             Self::Artist(a) => {
-                if a.id.starts_with("UC") {
+                if a.id.starts_with("vk:") {
+                    ProviderId::Vk
+                } else if a.id.starts_with("UC") {
                     ProviderId::YouTubeMusic
                 } else {
                     ProviderId::Yandex
                 }
             }
             Self::Album(a) => {
-                if a.id.starts_with("MPRE") {
+                if a.id.starts_with("vk:") {
+                    ProviderId::Vk
+                } else if a.id.starts_with("MPRE") {
                     ProviderId::YouTubeMusic
                 } else {
                     ProviderId::Yandex
                 }
             }
             Self::Playlist(p) => {
-                if p.kind.starts_with("VL") || p.kind.starts_with("PL") || p.uid.starts_with("VL") {
+                if p.id().starts_with("vk:") || p.uid.starts_with("vk:") {
+                    ProviderId::Vk
+                } else if p.kind.starts_with("VL") || p.kind.starts_with("PL") || p.uid.starts_with("VL") {
                     ProviderId::YouTubeMusic
                 } else {
                     ProviderId::Yandex
@@ -76,6 +84,14 @@ fn with_item(mut list: Vec<HistoryItem>, item: HistoryItem) -> Vec<HistoryItem> 
 pub fn load_history_for(provider: ProviderId) -> Vec<HistoryItem> {
     let mut config = load_config().unwrap_or_default();
     match provider {
+        ProviderId::Vk => {
+            config
+                .vk_history_items
+                .into_iter()
+                .filter_map(|v| serde_json::from_value::<HistoryItem>(v).ok())
+                .take(LIMIT)
+                .collect()
+        }
         ProviderId::YouTubeMusic => {
             // Если в ytmusic_history_items пока пусто, мигрируем элементы YouTube Music и удаляем их из history_items
             if config.ytmusic_history_items.is_empty() {
@@ -111,13 +127,23 @@ pub fn load_history_for(provider: ProviderId) -> Vec<HistoryItem> {
                 .take(LIMIT)
                 .collect()
         }
-        _ => Vec::new(),
     }
 }
 
 pub fn push_history_for(provider: ProviderId, item: HistoryItem) {
     let mut config = load_config().unwrap_or_default();
     match provider {
+        ProviderId::Vk => {
+            let list: Vec<HistoryItem> = config
+                .vk_history_items
+                .drain(..)
+                .filter_map(|v| serde_json::from_value::<HistoryItem>(v).ok())
+                .collect();
+            config.vk_history_items = with_item(list, item)
+                .iter()
+                .filter_map(|i| serde_json::to_value(i).ok())
+                .collect();
+        }
         ProviderId::YouTubeMusic => {
             let list: Vec<HistoryItem> = config
                 .ytmusic_history_items
@@ -141,7 +167,6 @@ pub fn push_history_for(provider: ProviderId, item: HistoryItem) {
                 .filter_map(|i| serde_json::to_value(i).ok())
                 .collect();
         }
-        _ => {}
     }
     let _ = save_config(&config);
 }
@@ -149,6 +174,9 @@ pub fn push_history_for(provider: ProviderId, item: HistoryItem) {
 pub fn clear_history_for(provider: ProviderId) {
     let mut config = load_config().unwrap_or_default();
     match provider {
+        ProviderId::Vk => {
+            config.vk_history_items.clear();
+        }
         ProviderId::YouTubeMusic => {
             config.ytmusic_history_items.clear();
             config.history_items.retain(|v| {
@@ -168,7 +196,6 @@ pub fn clear_history_for(provider: ProviderId) {
                 }
             });
         }
-        _ => {}
     }
     let _ = save_config(&config);
 }

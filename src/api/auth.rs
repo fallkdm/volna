@@ -92,6 +92,9 @@ pub struct AppConfig {
     /// История поиска YouTube Music
     #[serde(default)]
     pub ytmusic_history_items: Vec<serde_json::Value>,
+    /// История поиска VK Музыки
+    #[serde(default)]
+    pub vk_history_items: Vec<serde_json::Value>,
     /// Числовой ID аккаунта VK (для audio.getPlaylists)
     #[serde(default)]
     pub vk_user_id: Option<i64>,
@@ -121,6 +124,7 @@ impl Default for AppConfig {
             station_id: None,
             history_items: Vec::new(),
             ytmusic_history_items: Vec::new(),
+            vk_history_items: Vec::new(),
             crossfade: false,
             crossfade_duration: 3,
             nav_style: None,
