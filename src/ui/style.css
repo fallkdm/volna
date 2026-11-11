@@ -33,20 +33,49 @@
 }
 
 .hero-track-title {
-    font-size: 68px;
     font-weight: 800;
-    letter-spacing: -1.2px;
     line-height: 1.1;
     color: #ffffff;
     text-shadow: 0 4px 24px rgba(0, 0, 0, 0.85);
 }
 
+.hero-track-title,
+.hero-track-title.hero-title-xl {
+    font-size: 68px;
+    letter-spacing: -1.2px;
+}
+
+.hero-track-title.hero-title-lg {
+    font-size: 52px;
+    letter-spacing: -0.8px;
+}
+
+.hero-track-title.hero-title-md {
+    font-size: 40px;
+    letter-spacing: -0.5px;
+}
+
+.hero-track-title.hero-title-sm {
+    font-size: 34px;
+    letter-spacing: -0.3px;
+    line-height: 1.15;
+}
+
+.hero-track-version {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.15px;
+    color: rgba(255, 255, 255, 0.66);
+    text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
+    margin-top: 2px;
+}
+
 .hero-track-artist {
-    font-size: 18px;
+    font-size: 17px;
     font-weight: 500;
     color: rgba(255, 255, 255, 0.82);
     text-shadow: 0 2px 10px rgba(0, 0, 0, 0.65);
-    margin-top: 6px;
+    margin-top: 4px;
 }
 
 /* Круглая центральная стеклянная кнопка волны */

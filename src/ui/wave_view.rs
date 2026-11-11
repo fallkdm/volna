@@ -101,11 +101,20 @@ impl WaveShaderState {
 /// Выбранный пункт фильтра: значение, подпись и цвет
 type Pick = Option<(&'static str, &'static str, [f64; 3])>;
 
+const TITLE_SIZE_CLASSES: [&str; 4] = [
+    "hero-title-xl",
+    "hero-title-lg",
+    "hero-title-md",
+    "hero-title-sm",
+];
+
 pub struct WaveViewWidgets {
     pub container: Overlay,
     pub title_label: Label,
+    pub version_label: Label,
     pub explicit_badge: Label,
     pub artist_label: Label,
+    pub meta_clamp: libadwaita::Clamp,
     pub play_btn: Button,
     pub play_btn_icon: gtk4::Image,
     pub menu_button: Button,
@@ -162,6 +171,80 @@ impl WaveViewWidgets {
 }
 
 impl WaveViewWidgets {
+    /// CSS-класс размера заголовка по числу символов названия
+    pub fn title_size_class(char_len: usize) -> &'static str {
+        match char_len {
+            0..=15 => "hero-title-xl",
+            16..=26 => "hero-title-lg",
+            27..=42 => "hero-title-md",
+            _ => "hero-title-sm",
+        }
+    }
+
+    fn apply_title_size_class(&self, class: &str) {
+        for c in TITLE_SIZE_CLASSES {
+            if c == class {
+                self.title_label.add_css_class(c);
+            } else {
+                self.title_label.remove_css_class(c);
+            }
+        }
+    }
+
+    /// Обновляет метаданные трека на экране Волны: заголовок с адаптивным кеглем,
+    /// отдельная строка версии, бейдж `[E]` и подпись «артисты • альбом»
+    pub fn set_track_meta(&self, track: &crate::api::models::Track) {
+        self.title_label.set_text(&track.title);
+        self.apply_title_size_class(Self::title_size_class(track.title.chars().count()));
+
+        match track
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            Some(v) => {
+                self.version_label.set_text(v);
+                self.version_label.set_visible(true);
+            }
+            None => {
+                self.version_label.set_text("");
+                self.version_label.set_visible(false);
+            }
+        }
+
+        self.explicit_badge.set_visible(track.is_explicit());
+
+        let artists = track.artists_string();
+        let album = track
+            .albums
+            .first()
+            .and_then(|a| a.title.as_deref())
+            .map(str::trim)
+            .unwrap_or("");
+        let subtitle = if album.is_empty() || album.eq_ignore_ascii_case("unnamed") {
+            artists
+        } else {
+            format!("{} • {}", artists, album)
+        };
+        self.artist_label.set_text(&subtitle);
+    }
+
+    /// Устанавливает заглушечный заголовок и подзаголовок (до запуска потока / после выхода)
+    pub fn set_idle_meta(&self, title: &str, subtitle: &str) {
+        self.title_label.set_text(title);
+        self.apply_title_size_class("hero-title-xl");
+        self.version_label.set_text("");
+        self.version_label.set_visible(false);
+        self.explicit_badge.set_visible(false);
+        self.artist_label.set_text(subtitle);
+    }
+
+    /// Обновляет максимальную ширину блока метаданных
+    pub fn set_clamp_width(&self, width: i32) {
+        self.meta_clamp.set_maximum_size(width);
+    }
+
     /// Плашка типа Волны (по артисту или треку); `None` — убрать плашку
     pub fn set_context(&self, label: Option<&str>) {
         match label {
@@ -399,25 +482,30 @@ pub fn create_wave_view(
     // Вертикальная компоновка: кнопка Play по центру сферы, а текст и настройки строго ПОД сферой!
     let content_box = GtkBox::new(Orientation::Vertical, 0);
     content_box.set_valign(Align::Center);
-    content_box.set_halign(Align::Center);
+    content_box.set_halign(Align::Fill);
+    content_box.set_hexpand(true);
     content_box.set_margin_bottom(50); // Учитываем нижний плавающий остров плеера
 
     content_box.append(&play_btn);
 
     // Блок метаданных и кнопки настроек: размещен под кнопкой Play; отступ подобран, чтобы кнопка настроек не уходила под плеер
     let bottom_box = GtkBox::new(Orientation::Vertical, 6);
-    bottom_box.set_halign(Align::Center);
+    bottom_box.set_halign(Align::Fill);
     bottom_box.set_margin_top(110);
 
     let title_label = Label::new(Some("Волна"));
     title_label.add_css_class("hero-track-title");
+    title_label.add_css_class("hero-title-xl");
     title_label.set_wrap(true);
     title_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-    title_label.set_justify(gtk4::Justification::Center);
-    title_label.set_max_width_chars(28);
+    title_label.set_lines(2);
     title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    title_label.set_justify(gtk4::Justification::Center);
+    title_label.set_max_width_chars(-1);
+    title_label.set_hexpand(false);
     let explicit_badge = super::collection::explicit_badge();
     explicit_badge.set_margin_start(12);
+    explicit_badge.set_valign(Align::Center);
     explicit_badge.add_css_class("hero");
     let title_row = GtkBox::new(Orientation::Horizontal, 0);
     title_row.set_halign(Align::Center);
@@ -425,13 +513,25 @@ pub fn create_wave_view(
     title_row.append(&explicit_badge);
     bottom_box.append(&title_row);
 
+    let version_label = Label::new(None);
+    version_label.add_css_class("hero-track-version");
+    version_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    version_label.set_lines(1);
+    version_label.set_max_width_chars(-1);
+    version_label.set_justify(gtk4::Justification::Center);
+    version_label.set_halign(Align::Center);
+    version_label.set_visible(false);
+    bottom_box.append(&version_label);
+
     let artist_label = Label::new(Some("Нажмите для запуска персонального потока 🌊"));
     artist_label.add_css_class("hero-track-artist");
     artist_label.set_wrap(true);
     artist_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-    artist_label.set_justify(gtk4::Justification::Center);
-    artist_label.set_max_width_chars(32);
+    artist_label.set_lines(2);
     artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    artist_label.set_justify(gtk4::Justification::Center);
+    artist_label.set_max_width_chars(-1);
+    artist_label.set_halign(Align::Center);
     bottom_box.append(&artist_label);
 
     // Центральная кнопка фильтров Ротора «Настроить волну»
@@ -778,7 +878,14 @@ pub fn create_wave_view(
     }
 
     bottom_box.append(&menu_button);
-    content_box.append(&bottom_box);
+
+    let meta_clamp = libadwaita::Clamp::new();
+    meta_clamp.set_maximum_size(490);
+    meta_clamp.set_tightening_threshold(400);
+    meta_clamp.set_margin_start(24);
+    meta_clamp.set_margin_end(24);
+    meta_clamp.set_child(Some(&bottom_box));
+    content_box.append(&meta_clamp);
 
     // Обработчик центральной кнопки Play
     {
@@ -796,8 +903,10 @@ pub fn create_wave_view(
     WaveViewWidgets {
         container: root_overlay,
         title_label,
+        version_label,
         explicit_badge,
         artist_label,
+        meta_clamp,
         play_btn,
         play_btn_icon,
         menu_button,
@@ -930,5 +1039,26 @@ mod palette_tests {
         // Акцент тёплый: R > G > B. Регрессия «пожелтело/посинело» ловится здесь.
         assert!(core[0] > core[1] && core[1] > core[2], "оттенок уехал: {core:?}");
         assert!((deep[0] - core[0] * 0.32).abs() < 1e-9, "deep не производный от core: {deep:?}");
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::WaveViewWidgets;
+
+    #[test]
+    fn title_size_class_respects_thresholds() {
+        assert_eq!(WaveViewWidgets::title_size_class(0), "hero-title-xl");
+        assert_eq!(WaveViewWidgets::title_size_class(5), "hero-title-xl");
+        assert_eq!(WaveViewWidgets::title_size_class(15), "hero-title-xl");
+
+        assert_eq!(WaveViewWidgets::title_size_class(16), "hero-title-lg");
+        assert_eq!(WaveViewWidgets::title_size_class(26), "hero-title-lg");
+
+        assert_eq!(WaveViewWidgets::title_size_class(27), "hero-title-md");
+        assert_eq!(WaveViewWidgets::title_size_class(42), "hero-title-md");
+
+        assert_eq!(WaveViewWidgets::title_size_class(43), "hero-title-sm");
+        assert_eq!(WaveViewWidgets::title_size_class(120), "hero-title-sm");
     }
 }

@@ -26,6 +26,19 @@ const SIDEBAR_COLLAPSED_WIDTH: i32 = 68;
 const CONTENT_GUTTER_EXPANDED: i32 = 24;
 const CONTENT_GUTTER_COLLAPSED: i32 = 36;
 const CONTENT_GUTTER_DEFAULT: i32 = 32;
+const WAVE_CLAMP_WIDE: f64 = 660.0;
+const WAVE_CLAMP_NARROW: f64 = 490.0;
+
+/// Вычисляет максимальную ширину мета-блока Волны в зависимости от сайдбара
+fn wave_clamp_for_sidebar(is_spotify_nav: bool, sidebar_width: i32) -> i32 {
+    if !is_spotify_nav {
+        return WAVE_CLAMP_WIDE as i32;
+    }
+    let t = ((sidebar_width as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)
+        / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64))
+        .clamp(0.0, 1.0);
+    (WAVE_CLAMP_WIDE + (WAVE_CLAMP_NARROW - WAVE_CLAMP_WIDE) * t).round() as i32
+}
 
 pub struct VolnaWindow {
     pub window: ApplicationWindow,
@@ -166,6 +179,7 @@ impl VolnaWindow {
         sidebar.add_css_class("spotify-sidebar");
         let initial_width = if initial_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH };
         sidebar.set_width_request(initial_width);
+        wave_view.set_clamp_width(wave_clamp_for_sidebar(is_spotify_nav, initial_width));
         sidebar.set_halign(Align::Start);
         sidebar.set_valign(Align::Fill);
         sidebar.set_vexpand(true);
@@ -517,6 +531,7 @@ impl VolnaWindow {
             let search_container = search_container.clone();
             let library_container = library_container.clone();
             let is_spotify_nav_state = is_spotify_nav_state.clone();
+            let wave_clamp = wave_view.meta_clamp.clone();
             let nav_items = vec![nav_wave.clone(), nav_search.clone(), nav_liked.clone()];
             let anim_holder: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
 
@@ -578,18 +593,21 @@ impl VolnaWindow {
                 let sc = search_container.clone();
                 let lc = library_container.clone();
                 let is_sp = is_spotify_nav_state.clone();
+                let wc = wave_clamp.clone();
 
                 let target = libadwaita::CallbackAnimationTarget::new(move |val| {
                     let w = val.round() as i32;
                     s.set_width_request(w);
                     let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
-                    if *is_sp.borrow() {
+                    let is_sp_val = *is_sp.borrow();
+                    if is_sp_val {
                         let gutter = (CONTENT_GUTTER_COLLAPSED as f64 + (CONTENT_GUTTER_EXPANDED as f64 - CONTENT_GUTTER_COLLAPSED as f64) * t).round() as i32;
                         sc.set_margin_start(w + gutter);
                         lc.set_margin_start(w + gutter);
                         sc.set_margin_end(gutter);
                         lc.set_margin_end(gutter);
                     }
+                    wc.set_maximum_size(wave_clamp_for_sidebar(is_sp_val, w));
                     if !next_collapsed {
                         bb.set_opacity(t);
                         slb.set_opacity(t);
@@ -613,19 +631,27 @@ impl VolnaWindow {
                 let sc_done = search_container.clone();
                 let lc_done = library_container.clone();
                 let is_sp_done = is_spotify_nav_state.clone();
+                let wc_done = wave_clamp.clone();
 
                 anim.connect_done(move |_| {
-                    if *is_sp_done.borrow() {
-                        let (w, gutter) = if next_collapsed {
-                            (SIDEBAR_COLLAPSED_WIDTH, CONTENT_GUTTER_COLLAPSED)
+                    let is_sp_val = *is_sp_done.borrow();
+                    let w = if next_collapsed {
+                        SIDEBAR_COLLAPSED_WIDTH
+                    } else {
+                        SIDEBAR_EXPANDED_WIDTH
+                    };
+                    if is_sp_val {
+                        let gutter = if next_collapsed {
+                            CONTENT_GUTTER_COLLAPSED
                         } else {
-                            (SIDEBAR_EXPANDED_WIDTH, CONTENT_GUTTER_EXPANDED)
+                            CONTENT_GUTTER_EXPANDED
                         };
                         sc_done.set_margin_start(w + gutter);
                         lc_done.set_margin_start(w + gutter);
                         sc_done.set_margin_end(gutter);
                         lc_done.set_margin_end(gutter);
                     }
+                    wc_done.set_maximum_size(wave_clamp_for_sidebar(is_sp_val, w));
                     if next_collapsed {
                         s_done.set_width_request(SIDEBAR_COLLAPSED_WIDTH);
                         s_done.add_css_class("collapsed");
@@ -971,6 +997,7 @@ impl VolnaWindow {
         open_from_player(&island.title_label, false);
         open_from_player(&island.artist_label, true);
         open_from_player(&wave_view.title_label, false);
+        open_from_player(&wave_view.version_label, false);
         open_from_player(&wave_view.artist_label, true);
 
         // Клик по плашке источника («Альбом: …», «Плейлист: …», «По треку: …») открывает этот источник
@@ -2075,16 +2102,7 @@ fn setup_event_listener(
                         player.clips.telemetry().set_local_active(false);
                     }
                     let artists = track.artists_string();
-                    let album = track.albums.first().and_then(|a| a.title.as_ref()).map(|s| s.as_str()).unwrap_or("");
-                    let subtitle = if album.is_empty() || album.trim().eq_ignore_ascii_case("unnamed") {
-                        artists.clone()
-                    } else {
-                        format!("{} • {}", artists, album)
-                    };
-
-                    wave_view.title_label.set_markup(&track.title_markup());
-                    wave_view.explicit_badge.set_visible(track.is_explicit());
-                    wave_view.artist_label.set_text(&subtitle);
+                    wave_view.set_track_meta(&track);
 
                     let accent = theme_accent_state.borrow().clone();
                     if accent == "dynamic" {
@@ -2378,10 +2396,8 @@ fn setup_event_listener(
                         None,
                     );
 
-                    wave_view.title_label.set_text("Волна");
-                    wave_view.explicit_badge.set_visible(false);
+                    wave_view.set_idle_meta("Волна", "Войдите в Яндекс ID для запуска потока");
                     island.explicit_badge.set_visible(false);
-                    wave_view.artist_label.set_text("Войдите в Яндекс ID для запуска потока");
                     island.title_label.set_text("Волна");
                     island.artist_label.set_text("Яндекс Музыка");
                     island.cover_image.clear(); // пустая картинка = CSS-заглушка обложки
@@ -2423,8 +2439,15 @@ fn setup_event_listener(
                     view_switcher.set_visible(!is_spotify);
                     header_brand_box.set_visible(!is_spotify);
                     header_right_box.set_visible(!is_spotify);
+                    let collapsed = *is_collapsed.borrow();
+                    let sidebar_width = if collapsed {
+                        SIDEBAR_COLLAPSED_WIDTH
+                    } else {
+                        SIDEBAR_EXPANDED_WIDTH
+                    };
+                    wave_view.set_clamp_width(wave_clamp_for_sidebar(is_spotify, sidebar_width));
                     let (start, end) = if is_spotify {
-                        if *is_collapsed.borrow() {
+                        if collapsed {
                             (SIDEBAR_COLLAPSED_WIDTH + CONTENT_GUTTER_COLLAPSED, CONTENT_GUTTER_COLLAPSED)
                         } else {
                             (SIDEBAR_EXPANDED_WIDTH + CONTENT_GUTTER_EXPANDED, CONTENT_GUTTER_EXPANDED)
