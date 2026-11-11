@@ -1,6 +1,6 @@
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Публичный OAuth client_id приложения Яндекс Музыки; то же значение в открытом проекте
@@ -141,47 +141,65 @@ impl Default for AppConfig {
     }
 }
 
+static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn test_config_file_path_with_xdg(xdg: Option<&str>) -> PathBuf {
+    if let Some(xdg) = xdg.map(str::trim).filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg).join("volna").join("config.json");
+    }
+    std::env::temp_dir()
+        .join(format!("volna-unit-test-config-{}", std::process::id()))
+        .join("volna")
+        .join("config.json")
+}
+
 /// Возвращает путь к файлу конфигурации (~/.config/volna/config.json)
 pub fn config_file_path() -> PathBuf {
-    let base_dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".config")
-        });
-
-    base_dir.join("volna").join("config.json")
-}
-
-/// Загружает конфигурацию из ~/.config/volna/config.json
-pub fn load_config() -> Result<AppConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let path = config_file_path();
-    if !path.exists() {
-        return Ok(AppConfig::default());
-    }
-
-    let mut file = File::open(&path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-
-    let config: AppConfig = serde_json::from_str(&contents)?;
-    Ok(config)
-}
-
-/// Сохраняет конфигурацию в ~/.config/volna/config.json
-pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = config_file_path();
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
-    }
-
-    let json = serde_json::to_string_pretty(config)?;
-    // в файле токен аккаунта: читать его может только владелец (права ставим и на уже созданный файл)
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    // Атомарная замена: запись «на месте» с truncate даёт пустой/обрезанный JSON
-    // любому параллельному чтению (настройки читаются из фоновых задач).
-    let tmp = path.with_extension("json.tmp");
+    #[cfg(test)]
     {
+        let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        test_config_file_path_with_xdg(xdg.as_deref())
+    }
+    #[cfg(not(test))]
+    {
+        let base_dir = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".config")
+            });
+
+        base_dir.join("volna").join("config.json")
+    }
+}
+
+/// Атомарно записывает данные в `target` через уникальный временный файл с правами `0o600`.
+fn write_atomic_0600(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let parent_dir = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => {
+            create_dir_all(p)?;
+            p
+        }
+        _ => Path::new("."),
+    };
+
+    let tmp = parent_dir.join(format!(
+        "config.json.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+
+    let write_res: Result<(), std::io::Error> = (|| {
+        // в файле токен аккаунта: читать его может только владелец (права ставим и на уже созданный файл)
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -189,11 +207,164 @@ pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error +
             .mode(0o600)
             .open(&tmp)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        file.write_all(json.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Box::new(err));
     }
-    std::fs::rename(&tmp, &path)?;
+
+    if let Err(err) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Box::new(err));
+    }
+
     Ok(())
+}
+
+/// Сохраняет копию повреждённого файла в `config.json.corrupted` (если она ещё не создана).
+fn preserve_corrupted_copy(path: &Path) {
+    let corrupted = path.with_extension("json.corrupted");
+    if !corrupted.exists() {
+        if let Ok(bytes) = std::fs::read(path) {
+            let _ = write_atomic_0600(&corrupted, &bytes);
+        }
+    }
+}
+
+fn load_config_at_unlocked(
+    path: &Path,
+) -> Result<AppConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(AppConfig::default()),
+        Err(err) => return Err(Box::new(err)),
+    };
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let config: AppConfig = serde_json::from_str(&contents)?;
+    Ok(config)
+}
+
+fn save_config_at_unlocked(
+    path: &Path,
+    config: &AppConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            create_dir_all(parent)?;
+        }
+    }
+
+    // Перед заменой валидного конфига сохраняем его резервную копию с правами 0o600
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if serde_json::from_str::<AppConfig>(&existing).is_ok() {
+            let bak = path.with_extension("json.bak");
+            write_atomic_0600(&bak, existing.as_bytes())?;
+        }
+    }
+
+    let json = serde_json::to_string_pretty(config)?;
+    // Атомарная замена: запись «на месте» с truncate даёт пустой/обрезанный JSON
+    // любому параллельному чтению (настройки читаются из фоновых задач).
+    write_atomic_0600(path, json.as_bytes())
+}
+
+fn update_config_at_unlocked<F>(
+    path: &Path,
+    mutator: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce(&mut AppConfig),
+{
+    let mut cfg = match load_config_at_unlocked(path) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            if path.exists() {
+                let bak = path.with_extension("json.bak");
+                if bak.exists() {
+                    if let Ok(recovered) = load_config_at_unlocked(&bak) {
+                        recovered
+                    } else {
+                        preserve_corrupted_copy(path);
+                        return Err(err);
+                    }
+                } else {
+                    preserve_corrupted_copy(path);
+                    return Err(err);
+                }
+            } else {
+                return Err(err);
+            }
+        }
+    };
+
+    mutator(&mut cfg);
+    save_config_at_unlocked(path, &cfg)
+}
+
+fn load_config_unlocked() -> Result<AppConfig, Box<dyn std::error::Error + Send + Sync>> {
+    load_config_at_unlocked(&config_file_path())
+}
+
+fn save_config_unlocked(
+    config: &AppConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    save_config_at_unlocked(&config_file_path(), config)
+}
+
+#[cfg(test)]
+fn load_config_at(path: &Path) -> Result<AppConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_config_at_unlocked(path)
+}
+
+#[cfg(test)]
+fn save_config_at(
+    path: &Path,
+    config: &AppConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_config_at_unlocked(path, config)
+}
+
+#[cfg(test)]
+fn update_config_at<F>(
+    path: &Path,
+    mutator: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce(&mut AppConfig),
+{
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    update_config_at_unlocked(path, mutator)
+}
+
+/// Загружает конфигурацию из ~/.config/volna/config.json
+pub fn load_config() -> Result<AppConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_config_unlocked()
+}
+
+/// Сохраняет конфигурацию в ~/.config/volna/config.json
+pub fn save_config(config: &AppConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_config_unlocked(config)
+}
+
+/// Атомарно читает, изменяет и сохраняет конфигурацию под `CONFIG_LOCK`,
+/// восстанавливаясь из `.json.bak` при повреждении основного файла и не затирая его при полном сбое.
+pub fn update_config<F>(mutator: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnOnce(&mut AppConfig),
+{
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    update_config_at_unlocked(&config_file_path(), mutator)
 }
 
 /// Получает сохраненный токен или None
@@ -208,10 +379,10 @@ pub fn load_lastfm_key() -> Option<String> {
 
 /// Сохраняет ключ Last.fm (пустая строка удаляет)
 pub fn save_lastfm_key(key: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
     let key = key.trim();
-    config.lastfm_key = if key.is_empty() { None } else { Some(key.to_string()) };
-    save_config(&config)
+    update_config(|config| {
+        config.lastfm_key = if key.is_empty() { None } else { Some(key.to_string()) };
+    })
 }
 
 /// Токен Genius или None, если не задан
@@ -221,10 +392,10 @@ pub fn load_genius_token() -> Option<String> {
 
 /// Сохраняет токен Genius (пустая строка удаляет)
 pub fn save_genius_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
     let token = token.trim();
-    config.genius_token = if token.is_empty() { None } else { Some(token.to_string()) };
-    save_config(&config)
+    update_config(|config| {
+        config.genius_token = if token.is_empty() { None } else { Some(token.to_string()) };
+    })
 }
 
 /// Выбранное качество звука (`lossless`, `best`, `balanced`, `economy`); при отсутствии или ошибке — `lossless`
@@ -237,9 +408,9 @@ pub fn load_quality() -> String {
 
 /// Сохраняет выбранное качество звука
 pub fn save_quality(quality: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.quality = Some(quality.to_string());
-    save_config(&config)
+    update_config(|config| {
+        config.quality = Some(quality.to_string());
+    })
 }
 
 /// Включены ли клипы на фоне
@@ -254,21 +425,22 @@ pub fn load_discord() -> (bool, Option<String>) {
 }
 
 pub fn save_discord_rpc(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.discord_rpc = on;
-    save_config(&config)
+    update_config(|config| {
+        config.discord_rpc = on;
+    })
 }
 
 pub fn save_discord_client_id(id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.discord_client_id = Some(id.trim().to_string()).filter(|i| !i.is_empty());
-    save_config(&config)
+    let id = Some(id.trim().to_string()).filter(|i| !i.is_empty());
+    update_config(|config| {
+        config.discord_client_id = id;
+    })
 }
 
 pub fn save_clips(on: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.clips = on;
-    save_config(&config)
+    update_config(|config| {
+        config.clips = on;
+    })
 }
 
 /// Настройки плавного перехода между треками: (включен, длительность в секундах)
@@ -280,10 +452,10 @@ pub fn load_crossfade() -> (bool, u32) {
 
 /// Сохраняет настройки плавного перехода между треками
 pub fn save_crossfade(enabled: bool, duration: u32) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.crossfade = enabled;
-    config.crossfade_duration = duration;
-    save_config(&config)
+    update_config(|config| {
+        config.crossfade = enabled;
+        config.crossfade_duration = duration;
+    })
 }
 
 /// Выбранный стиль навигации: `wave` (по умолчанию, верхний бар) или `spotify` (левый сайдбар)
@@ -296,9 +468,9 @@ pub fn load_nav_style() -> String {
 
 /// Сохраняет стиль навигации
 pub fn save_nav_style(style: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.nav_style = Some(style.to_string());
-    save_config(&config)
+    update_config(|config| {
+        config.nav_style = Some(style.to_string());
+    })
 }
 
 /// Выбранный стиль плеера: `floating` (по умолчанию, парящий остров) или `dock` (прижатый док)
@@ -311,9 +483,9 @@ pub fn load_player_layout() -> String {
 
 /// Сохраняет стиль плеера
 pub fn save_player_layout(layout: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.player_layout = Some(layout.to_string());
-    save_config(&config)
+    update_config(|config| {
+        config.player_layout = Some(layout.to_string());
+    })
 }
 
 /// Выбранный акцент темы: `dynamic` (по умолчанию), `spotify`, `ruby`, `sunset`, `violet`, `ocean`, `monochrome`
@@ -326,9 +498,9 @@ pub fn load_theme_accent() -> String {
 
 /// Сохраняет акцент темы
 pub fn save_theme_accent(accent: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.theme_accent = Some(accent.to_string());
-    save_config(&config)
+    update_config(|config| {
+        config.theme_accent = Some(accent.to_string());
+    })
 }
 
 /// Питомец на плеере включён?
@@ -337,9 +509,9 @@ pub fn load_pet_enabled() -> bool {
 }
 
 pub fn save_pet_enabled(enabled: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.pet_enabled = enabled;
-    save_config(&config)
+    update_config(|config| {
+        config.pet_enabled = enabled;
+    })
 }
 
 /// Облик питомца: "wave", "cat" или "slime"
@@ -351,9 +523,9 @@ pub fn load_pet_style() -> String {
 }
 
 pub fn save_pet_style(style: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.pet_style = Some(style.to_string());
-    save_config(&config)
+    update_config(|config| {
+        config.pet_style = Some(style.to_string());
+    })
 }
 
 /// Состояние свернутости сайдбара
@@ -363,9 +535,9 @@ pub fn load_sidebar_collapsed() -> bool {
 
 /// Сохраняет состояние свернутости сайдбара
 pub fn save_sidebar_collapsed(collapsed: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.sidebar_collapsed = collapsed;
-    save_config(&config)
+    update_config(|config| {
+        config.sidebar_collapsed = collapsed;
+    })
 }
 
 /// Загружает сохраненную громкость пользователя (от 0.0 до 1.0, по умолчанию 0.85)
@@ -375,24 +547,25 @@ pub fn load_volume() -> f64 {
 
 /// Сохраняет громкость пользователя в файл конфигурации
 pub fn save_volume(vol: f64) {
-    let mut cfg = load_config().unwrap_or_default();
-    cfg.volume = Some(vol.clamp(0.0, 1.0));
-    let _ = save_config(&cfg);
+    let clamped = vol.clamp(0.0, 1.0);
+    let _ = update_config(|cfg| {
+        cfg.volume = Some(clamped);
+    });
 }
 
 /// Сохраняет токен в файл конфигурации
 pub fn save_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let clean = extract_token_from_input(token);
-    let mut config = load_config().unwrap_or_default();
-    config.token = Some(clean);
-    save_config(&config)
+    update_config(|config| {
+        config.token = Some(clean);
+    })
 }
 
 /// Удаляет сохраненный токен (выход из аккаунта)
 pub fn clear_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.token = None;
-    save_config(&config)
+    update_config(|config| {
+        config.token = None;
+    })
 }
 
 /// Загружает сохраненного активного провайдера (по умолчанию ProviderId::Yandex)
@@ -406,14 +579,14 @@ pub fn load_active_provider() -> crate::api::provider::ProviderId {
 
 /// Сохраняет активного провайдера в конфигурацию
 pub fn save_active_provider(provider: crate::api::provider::ProviderId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
     let val = match provider {
         crate::api::provider::ProviderId::YouTubeMusic => "ytmusic",
         crate::api::provider::ProviderId::Vk => "vk",
         crate::api::provider::ProviderId::Yandex => "yandex",
     };
-    config.active_provider = Some(val.to_string());
-    save_config(&config)
+    update_config(|config| {
+        config.active_provider = Some(val.to_string());
+    })
 }
 
 /// Числовой ID нужен `audio.getPlaylists`; это не секрет и не заменяет токен.
@@ -422,15 +595,15 @@ pub fn load_vk_user_id() -> Option<i64> {
 }
 
 pub fn save_vk_user_id(user_id: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.vk_user_id = Some(user_id);
-    save_config(&config)
+    update_config(|config| {
+        config.vk_user_id = Some(user_id);
+    })
 }
 
 pub fn clear_vk_user_id() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.vk_user_id = None;
-    save_config(&config)
+    update_config(|config| {
+        config.vk_user_id = None;
+    })
 }
 
 /// Загружает refresh-токен YouTube Music или None
@@ -441,16 +614,16 @@ pub fn load_ytmusic_refresh_token() -> Option<String> {
 /// Сохраняет refresh-токен YouTube Music
 pub fn save_ytmusic_refresh_token(token: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let clean = token.trim();
-    let mut config = load_config().unwrap_or_default();
-    config.ytmusic_refresh_token = if clean.is_empty() { None } else { Some(clean.to_string()) };
-    save_config(&config)
+    update_config(|config| {
+        config.ytmusic_refresh_token = if clean.is_empty() { None } else { Some(clean.to_string()) };
+    })
 }
 
 /// Удаляет refresh-токен YouTube Music
 pub fn clear_ytmusic_refresh_token() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.ytmusic_refresh_token = None;
-    save_config(&config)
+    update_config(|config| {
+        config.ytmusic_refresh_token = None;
+    })
 }
 
 /// Загружает сохраненную куку YouTube Music или None
@@ -478,30 +651,32 @@ pub fn load_ytmusic_oauth_client() -> (Option<String>, Option<String>) {
 
 /// Сохраняет свой OAuth-клиент Google (пустая строка — сбросить)
 pub fn save_ytmusic_oauth_client(id: Option<&str>, secret: Option<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.ytmusic_oauth_client_id = id
+    let clean_id = id
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
-    config.ytmusic_oauth_client_secret = secret
+    let clean_secret = secret
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
-    save_config(&config)
+    update_config(|config| {
+        config.ytmusic_oauth_client_id = clean_id;
+        config.ytmusic_oauth_client_secret = clean_secret;
+    })
 }
 
 pub fn save_ytmusic_cookie(cookie: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sanitized = crate::api::ytmusic::sanitize_cookie(cookie);
-    let mut config = load_config().unwrap_or_default();
-    config.ytmusic_cookie = if sanitized.is_empty() { None } else { Some(sanitized) };
-    save_config(&config)
+    update_config(|config| {
+        config.ytmusic_cookie = if sanitized.is_empty() { None } else { Some(sanitized) };
+    })
 }
 
 /// Удаляет куку YouTube Music
 pub fn clear_ytmusic_cookie() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut config = load_config().unwrap_or_default();
-    config.ytmusic_cookie = None;
-    save_config(&config)
+    update_config(|config| {
+        config.ytmusic_cookie = None;
+    })
 }
 
 /// Извлекает чистый токен из произвольного ввода пользователя
@@ -627,5 +802,205 @@ mod tests {
         let json_custom = r#"{"volume": 0.42}"#;
         let parsed_custom: AppConfig = serde_json::from_str(json_custom).unwrap();
         assert_eq!(parsed_custom.volume, Some(0.42));
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "volna-{}-{}-{}",
+                prefix,
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn test_config_path_is_isolated_in_tests() {
+        let expected_isolated = std::env::temp_dir()
+            .join(format!("volna-unit-test-config-{}", std::process::id()))
+            .join("volna")
+            .join("config.json");
+
+        assert_eq!(test_config_file_path_with_xdg(None), expected_isolated);
+        assert_eq!(test_config_file_path_with_xdg(Some("")), expected_isolated);
+        assert_eq!(test_config_file_path_with_xdg(Some("   ")), expected_isolated);
+        assert_eq!(
+            test_config_file_path_with_xdg(Some("/tmp/custom-xdg")),
+            PathBuf::from("/tmp/custom-xdg").join("volna").join("config.json")
+        );
+
+        if let Ok(home) = std::env::var("HOME") {
+            let real_dir = PathBuf::from(&home).join(".config").join("volna");
+            assert!(!test_config_file_path_with_xdg(None).starts_with(&real_dir));
+            if std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_none()
+            {
+                let active_path = config_file_path();
+                assert!(!active_path.starts_with(&real_dir));
+                assert_eq!(active_path, expected_isolated);
+            }
+        }
+    }
+
+    #[test]
+    fn test_concurrent_update_config_preserves_fields_and_backup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("concurrent-cfg");
+        let path = dir.path().join("volna").join("config.json");
+
+        let mut initial = AppConfig::default();
+        initial.token = Some("secret-yandex-token".to_string());
+        initial.quality = Some("lossless".to_string());
+        initial.volume = Some(0.5);
+        save_config_at(&path, &initial).unwrap();
+
+        let mut handles = Vec::new();
+        for tid in 0..8usize {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for iter in 0..10usize {
+                    update_config_at(&path, |cfg| {
+                        cfg.recent_played.push(format!("t{}-i{}", tid, iter));
+                        match tid {
+                            0 => cfg.clips = true,
+                            1 => cfg.crossfade = true,
+                            2 => cfg.pet_enabled = false,
+                            3 => cfg.sidebar_collapsed = true,
+                            4 => cfg.discord_rpc = true,
+                            5 => cfg.nav_style = Some("spotify".to_string()),
+                            6 => cfg.player_layout = Some("dock".to_string()),
+                            7 => cfg.volume = Some(0.75),
+                            _ => unreachable!(),
+                        }
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_cfg = load_config_at(&path).unwrap();
+        assert_eq!(final_cfg.token.as_deref(), Some("secret-yandex-token"));
+        assert_eq!(final_cfg.quality.as_deref(), Some("lossless"));
+        assert!(final_cfg.clips);
+        assert!(final_cfg.crossfade);
+        assert!(!final_cfg.pet_enabled);
+        assert!(final_cfg.sidebar_collapsed);
+        assert!(final_cfg.discord_rpc);
+        assert_eq!(final_cfg.nav_style.as_deref(), Some("spotify"));
+        assert_eq!(final_cfg.player_layout.as_deref(), Some("dock"));
+        assert_eq!(final_cfg.volume, Some(0.75));
+        assert_eq!(final_cfg.recent_played.len(), 80);
+        for tid in 0..8usize {
+            for iter in 0..10usize {
+                assert!(final_cfg.recent_played.contains(&format!("t{}-i{}", tid, iter)));
+            }
+        }
+
+        let bak = path.with_extension("json.bak");
+        assert!(bak.exists());
+        let bak_cfg = load_config_at(&bak).unwrap();
+        assert_eq!(bak_cfg.token.as_deref(), Some("secret-yandex-token"));
+
+        let path_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let bak_mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+        assert_eq!(path_mode, 0o600);
+        assert_eq!(bak_mode, 0o600);
+
+        let leftover_tmp = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp);
+    }
+
+    #[test]
+    fn test_corrupted_config_recovers_from_backup_and_never_wipes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. Повреждён основной config.json, но .bak валиден -> восстанавливаем токен из .bak
+        let dir1 = TestDir::new("recover-bak");
+        let path1 = dir1.path().join("config.json");
+
+        let mut cfg1 = AppConfig::default();
+        cfg1.token = Some("keep-my-token".to_string());
+        cfg1.volume = Some(0.42);
+        save_config_at(&path1, &cfg1).unwrap();
+        update_config_at(&path1, |c| c.crossfade = true).unwrap();
+        assert!(path1.with_extension("json.bak").exists());
+
+        std::fs::write(&path1, "{ broken json").unwrap();
+        assert!(load_config_at(&path1).is_err());
+
+        update_config_at(&path1, |c| c.clips = true).unwrap();
+        let recovered = load_config_at(&path1).unwrap();
+        assert_eq!(recovered.token.as_deref(), Some("keep-my-token"));
+        assert!(recovered.clips);
+        assert_eq!(recovered.volume, Some(0.42));
+        assert!(!recovered.crossfade);
+
+        // 2. Ни основного, ни .bak нет (основной битый, .bak отсутствует) -> .corrupted и Err, не затирая файл
+        let dir2 = TestDir::new("corrupt-no-bak");
+        let path2 = dir2.path().join("config.json");
+        let broken_raw = "{not-valid-json";
+        std::fs::write(&path2, broken_raw).unwrap();
+
+        let res = update_config_at(&path2, |c| {
+            c.token = Some("must-not-overwrite".to_string());
+        });
+        assert!(res.is_err());
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), broken_raw);
+
+        let corrupted = path2.with_extension("json.corrupted");
+        assert!(corrupted.exists());
+        assert_eq!(std::fs::read_to_string(&corrupted).unwrap(), broken_raw);
+        let corrupted_mode = std::fs::metadata(&corrupted).unwrap().permissions().mode() & 0o777;
+        assert_eq!(corrupted_mode, 0o600);
+
+        // Повторный вызов не перезаписывает уже сохранённый .corrupted
+        let another_broken = "{another-broken";
+        std::fs::write(&path2, another_broken).unwrap();
+        assert!(update_config_at(&path2, |c| c.clips = true).is_err());
+        assert_eq!(std::fs::read_to_string(&path2).unwrap(), another_broken);
+        assert_eq!(std::fs::read_to_string(&corrupted).unwrap(), broken_raw);
+
+        // 3. Основной битый и .bak тоже битый -> сохраняется .corrupted и возвращается Err
+        let dir3 = TestDir::new("corrupt-bad-bak");
+        let path3 = dir3.path().join("config.json");
+        let broken_main = "{broken-main";
+        std::fs::write(&path3, broken_main).unwrap();
+        std::fs::write(path3.with_extension("json.bak"), "{broken-bak").unwrap();
+
+        let res3 = update_config_at(&path3, |c| c.clips = true);
+        assert!(res3.is_err());
+        assert_eq!(std::fs::read_to_string(&path3).unwrap(), broken_main);
+        assert_eq!(
+            std::fs::read_to_string(path3.with_extension("json.corrupted")).unwrap(),
+            broken_main
+        );
     }
 }

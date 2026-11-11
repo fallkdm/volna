@@ -117,10 +117,9 @@ impl PlayerManager {
             let session = Arc::new(session);
             me.audio.pause();
             *me.cast.lock().unwrap() = Some(CastLink { session: session.clone(), state: StationState::default(), at: Instant::now(), played_at: Instant::now(), started_here: false });
-            if let Ok(mut cfg) = crate::api::auth::load_config() {
+            let _ = crate::api::auth::update_config(|cfg| {
                 cfg.station_id = Some(device_id);
-                let _ = crate::api::auth::save_config(&cfg);
-            }
+            });
             me.emit(PlayerUiEvent::CastChanged(Some(name.clone())));
             me.emit(PlayerUiEvent::StatusMessage(format!("Станция «{}» подключена: музыка играет на ней", name)));
 
@@ -172,10 +171,9 @@ impl PlayerManager {
     /// и продолжается в приложении с того же места.
     pub fn cast_disconnect(&self) {
         let Some(link) = self.cast.lock().unwrap().take() else { return };
-        if let Ok(mut cfg) = crate::api::auth::load_config() {
+        let _ = crate::api::auth::update_config(|cfg| {
             cfg.station_id = None;
-            let _ = crate::api::auth::save_config(&cfg);
-        }
+        });
         self.emit(PlayerUiEvent::CastChanged(None));
         self.emit(PlayerUiEvent::StatusMessage("Станция отключена".into()));
         if !link.started_here {

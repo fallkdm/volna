@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::auth::{load_config, save_config};
+use super::auth::{load_config, update_config};
 use super::models::{Album, Artist, Playlist, Track};
 use super::provider::ProviderId;
 
@@ -82,7 +82,7 @@ fn with_item(mut list: Vec<HistoryItem>, item: HistoryItem) -> Vec<HistoryItem> 
 
 /// Сохранённая история поиска для конкретного сервиса (Яндекс Музыка или YouTube Music)
 pub fn load_history_for(provider: ProviderId) -> Vec<HistoryItem> {
-    let mut config = load_config().unwrap_or_default();
+    let config = load_config().unwrap_or_default();
     match provider {
         ProviderId::Vk => {
             config
@@ -94,20 +94,39 @@ pub fn load_history_for(provider: ProviderId) -> Vec<HistoryItem> {
         }
         ProviderId::YouTubeMusic => {
             // Если в ytmusic_history_items пока пусто, мигрируем элементы YouTube Music и удаляем их из history_items
-            if config.ytmusic_history_items.is_empty() {
-                let mut migrated = Vec::new();
-                config.history_items.retain(|v| {
-                    if let Ok(item) = serde_json::from_value::<HistoryItem>(v.clone()) {
-                        if item.provider() == ProviderId::YouTubeMusic {
-                            migrated.push(v.clone());
-                            return false;
+            if config.ytmusic_history_items.is_empty()
+                && config.history_items.iter().any(|v| {
+                    serde_json::from_value::<HistoryItem>(v.clone())
+                        .is_ok_and(|item| item.provider() == ProviderId::YouTubeMusic)
+                })
+            {
+                let mut migrated_list: Option<Vec<HistoryItem>> = None;
+                let _ = update_config(|cfg| {
+                    if cfg.ytmusic_history_items.is_empty() {
+                        let mut migrated = Vec::new();
+                        cfg.history_items.retain(|v| {
+                            if let Ok(item) = serde_json::from_value::<HistoryItem>(v.clone()) {
+                                if item.provider() == ProviderId::YouTubeMusic {
+                                    migrated.push(v.clone());
+                                    return false;
+                                }
+                            }
+                            true
+                        });
+                        if !migrated.is_empty() {
+                            cfg.ytmusic_history_items = migrated;
                         }
                     }
-                    true
+                    migrated_list = Some(
+                        cfg.ytmusic_history_items
+                            .iter()
+                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                            .take(LIMIT)
+                            .collect(),
+                    );
                 });
-                if !migrated.is_empty() {
-                    config.ytmusic_history_items = migrated;
-                    let _ = save_config(&config);
+                if let Some(list) = migrated_list {
+                    return list;
                 }
             }
             let mut list: Vec<HistoryItem> = config
@@ -131,73 +150,73 @@ pub fn load_history_for(provider: ProviderId) -> Vec<HistoryItem> {
 }
 
 pub fn push_history_for(provider: ProviderId, item: HistoryItem) {
-    let mut config = load_config().unwrap_or_default();
-    match provider {
-        ProviderId::Vk => {
-            let list: Vec<HistoryItem> = config
-                .vk_history_items
-                .drain(..)
-                .filter_map(|v| serde_json::from_value::<HistoryItem>(v).ok())
-                .collect();
-            config.vk_history_items = with_item(list, item)
-                .iter()
-                .filter_map(|i| serde_json::to_value(i).ok())
-                .collect();
+    let _ = update_config(|config| {
+        match provider {
+            ProviderId::Vk => {
+                let list: Vec<HistoryItem> = config
+                    .vk_history_items
+                    .drain(..)
+                    .filter_map(|v| serde_json::from_value::<HistoryItem>(v).ok())
+                    .collect();
+                config.vk_history_items = with_item(list, item)
+                    .iter()
+                    .filter_map(|i| serde_json::to_value(i).ok())
+                    .collect();
+            }
+            ProviderId::YouTubeMusic => {
+                let list: Vec<HistoryItem> = config
+                    .ytmusic_history_items
+                    .drain(..)
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+                config.ytmusic_history_items = with_item(list, item)
+                    .iter()
+                    .filter_map(|i| serde_json::to_value(i).ok())
+                    .collect();
+            }
+            ProviderId::Yandex => {
+                let list: Vec<HistoryItem> = config
+                    .history_items
+                    .drain(..)
+                    .filter_map(|v| serde_json::from_value::<HistoryItem>(v).ok())
+                    .filter(|it| it.provider() == ProviderId::Yandex)
+                    .collect();
+                config.history_items = with_item(list, item)
+                    .iter()
+                    .filter_map(|i| serde_json::to_value(i).ok())
+                    .collect();
+            }
         }
-        ProviderId::YouTubeMusic => {
-            let list: Vec<HistoryItem> = config
-                .ytmusic_history_items
-                .drain(..)
-                .filter_map(|v| serde_json::from_value(v).ok())
-                .collect();
-            config.ytmusic_history_items = with_item(list, item)
-                .iter()
-                .filter_map(|i| serde_json::to_value(i).ok())
-                .collect();
-        }
-        ProviderId::Yandex => {
-            let list: Vec<HistoryItem> = config
-                .history_items
-                .drain(..)
-                .filter_map(|v| serde_json::from_value::<HistoryItem>(v).ok())
-                .filter(|it| it.provider() == ProviderId::Yandex)
-                .collect();
-            config.history_items = with_item(list, item)
-                .iter()
-                .filter_map(|i| serde_json::to_value(i).ok())
-                .collect();
-        }
-    }
-    let _ = save_config(&config);
+    });
 }
 
 pub fn clear_history_for(provider: ProviderId) {
-    let mut config = load_config().unwrap_or_default();
-    match provider {
-        ProviderId::Vk => {
-            config.vk_history_items.clear();
+    let _ = update_config(|config| {
+        match provider {
+            ProviderId::Vk => {
+                config.vk_history_items.clear();
+            }
+            ProviderId::YouTubeMusic => {
+                config.ytmusic_history_items.clear();
+                config.history_items.retain(|v| {
+                    if let Ok(item) = serde_json::from_value::<HistoryItem>(v.clone()) {
+                        item.provider() != ProviderId::YouTubeMusic
+                    } else {
+                        true
+                    }
+                });
+            }
+            ProviderId::Yandex => {
+                config.history_items.retain(|v| {
+                    if let Ok(item) = serde_json::from_value::<HistoryItem>(v.clone()) {
+                        item.provider() != ProviderId::Yandex
+                    } else {
+                        false
+                    }
+                });
+            }
         }
-        ProviderId::YouTubeMusic => {
-            config.ytmusic_history_items.clear();
-            config.history_items.retain(|v| {
-                if let Ok(item) = serde_json::from_value::<HistoryItem>(v.clone()) {
-                    item.provider() != ProviderId::YouTubeMusic
-                } else {
-                    true
-                }
-            });
-        }
-        ProviderId::Yandex => {
-            config.history_items.retain(|v| {
-                if let Ok(item) = serde_json::from_value::<HistoryItem>(v.clone()) {
-                    item.provider() != ProviderId::Yandex
-                } else {
-                    false
-                }
-            });
-        }
-    }
-    let _ = save_config(&config);
+    });
 }
 
 /// Сколько последних проигранных треков помнить между запусками
@@ -217,18 +236,19 @@ pub fn remember_played(track_id: &str) {
     if id.is_empty() {
         return;
     }
-    let mut config = load_config().unwrap_or_default();
-    config.recent_played.retain(|x| x != id);
-    config.recent_played.insert(0, id.to_string());
-    config.recent_played.truncate(RECENT_PLAYED_LIMIT);
-    let _ = save_config(&config);
+    let _ = update_config(|config| {
+        config.recent_played.retain(|x| x != id);
+        config.recent_played.insert(0, id.to_string());
+        config.recent_played.truncate(RECENT_PLAYED_LIMIT);
+    });
 }
 
 /// Запоминает последний проигранный трек
 pub fn save_last_track(track: &Track) {
-    let mut config = load_config().unwrap_or_default();
-    config.last_track = serde_json::to_value(track).ok();
-    let _ = save_config(&config);
+    let value = serde_json::to_value(track).ok();
+    let _ = update_config(|config| {
+        config.last_track = value;
+    });
 }
 
 /// Последний проигранный трек, если он сохранён и читается
