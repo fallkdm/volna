@@ -27,6 +27,15 @@ fn apply_allocator_tuning() {
     unsafe {
         let _ = mallopt(M_ARENA_MAX, arena_max);
     }
+
+    const M_MMAP_THRESHOLD: std::os::raw::c_int = -3;
+    if let Ok(val) = std::env::var("M_MMAP_THRESHOLD") {
+        if let Ok(thresh) = val.trim().parse::<i32>() {
+            unsafe {
+                let _ = mallopt(M_MMAP_THRESHOLD, thresh);
+            }
+        }
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
