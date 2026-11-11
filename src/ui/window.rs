@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_channel::Receiver;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, Label, Orientation, Overlay, Overflow, ScrolledWindow, PolicyType,
+    Align, Box as GtkBox, Button, Image, Label, Orientation, Overlay, Overflow, ScrolledWindow, PolicyType,
 };
 use libadwaita::prelude::*;
 use libadwaita::{
@@ -850,18 +850,98 @@ impl VolnaWindow {
             let (p, vs) = (player.clone(), view_stack.clone());
             let (show_artist, show_track) = (search_view.show_artist.clone(), search_view.show_track.clone());
             let close = close_karaoke.clone();
+            let lbl = label.clone();
+            let active_popover: Rc<RefCell<Option<gtk4::Popover>>> = Rc::default();
             click.connect_released(move |_, _, _, _| {
                 let Some(track) = p.state.lock().unwrap().current_track.clone() else { return };
-                let f = close.borrow().clone();
-                if let Some(f) = f {
-                    f();
-                }
                 if artist {
-                    // shortcut: у трека с несколькими артистами открывается первый, для выбора нужен popover
-                    let Some(a) = track.artists.first() else { return };
-                    vs.set_visible_child_name("search");
-                    show_artist(a.clone(), track.source);
+                    if track.artists.len() <= 1 {
+                        let Some(a) = track.artists.first() else { return };
+                        let f = close.borrow().clone();
+                        if let Some(f) = f {
+                            f();
+                        }
+                        vs.set_visible_child_name("search");
+                        show_artist(a.clone(), track.source);
+                    } else {
+                        if let Some(old) = active_popover.borrow_mut().take() {
+                            old.popdown();
+                            old.unparent();
+                        }
+
+                        let pop = gtk4::Popover::new();
+                        pop.set_parent(&lbl);
+                        pop.add_css_class("menu");
+
+                        let pop_box = GtkBox::new(Orientation::Vertical, 4);
+                        pop_box.set_margin_top(6);
+                        pop_box.set_margin_bottom(6);
+                        pop_box.set_margin_start(6);
+                        pop_box.set_margin_end(6);
+
+                        let title_lbl = Label::new(Some("Исполнители"));
+                        title_lbl.add_css_class("dim-label");
+                        title_lbl.set_halign(Align::Start);
+                        pop_box.append(&title_lbl);
+
+                        for a in &track.artists {
+                            let btn = Button::new();
+                            btn.add_css_class("flat");
+
+                            let row = GtkBox::new(Orientation::Horizontal, 8);
+                            let icon = Image::from_icon_name("avatar-default-symbolic");
+                            icon.set_pixel_size(18);
+
+                            let name_lbl = Label::new(Some(&a.name));
+                            name_lbl.set_xalign(0.0);
+                            name_lbl.set_hexpand(true);
+
+                            row.append(&icon);
+                            row.append(&name_lbl);
+                            btn.set_child(Some(&row));
+
+                            let (pop_c, close_c, vs_c, show_artist_c, a_c, src) = (
+                                pop.clone(),
+                                close.clone(),
+                                vs.clone(),
+                                show_artist.clone(),
+                                a.clone(),
+                                track.source,
+                            );
+                            btn.connect_clicked(move |_| {
+                                pop_c.popdown();
+                                if let Some(f) = close_c.borrow().clone() {
+                                    f();
+                                }
+                                vs_c.set_visible_child_name("search");
+                                show_artist_c(a_c.clone(), src);
+                            });
+
+                            pop_box.append(&btn);
+                        }
+
+                        pop.set_child(Some(&pop_box));
+
+                        let pop_holder = active_popover.clone();
+                        let pop_weak = pop.downgrade();
+                        pop.connect_closed(move |p| {
+                            p.unparent();
+                            if let Some(w) = pop_weak.upgrade() {
+                                let mut cur = pop_holder.borrow_mut();
+                                if cur.as_ref().map_or(false, |c| c == &w) {
+                                    *cur = None;
+                                }
+                            }
+                        });
+
+                        *active_popover.borrow_mut() = Some(pop.clone());
+                        pop.popup();
+                    }
                 } else {
+                    let f = close.borrow().clone();
+                    if let Some(f) = f {
+                        f();
+                    }
                     vs.set_visible_child_name("search");
                     show_track(track);
                 }
@@ -1023,6 +1103,8 @@ impl VolnaWindow {
         k_track_info.append(&k_title_row);
         k_track_info.append(&k_track_artist);
         k_header.append(&k_track_info);
+        open_from_player(&k_track_title, false);
+        open_from_player(&k_track_artist, true);
 
         let k_close_btn = Button::from_icon_name("window-close-symbolic");
         k_close_btn.set_halign(Align::End);

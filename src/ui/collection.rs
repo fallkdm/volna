@@ -2346,9 +2346,19 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
         let album_nav = add("media-optical-symbolic", "Перейти к альбому", Box::new(move || open_album(&p, &stack, &page, &album)));
         album_nav.set_visible(track.source != TrackSource::Vk);
     }
-    if let (Some((stack, page)), Some(artist)) = (nav, track.artists.first()) {
-        let (p, stack, page, artist, source) = (player.clone(), stack.clone(), page.clone(), artist.clone(), track.source);
-        add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || open_artist(&p, &stack, &page, artist.clone(), source)));
+    if let Some((stack, page)) = nav {
+        if track.artists.len() <= 1 {
+            if let Some(artist) = track.artists.first() {
+                let (p, stack, page, artist, source) = (player.clone(), stack.clone(), page.clone(), artist.clone(), track.source);
+                add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || open_artist(&p, &stack, &page, artist.clone(), source)));
+            }
+        } else {
+            for a in &track.artists {
+                let (p, stack, page, artist, source) = (player.clone(), stack.clone(), page.clone(), a.clone(), track.source);
+                let label = format!("Перейти к {}", artist.name);
+                add("avatar-default-symbolic", &label, Box::new(move || open_artist(&p, &stack, &page, artist.clone(), source)));
+            }
+        }
     }
 
     bx.append(&menu);
