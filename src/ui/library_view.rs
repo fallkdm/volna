@@ -317,7 +317,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                                         let client = p.client.lock().unwrap().clone();
                                         match client.create_playlist(&uid, &name).await {
                                             Ok(kind) => {
-                                                let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), og_image: None };
+                                                let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), ..Default::default() };
                                                 open_playlist(&p, &stack, &page, &pl);
                                                 fill_playlists(&p, &stack, &page, &row, &uid).await;
                                             }
@@ -475,7 +475,7 @@ async fn fill_playlists(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>,
                     match client.create_playlist(&uid, &name).await {
                         Ok(kind) => {
                             // у нового плейлиста сразу открывается его страница
-                            let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), og_image: None };
+                            let pl = Playlist { uid: uid.clone(), kind, title: name, track_count: Some(0), ..Default::default() };
                             open_playlist(&p, &stack, &page, &pl);
                             fill_playlists(&p, &stack, &page, &row, &uid).await
                         }

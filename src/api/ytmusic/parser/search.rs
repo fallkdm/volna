@@ -106,8 +106,8 @@ fn parse_card_shelf(
             uid: browse_id.clone(),
             kind: browse_id,
             title,
-            track_count: None,
             og_image: cover_uri,
+            ..Default::default()
         });
     } else if let Some(t) = parse_responsive_track(card) {
         tracks.push(t);

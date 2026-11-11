@@ -74,6 +74,7 @@ fn into_playlist(playlist: VkPlaylistDto) -> Playlist {
         og_image: playlist
             .photo
             .and_then(|photo| photo.best_url().map(str::to_owned)),
+        ..Default::default()
     }
 }
 

@@ -56,6 +56,18 @@ pub struct Album {
     pub month: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaylistCover {
+    #[serde(default, rename = "type")]
+    pub cover_type: Option<String>,
+    pub uri: Option<String>,
+    #[serde(default, rename = "itemsUri")]
+    pub items_uri: Vec<String>,
+    pub dir: Option<String>,
+    pub version: Option<String>,
+    pub custom: Option<bool>,
+}
+
 /// Плейлист (в поиске и в списке плейлистов пользователя)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Playlist {
@@ -64,10 +76,14 @@ pub struct Playlist {
     #[serde(deserialize_with = "deserialize_id")]
     pub kind: String,
     pub title: String,
-    #[serde(rename = "trackCount")]
+    #[serde(rename = "trackCount", default)]
     pub track_count: Option<u32>,
-    #[serde(rename = "ogImage")]
+    #[serde(rename = "ogImage", default)]
     pub og_image: Option<String>,
+    #[serde(default, rename = "coverUri")]
+    pub cover_uri: Option<String>,
+    #[serde(default)]
+    pub cover: Option<PlaylistCover>,
 }
 
 /// Нормализует URL картинки к доступному хосту.
@@ -185,7 +201,14 @@ impl Playlist {
     }
 
     pub fn cover_url(&self, size: u32) -> Option<String> {
-        self.og_image.as_deref().map(|u| cover_url(u, size))
+        let uri = self
+            .cover
+            .as_ref()
+            .and_then(|c| c.uri.as_deref().or_else(|| c.items_uri.first().map(|s| s.as_str())))
+            .or(self.og_image.as_deref())
+            .or(self.cover_uri.as_deref());
+
+        uri.map(|u| cover_url(u, size))
     }
 }
 
@@ -939,6 +962,7 @@ mod tests {
             title: "Test".into(),
             track_count: None,
             og_image: None,
+            ..Default::default()
         };
         assert_eq!(pl_kind.id(), "VLPL123");
 
@@ -948,7 +972,63 @@ mod tests {
             title: "Test".into(),
             track_count: None,
             og_image: None,
+            ..Default::default()
         };
         assert_eq!(pl_uid.id(), "PL456");
+    }
+
+    #[test]
+    fn test_playlist_cover_url() {
+        let json_with_uri = r#"{
+            "uid": 12345,
+            "kind": 1001,
+            "title": "Лучшее: Три дня дождя",
+            "cover": {
+                "type": "pic",
+                "uri": "avatars.yandex.net/get-music-user-playlist/28719/s6br0jHow1yTnj/%%?1703678852293",
+                "custom": true
+            }
+        }"#;
+
+        let pl: Playlist = serde_json::from_str(json_with_uri).unwrap();
+        assert_eq!(
+            pl.cover_url(400),
+            Some("https://avatars.yandex.net/get-music-user-playlist/28719/s6br0jHow1yTnj/400x400?1703678852293".to_string())
+        );
+
+        let json_with_items_uri = r#"{
+            "uid": "12345",
+            "kind": "1002",
+            "title": "Сборный плейлист",
+            "cover": {
+                "type": "mosaic",
+                "itemsUri": [
+                    "avatars.yandex.net/get-music-content/123/%%",
+                    "avatars.yandex.net/get-music-content/456/%%"
+                ]
+            }
+        }"#;
+
+        let pl2: Playlist = serde_json::from_str(json_with_items_uri).unwrap();
+        assert_eq!(
+            pl2.cover_url(400),
+            Some("https://avatars.yandex.net/get-music-content/123/400x400".to_string())
+        );
+
+        let json_with_cover_uri = r#"{
+            "uid": 12345,
+            "kind": 1003,
+            "title": "Плейлист с coverUri",
+            "coverUri": "avatars.yandex.net/get-music-content/789/%%"
+        }"#;
+
+        let pl3: Playlist = serde_json::from_str(json_with_cover_uri).unwrap();
+        assert_eq!(
+            pl3.cover_url(400),
+            Some("https://avatars.yandex.net/get-music-content/789/400x400".to_string())
+        );
+
+        let pl_empty = Playlist::default();
+        assert_eq!(pl_empty.cover_url(400), None);
     }
 }

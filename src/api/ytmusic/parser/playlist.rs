@@ -51,6 +51,7 @@ pub fn parse_playlist_item(item: &serde_json::Value) -> Option<Playlist> {
         title,
         track_count,
         og_image,
+        ..Default::default()
     })
 }
 
@@ -169,8 +170,7 @@ fn collect_playlists_from_json(
                     uid: browse_id.to_string(),
                     kind: browse_id.to_string(),
                     title: title.to_string(),
-                    track_count: None,
-                    og_image: None,
+                    ..Default::default()
                 });
             }
         }
@@ -191,8 +191,7 @@ fn collect_playlists_from_json(
                         uid: bid.clone(),
                         kind: bid,
                         title,
-                        track_count: None,
-                        og_image: None,
+                        ..Default::default()
                     });
                 }
             }
@@ -253,8 +252,7 @@ pub fn parse_playlists_from_html(html: &str) -> Vec<Playlist> {
                         uid: bid.to_string(),
                         kind: bid.to_string(),
                         title,
-                        track_count: None,
-                        og_image: None,
+                        ..Default::default()
                     });
                 }
             }
