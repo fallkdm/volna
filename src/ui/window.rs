@@ -26,19 +26,6 @@ const SIDEBAR_COLLAPSED_WIDTH: i32 = 68;
 const CONTENT_GUTTER_EXPANDED: i32 = 24;
 const CONTENT_GUTTER_COLLAPSED: i32 = 36;
 const CONTENT_GUTTER_DEFAULT: i32 = 32;
-const WAVE_CLAMP_WIDE: f64 = 660.0;
-const WAVE_CLAMP_NARROW: f64 = 490.0;
-
-/// Вычисляет максимальную ширину мета-блока Волны в зависимости от сайдбара
-fn wave_clamp_for_sidebar(is_spotify_nav: bool, sidebar_width: i32) -> i32 {
-    if !is_spotify_nav {
-        return WAVE_CLAMP_WIDE as i32;
-    }
-    let t = ((sidebar_width as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)
-        / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64))
-        .clamp(0.0, 1.0);
-    (WAVE_CLAMP_WIDE + (WAVE_CLAMP_NARROW - WAVE_CLAMP_WIDE) * t).round() as i32
-}
 
 pub struct VolnaWindow {
     pub window: ApplicationWindow,
@@ -179,7 +166,6 @@ impl VolnaWindow {
         sidebar.add_css_class("spotify-sidebar");
         let initial_width = if initial_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH };
         sidebar.set_width_request(initial_width);
-        wave_view.set_clamp_width(wave_clamp_for_sidebar(is_spotify_nav, initial_width));
         sidebar.set_halign(Align::Start);
         sidebar.set_valign(Align::Fill);
         sidebar.set_vexpand(true);
@@ -531,7 +517,6 @@ impl VolnaWindow {
             let search_container = search_container.clone();
             let library_container = library_container.clone();
             let is_spotify_nav_state = is_spotify_nav_state.clone();
-            let wave_clamp = wave_view.meta_clamp.clone();
             let nav_items = vec![nav_wave.clone(), nav_search.clone(), nav_liked.clone()];
             let anim_holder: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
 
@@ -593,7 +578,6 @@ impl VolnaWindow {
                 let sc = search_container.clone();
                 let lc = library_container.clone();
                 let is_sp = is_spotify_nav_state.clone();
-                let wc = wave_clamp.clone();
 
                 let target = libadwaita::CallbackAnimationTarget::new(move |val| {
                     let w = val.round() as i32;
@@ -607,7 +591,6 @@ impl VolnaWindow {
                         sc.set_margin_end(gutter);
                         lc.set_margin_end(gutter);
                     }
-                    wc.set_maximum_size(wave_clamp_for_sidebar(is_sp_val, w));
                     if !next_collapsed {
                         bb.set_opacity(t);
                         slb.set_opacity(t);
@@ -631,7 +614,6 @@ impl VolnaWindow {
                 let sc_done = search_container.clone();
                 let lc_done = library_container.clone();
                 let is_sp_done = is_spotify_nav_state.clone();
-                let wc_done = wave_clamp.clone();
 
                 anim.connect_done(move |_| {
                     let is_sp_val = *is_sp_done.borrow();
@@ -651,7 +633,6 @@ impl VolnaWindow {
                         sc_done.set_margin_end(gutter);
                         lc_done.set_margin_end(gutter);
                     }
-                    wc_done.set_maximum_size(wave_clamp_for_sidebar(is_sp_val, w));
                     if next_collapsed {
                         s_done.set_width_request(SIDEBAR_COLLAPSED_WIDTH);
                         s_done.add_css_class("collapsed");
@@ -2440,12 +2421,6 @@ fn setup_event_listener(
                     header_brand_box.set_visible(!is_spotify);
                     header_right_box.set_visible(!is_spotify);
                     let collapsed = *is_collapsed.borrow();
-                    let sidebar_width = if collapsed {
-                        SIDEBAR_COLLAPSED_WIDTH
-                    } else {
-                        SIDEBAR_EXPANDED_WIDTH
-                    };
-                    wave_view.set_clamp_width(wave_clamp_for_sidebar(is_spotify, sidebar_width));
                     let (start, end) = if is_spotify {
                         if collapsed {
                             (SIDEBAR_COLLAPSED_WIDTH + CONTENT_GUTTER_COLLAPSED, CONTENT_GUTTER_COLLAPSED)

@@ -101,9 +101,8 @@ impl WaveShaderState {
 /// Выбранный пункт фильтра: значение, подпись и цвет
 type Pick = Option<(&'static str, &'static str, [f64; 3])>;
 
-const TITLE_SIZE_CLASSES: [&str; 4] = [
+const TITLE_SIZE_CLASSES: [&str; 3] = [
     "hero-title-xl",
-    "hero-title-lg",
     "hero-title-md",
     "hero-title-sm",
 ];
@@ -174,9 +173,8 @@ impl WaveViewWidgets {
     /// CSS-класс размера заголовка по числу символов названия
     pub fn title_size_class(char_len: usize) -> &'static str {
         match char_len {
-            0..=15 => "hero-title-xl",
-            16..=26 => "hero-title-lg",
-            27..=42 => "hero-title-md",
+            0..=28 => "hero-title-xl",
+            29..=44 => "hero-title-md",
             _ => "hero-title-sm",
         }
     }
@@ -238,11 +236,6 @@ impl WaveViewWidgets {
         self.version_label.set_visible(false);
         self.explicit_badge.set_visible(false);
         self.artist_label.set_text(subtitle);
-    }
-
-    /// Обновляет максимальную ширину блока метаданных
-    pub fn set_clamp_width(&self, width: i32) {
-        self.meta_clamp.set_maximum_size(width);
     }
 
     /// Плашка типа Волны (по артисту или треку); `None` — убрать плашку
@@ -880,10 +873,10 @@ pub fn create_wave_view(
     bottom_box.append(&menu_button);
 
     let meta_clamp = libadwaita::Clamp::new();
-    meta_clamp.set_maximum_size(490);
-    meta_clamp.set_tightening_threshold(400);
-    meta_clamp.set_margin_start(24);
-    meta_clamp.set_margin_end(24);
+    meta_clamp.set_maximum_size(860);
+    meta_clamp.set_tightening_threshold(860);
+    meta_clamp.set_margin_start(32);
+    meta_clamp.set_margin_end(32);
     meta_clamp.set_child(Some(&bottom_box));
     content_box.append(&meta_clamp);
 
@@ -1050,15 +1043,13 @@ mod title_tests {
     fn title_size_class_respects_thresholds() {
         assert_eq!(WaveViewWidgets::title_size_class(0), "hero-title-xl");
         assert_eq!(WaveViewWidgets::title_size_class(5), "hero-title-xl");
-        assert_eq!(WaveViewWidgets::title_size_class(15), "hero-title-xl");
+        assert_eq!(WaveViewWidgets::title_size_class(19), "hero-title-xl");
+        assert_eq!(WaveViewWidgets::title_size_class(28), "hero-title-xl");
 
-        assert_eq!(WaveViewWidgets::title_size_class(16), "hero-title-lg");
-        assert_eq!(WaveViewWidgets::title_size_class(26), "hero-title-lg");
+        assert_eq!(WaveViewWidgets::title_size_class(29), "hero-title-md");
+        assert_eq!(WaveViewWidgets::title_size_class(44), "hero-title-md");
 
-        assert_eq!(WaveViewWidgets::title_size_class(27), "hero-title-md");
-        assert_eq!(WaveViewWidgets::title_size_class(42), "hero-title-md");
-
-        assert_eq!(WaveViewWidgets::title_size_class(43), "hero-title-sm");
+        assert_eq!(WaveViewWidgets::title_size_class(45), "hero-title-sm");
         assert_eq!(WaveViewWidgets::title_size_class(120), "hero-title-sm");
     }
 }

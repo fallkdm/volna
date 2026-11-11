@@ -45,19 +45,14 @@
     letter-spacing: -1.2px;
 }
 
-.hero-track-title.hero-title-lg {
-    font-size: 52px;
-    letter-spacing: -0.8px;
-}
-
 .hero-track-title.hero-title-md {
-    font-size: 40px;
-    letter-spacing: -0.5px;
+    font-size: 48px;
+    letter-spacing: -0.7px;
 }
 
 .hero-track-title.hero-title-sm {
-    font-size: 34px;
-    letter-spacing: -0.3px;
+    font-size: 36px;
+    letter-spacing: -0.4px;
     line-height: 1.15;
 }
 
