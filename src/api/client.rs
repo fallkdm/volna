@@ -3,6 +3,7 @@ use chrono::Utc;
 use md5::{Digest, Md5};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use ring::hmac;
+use serde::Deserialize;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,6 +106,11 @@ pub struct PlaylistMeta {
     pub description: String,
     pub owner: String,
     pub modified: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DirectAlbumsResponse {
+    pub albums: Vec<Album>,
 }
 
 #[derive(Clone)]
@@ -939,6 +945,13 @@ impl YandexMusicClient {
     pub async fn get_artist_brief(&self, artist_id: &str) -> Result<ArtistBrief, ApiError> {
         self.get_result(&format!("/artists/{}/brief-info", artist_id))
             .await
+    }
+
+    pub async fn get_artist_direct_albums(&self, artist_id: &str) -> Result<Vec<Album>, ApiError> {
+        let res: DirectAlbumsResponse = self
+            .get_result(&format!("/artists/{}/direct-albums?page-size=100", artist_id))
+            .await?;
+        Ok(res.albums)
     }
 
     /// Похожие на трек

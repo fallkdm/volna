@@ -1637,7 +1637,22 @@ pub fn open_artist(
             TrackSource::Yandex => {
                 let clean_id = artist.id.strip_prefix("ya:").unwrap_or(&artist.id);
                 let client = p.client.lock().unwrap().clone();
-                client.get_artist_brief(clean_id).await.map_err(|e| e.to_string())
+                match client.get_artist_brief(clean_id).await {
+                    Ok(mut brief) => {
+                        // Загружаем полную дискографию (все альбомы и синглы) через direct-albums
+                        if let Ok(direct_albums) = client.get_artist_direct_albums(clean_id).await {
+                            if !direct_albums.is_empty() {
+                                let mut albums = direct_albums;
+                                for a in &mut albums {
+                                    a.ensure_month_parsed();
+                                }
+                                brief.albums = albums;
+                            }
+                        }
+                        Ok(brief)
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
             }
         };
 
@@ -1741,7 +1756,8 @@ pub fn open_artist(
                         std::collections::BTreeMap::new();
                     let mut without_year: Vec<Album> = Vec::new();
 
-                    for album in brief.albums {
+                    for mut album in brief.albums {
+                        album.ensure_month_parsed();
                         if let Some(year) = album.year {
                             by_year.entry(year).or_default().push(album);
                         } else {
@@ -1749,7 +1765,11 @@ pub fn open_artist(
                         }
                     }
 
-                    for (year, albums_in_year) in by_year.into_iter().rev() {
+                    for (year, mut albums_in_year) in by_year.into_iter().rev() {
+                        albums_in_year.sort_by(|a, b| {
+                            b.month.cmp(&a.month)
+                                .then_with(|| b.release_date.cmp(&a.release_date))
+                        });
                         let title = format!("{} — {} рел.", year, albums_in_year.len());
                         page.extra.append(&section_title(&title));
                         let (row, inner) = tile_row();

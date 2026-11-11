@@ -48,9 +48,9 @@ pub struct Album {
     pub artists: Vec<Artist>,
     #[serde(rename = "trackCount")]
     pub track_count: Option<u32>,
-    #[serde(default)]
+    #[serde(alias = "releaseDate", default)]
     pub release_date: Option<String>,
-    #[serde(default)]
+    #[serde(alias = "type", default)]
     pub release_type: Option<String>,
     #[serde(default)]
     pub month: Option<u32>,
@@ -122,6 +122,23 @@ impl Album {
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    pub fn ensure_month_parsed(&mut self) {
+        if self.month.is_none() {
+            if let Some(ref d) = self.release_date {
+                if let Some(m_str) = d.split('-').nth(1) {
+                    self.month = m_str.parse().ok();
+                }
+            }
+        }
+        if self.year.is_none() {
+            if let Some(ref d) = self.release_date {
+                if let Some(y_str) = d.split('-').next() {
+                    self.year = y_str.parse().ok();
+                }
+            }
+        }
     }
 
     pub fn date_label(&self) -> String {

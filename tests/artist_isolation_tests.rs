@@ -418,5 +418,44 @@ fn test_album_chronology_date_label() {
     }
 }
 
+#[test]
+fn test_yandex_album_serde_and_month_parsing() {
+    let json_data = r#"{
+        "id": 1234567,
+        "title": "Светлячки",
+        "type": "single",
+        "releaseDate": "2024-10-04T00:00:00+03:00"
+    }"#;
 
+    let mut album: api::models::Album =
+        serde_json::from_str(json_data).expect("десериализация альбома Яндекс Музыки");
 
+    assert_eq!(album.id, "1234567");
+    assert_eq!(album.release_type.as_deref(), Some("single"));
+    assert_eq!(
+        album.release_date.as_deref(),
+        Some("2024-10-04T00:00:00+03:00")
+    );
+    assert_eq!(album.month, None);
+
+    album.ensure_month_parsed();
+
+    assert_eq!(album.month, Some(10));
+    assert_eq!(album.release_type.as_deref(), Some("single"));
+    assert_eq!(album.date_label(), "Октябрь 2024");
+
+    // Также проверяем вариант, когда поле year явно присутствует
+    let json_with_year = r#"{
+        "id": 1234568,
+        "title": "Светлячки (Remix)",
+        "year": 2024,
+        "type": "single",
+        "releaseDate": "2024-10-04T00:00:00+03:00"
+    }"#;
+    let mut album2: api::models::Album =
+        serde_json::from_str(json_with_year).expect("десериализация с явным year");
+    album2.ensure_month_parsed();
+    assert_eq!(album2.month, Some(10));
+    assert_eq!(album2.release_type.as_deref(), Some("single"));
+    assert_eq!(album2.date_label(), "Октябрь 2024");
+}
