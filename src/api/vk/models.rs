@@ -374,6 +374,10 @@ pub struct VkPlaylistDto {
     pub audios: Vec<VkAudioDto>,
     #[serde(default)]
     pub access_key: Option<String>,
+    #[serde(default)]
+    pub create_time: Option<u64>,
+    #[serde(default)]
+    pub update_time: Option<u64>,
 }
 
 /// Список плейлистов с общим количеством результатов.

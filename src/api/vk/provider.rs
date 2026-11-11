@@ -769,28 +769,49 @@ impl MusicProvider for VkProvider {
 
         let mut enriched_albums = Vec::new();
         for mut album in albums {
-            let is_unnamed = album
-                .title
-                .as_deref()
-                .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
-            if is_unnamed {
-                let clean_id = album.id.strip_prefix("vk:").unwrap_or(&album.id);
-                if let Some((o_str, a_str)) = clean_id.split_once('_') {
-                    if let (Ok(o), Ok(a)) = (o_str.parse::<i64>(), a_str.parse::<i64>()) {
-                        if let Ok(pl) = self.client.get_playlist_by_id(o, a).await {
+            let clean_id = album.id.strip_prefix("vk:").unwrap_or(&album.id);
+            if let Some((o_str, a_str)) = clean_id.split_once('_') {
+                if let (Ok(o), Ok(a)) = (o_str.parse::<i64>(), a_str.parse::<i64>()) {
+                    if let Ok(pl) = self.client.get_playlist_by_id(o, a).await {
+                        let is_unnamed = album
+                            .title
+                            .as_deref()
+                            .map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("unnamed"));
+                        if is_unnamed {
                             let pl_title = pl.title.trim();
                             if !pl_title.is_empty() && !pl_title.eq_ignore_ascii_case("unnamed") {
                                 album.title = Some(pl_title.to_string());
-                                if album.og_image.is_none() {
-                                    album.og_image = pl.photo.and_then(|p| p.best_url().map(str::to_owned));
+                            }
+                        }
+                        if album.og_image.is_none() {
+                            album.og_image = pl.photo.as_ref().and_then(|p| p.best_url().map(str::to_owned));
+                        }
+                        if let Some(ts) = pl.create_time {
+                            if let Some(dt) = chrono::DateTime::from_timestamp(ts as i64, 0) {
+                                use chrono::Datelike;
+                                let y = dt.year();
+                                if y > 0 {
+                                    album.year = Some(y as u32);
+                                    album.month = Some(dt.month());
                                 }
                             }
                         }
+                        let count = pl.count.unwrap_or(0);
+                        let rel_type = if count == 1 {
+                            "single"
+                        } else if count > 1 && count <= 4 {
+                            "ep"
+                        } else {
+                            "album"
+                        };
+                        album.release_type = Some(rel_type.into());
                     }
                 }
             }
             enriched_albums.push(album);
         }
+
+        enriched_albums.sort_by(|a, b| b.year.cmp(&a.year).then_with(|| b.month.cmp(&a.month)));
 
         let mut playlists = Vec::new();
         if let Ok(pl_res) = self.client.search_playlists(artist_name, 10).await {
@@ -913,7 +934,12 @@ pub fn filter_artist_items(
             }
             entry.1 += 1;
         }
-        if top_tracks.len() < 10 && item.is_playable() {
+        if top_tracks.len() < 10
+            && item.is_playable()
+            && !top_tracks
+                .iter()
+                .any(|t: &Track| t.title.trim().eq_ignore_ascii_case(item.title.trim()))
+        {
             top_tracks.push(item.clone().into_track());
         }
     }

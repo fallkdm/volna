@@ -89,6 +89,7 @@ fn parse_track_meta_runs(
                     og_image: None,
                     artists: Vec::new(),
                     track_count: None,
+                    ..Default::default()
                 });
                 explicit_found_album = true;
                 continue;
@@ -156,6 +157,7 @@ fn parse_track_meta_runs(
                         og_image: None,
                         artists: Vec::new(),
                         track_count: None,
+                        ..Default::default()
                     });
                 }
             }

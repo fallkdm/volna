@@ -48,6 +48,12 @@ pub struct Album {
     pub artists: Vec<Artist>,
     #[serde(rename = "trackCount")]
     pub track_count: Option<u32>,
+    #[serde(default)]
+    pub release_date: Option<String>,
+    #[serde(default)]
+    pub release_type: Option<String>,
+    #[serde(default)]
+    pub month: Option<u32>,
 }
 
 /// Плейлист (в поиске и в списке плейлистов пользователя)
@@ -116,6 +122,39 @@ impl Album {
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    pub fn date_label(&self) -> String {
+        let month_name = match self.month {
+            Some(1) => "Январь",
+            Some(2) => "Февраль",
+            Some(3) => "Март",
+            Some(4) => "Апрель",
+            Some(5) => "Май",
+            Some(6) => "Июнь",
+            Some(7) => "Июль",
+            Some(8) => "Август",
+            Some(9) => "Сентябрь",
+            Some(10) => "Октябрь",
+            Some(11) => "Ноябрь",
+            Some(12) => "Декабрь",
+            _ => "",
+        };
+        match (month_name.is_empty(), self.year) {
+            (false, Some(y)) => format!("{} {}", month_name, y),
+            (true, Some(y)) => format!("{}", y),
+            (false, None) => month_name.to_string(),
+            (true, None) => String::new(),
+        }
+    }
+
+    pub fn type_badge(&self) -> &'static str {
+        match self.release_type.as_deref() {
+            Some("single") => "Сингл",
+            Some("ep") => "EP",
+            Some("compilation") => "Сборник",
+            _ => "Альбом",
+        }
     }
 }
 

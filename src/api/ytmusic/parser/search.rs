@@ -95,6 +95,7 @@ fn parse_card_shelf(
             og_image: None,
             artists: Vec::new(),
             track_count: None,
+            ..Default::default()
         });
     } else if subtitle.contains("плейлист")
         || subtitle.contains("playlist")

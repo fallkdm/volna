@@ -77,6 +77,7 @@ pub fn parse_album_item(item: &serde_json::Value) -> Option<Album> {
         og_image: None,
         artists,
         track_count: None,
+        ..Default::default()
     })
 }
 

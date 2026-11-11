@@ -1545,7 +1545,12 @@ pub fn album_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, 
     } else {
         raw_title
     };
-    let sub = album_subtitle(album);
+    let date_lbl = album.date_label();
+    let sub = if !date_lbl.is_empty() {
+        format!("{} • {}", album.type_badge(), date_lbl)
+    } else {
+        album_subtitle(album)
+    };
     let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
     let al = album.clone();
     tile(title, &sub, album.cover_url(300), size, false, move || open_album(&p, &stack, &page, &al))
@@ -1732,12 +1737,36 @@ pub fn open_artist(
                 }
 
                 if !brief.albums.is_empty() {
-                    page.extra.append(&section_title("Альбомы"));
-                    let (row, inner) = tile_row();
-                    for album in &brief.albums {
-                        inner.append(&album_tile(&p, &stack, &page, album, 160));
+                    let mut by_year: std::collections::BTreeMap<u32, Vec<Album>> =
+                        std::collections::BTreeMap::new();
+                    let mut without_year: Vec<Album> = Vec::new();
+
+                    for album in brief.albums {
+                        if let Some(year) = album.year {
+                            by_year.entry(year).or_default().push(album);
+                        } else {
+                            without_year.push(album);
+                        }
                     }
-                    page.extra.append(&row);
+
+                    for (year, albums_in_year) in by_year.into_iter().rev() {
+                        let title = format!("{} — {} рел.", year, albums_in_year.len());
+                        page.extra.append(&section_title(&title));
+                        let (row, inner) = tile_row();
+                        for album in &albums_in_year {
+                            inner.append(&album_tile(&p, &stack, &page, album, 160));
+                        }
+                        page.extra.append(&row);
+                    }
+
+                    if !without_year.is_empty() {
+                        page.extra.append(&section_title("Другие релизы"));
+                        let (row, inner) = tile_row();
+                        for album in &without_year {
+                            inner.append(&album_tile(&p, &stack, &page, album, 160));
+                        }
+                        page.extra.append(&row);
+                    }
                 }
 
                 if !brief.playlists.is_empty() {

@@ -359,4 +359,64 @@ fn test_filter_artist_items_replaces_unnamed_album_title() {
     assert_eq!(albums[0].title.as_deref(), Some("Demons"));
 }
 
+#[test]
+fn test_album_chronology_date_label() {
+    use api::models::Album;
+
+    // 1. Проверка date_label: месяц + год
+    let mut album = Album {
+        year: Some(2023),
+        month: Some(5),
+        release_type: Some("single".into()),
+        ..Default::default()
+    };
+    assert_eq!(album.date_label(), "Май 2023");
+    assert_eq!(album.type_badge(), "Сингл");
+
+    // 2. Только год
+    album.month = None;
+    album.release_type = Some("ep".into());
+    assert_eq!(album.date_label(), "2023");
+    assert_eq!(album.type_badge(), "EP");
+
+    // 3. Только месяц
+    album.year = None;
+    album.month = Some(1);
+    album.release_type = Some("compilation".into());
+    assert_eq!(album.date_label(), "Январь");
+    assert_eq!(album.type_badge(), "Сборник");
+
+    // 4. Без даты
+    album.month = None;
+    album.release_type = None;
+    assert_eq!(album.date_label(), "");
+    assert_eq!(album.type_badge(), "Альбом");
+
+    // 5. Неизвестный тип релиза по умолчанию Альбом
+    album.release_type = Some("unknown".into());
+    assert_eq!(album.type_badge(), "Альбом");
+
+    // 6. Проверка всех 12 месяцев
+    let expected_months = [
+        (1, "Январь"),
+        (2, "Февраль"),
+        (3, "Март"),
+        (4, "Апрель"),
+        (5, "Май"),
+        (6, "Июнь"),
+        (7, "Июль"),
+        (8, "Август"),
+        (9, "Сентябрь"),
+        (10, "Октябрь"),
+        (11, "Ноябрь"),
+        (12, "Декабрь"),
+    ];
+    for (m, name) in expected_months {
+        album.month = Some(m);
+        album.year = Some(2024);
+        assert_eq!(album.date_label(), format!("{} 2024", name));
+    }
+}
+
+
 
