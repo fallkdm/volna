@@ -3276,6 +3276,7 @@ dependencies = [
  "gtk4",
  "keyring",
  "libadwaita",
+ "libc",
  "libloading",
  "md-5",
  "mdns-sd",

@@ -41,3 +41,5 @@ sha1 = "0.10"
 thiserror = "2"
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
 zeroize = "1"
+libc = "0.2"
+

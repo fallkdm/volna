@@ -1,8 +1,9 @@
+use gtk4::glib;
 use libadwaita::prelude::*;
 use libadwaita::Application;
 
 #[allow(unused_imports)]
-use volna::{api, cache, cast, discord, ipc, mpris, player, station, ui, trim_allocator};
+use volna::{api, cache, cast, discord, ipc, mpris, player, station, ui, trim_allocator, memory_info};
 use volna::api::auth::load_token;
 use volna::api::client::YandexMusicClient;
 use volna::player::PlayerManager;
@@ -10,22 +11,18 @@ use volna::ui::VolnaWindow;
 
 const APP_ID: &str = "io.github.fallkdm.Volna";
 
-/// Ограничивает число malloc-арен glibc.
-///
-/// У плеера много потоков (GTK, GStreamer, Tokio, сеть), и glibc создаёт
-/// отдельную арену почти под каждый. К моменту, когда все они разрастаются,
-/// в памяти висит 200+ МБ пустых арен. Двух арен хватает с запасом.
+/// Ограничивает число malloc-арен glibc (M_ARENA_MAX = 4).
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn tune_allocator() {
+fn apply_allocator_tuning() {
     unsafe extern "C" {
         fn mallopt(param: std::os::raw::c_int, value: std::os::raw::c_int) -> std::os::raw::c_int;
     }
-    // M_ARENA_MAX из <malloc.h>; тестовый harness может задать 2/4/env.
+    // M_ARENA_MAX = 4 (проверенная конфигурация с меньшим RSS и минимумом contention)
     const M_ARENA_MAX: std::os::raw::c_int = -8;
     let arena_max = std::env::var("M_ARENA_MAX")
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
-        .unwrap_or(2)
+        .unwrap_or(4)
         .clamp(1, 64);
     unsafe {
         let _ = mallopt(M_ARENA_MAX, arena_max);
@@ -33,10 +30,27 @@ fn tune_allocator() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn tune_allocator() {}
+fn apply_allocator_tuning() {}
+
+fn spawn_memory_diag_logger() {
+    std::thread::Builder::new()
+        .name("volna-diag".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            if let Some(info) = volna::memory_info() {
+                eprintln!(
+                    "[diag] mallinfo2: arena={:.2}MB uordblks={:.2}MB fordblks={:.2}MB",
+                    info.get("arena_mb").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    info.get("uordblks_mb").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    info.get("fordblks_mb").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                );
+            }
+        })
+        .ok();
+}
 
 fn main() {
-    tune_allocator();
+    apply_allocator_tuning();
 
     // Инициализируем многопоточный Tokio runtime для фоновых сетевых запросов и MPRIS D-Bus
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -45,8 +59,20 @@ fn main() {
         .expect("Не удалось инициализировать Tokio runtime");
     let _guard = rt.enter();
 
+    if std::env::var("VOLNA_DIAG").as_deref() == Ok("1") {
+        spawn_memory_diag_logger();
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "mcp" {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let name = std::ffi::CString::new("volna-mcp").unwrap();
+            libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
+        }
+        glib::set_prgname(Some("volna-mcp"));
+        glib::set_application_name("Volna MCP Server");
+
         // Запускаем MCP сервер без инициализации GTK!
         rt.block_on(volna::ipc::mcp::run_mcp_server());
         return;
@@ -55,9 +81,10 @@ fn main() {
         // Простой CLI-клиент для вызова команд из терминала
         let cmd_name = args.get(2).map(|s| s.as_str()).unwrap_or("status");
         let cmd_json = match cmd_name {
-            "status" | "play" | "pause" | "toggle" | "next" | "prev" | "like" | "dislike" => {
+            "status" | "play" | "pause" | "toggle" | "next" | "prev" | "like" | "dislike" | "mem_info" | "mem_trim" => {
                 serde_json::json!({ "cmd": cmd_name })
             }
+
             "volume" => {
                 let val = args.get(3).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.5);
                 serde_json::json!({ "cmd": "volume", "val": val })

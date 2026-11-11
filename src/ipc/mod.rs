@@ -306,7 +306,31 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
             player.toggle_dislike();
             serde_json::json!({ "ok": true })
         }
+        "mem_info" => {
+            let mem = crate::memory_info();
+            let mut resp = serde_json::json!({
+                "ok": true,
+                "memory": mem,
+            });
+            if let Some(serde_json::Value::Object(map)) = mem {
+                for (k, v) in map {
+                    resp[k] = v;
+                }
+            }
+            resp
+        }
+        "mem_trim" => {
+            let before = crate::memory_info();
+            crate::trim_allocator();
+            let after = crate::memory_info();
+            serde_json::json!({
+                "ok": true,
+                "before": before,
+                "after": after,
+            })
+        }
         _ => serde_json::json!({ "ok": false, "error": "unknown command" }),
+
     }
 }
 
@@ -394,6 +418,32 @@ mod tests {
         let resp_vk = handle_command(&player, &cmd_vk).await;
         assert_eq!(resp_vk["ok"], true);
         assert_eq!(player.providers.active_id(), crate::api::provider::ProviderId::Vk);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_mem_info_command() {
+        let Some(player) = setup_test_player() else { return; };
+        let cmd = serde_json::json!({ "cmd": "mem_info" });
+        let resp = handle_command(&player, &cmd).await;
+        assert_eq!(resp["ok"], true);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            assert!(resp.get("memory").is_some());
+            assert!(resp.get("arena_mb").is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ipc_mem_trim_command() {
+        let Some(player) = setup_test_player() else { return; };
+        let cmd = serde_json::json!({ "cmd": "mem_trim" });
+        let resp = handle_command(&player, &cmd).await;
+        assert_eq!(resp["ok"], true);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            assert!(resp.get("before").is_some());
+            assert!(resp.get("after").is_some());
+        }
     }
 
     #[tokio::test]
