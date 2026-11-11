@@ -21,6 +21,12 @@ use super::preferences_dialog::{show_preferences_dialog, show_ytmusic_auth_dialo
 use super::search_view::create_search_view;
 use super::wave_view::{create_wave_view, WaveViewWidgets};
 
+const SIDEBAR_EXPANDED_WIDTH: i32 = 240;
+const SIDEBAR_COLLAPSED_WIDTH: i32 = 68;
+const CONTENT_GUTTER_EXPANDED: i32 = 24;
+const CONTENT_GUTTER_COLLAPSED: i32 = 36;
+const CONTENT_GUTTER_DEFAULT: i32 = 32;
+
 pub struct VolnaWindow {
     pub window: ApplicationWindow,
 }
@@ -129,21 +135,25 @@ impl VolnaWindow {
         }
 
         // ================= Монолитный левый сайдбар =================
-        const SIDEBAR_EXPANDED_WIDTH: i32 = 240;
-        const SIDEBAR_COLLAPSED_WIDTH: i32 = 68;
         let is_collapsed = Rc::new(RefCell::new(crate::api::auth::load_sidebar_collapsed()));
         let initial_collapsed = *is_collapsed.borrow();
 
         let is_spotify_nav = nav_style == "spotify";
         let is_spotify_nav_state = Rc::new(RefCell::new(is_spotify_nav));
 
-        let initial_content_margin = if is_spotify_nav {
-            if initial_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH }
+        let (initial_margin_start, initial_margin_end) = if is_spotify_nav {
+            if initial_collapsed {
+                (SIDEBAR_COLLAPSED_WIDTH + CONTENT_GUTTER_COLLAPSED, CONTENT_GUTTER_COLLAPSED)
+            } else {
+                (SIDEBAR_EXPANDED_WIDTH + CONTENT_GUTTER_EXPANDED, CONTENT_GUTTER_EXPANDED)
+            }
         } else {
-            0
+            (CONTENT_GUTTER_DEFAULT, CONTENT_GUTTER_DEFAULT)
         };
-        search_view.container.set_margin_start(initial_content_margin);
-        library_view.container.set_margin_start(initial_content_margin);
+        search_view.container.set_margin_start(initial_margin_start);
+        search_view.container.set_margin_end(initial_margin_end);
+        library_view.container.set_margin_start(initial_margin_start);
+        library_view.container.set_margin_end(initial_margin_end);
 
         let search_container = search_view.container.clone();
         let library_container = library_view.container.clone();
@@ -572,11 +582,14 @@ impl VolnaWindow {
                 let target = libadwaita::CallbackAnimationTarget::new(move |val| {
                     let w = val.round() as i32;
                     s.set_width_request(w);
-                    if *is_sp.borrow() {
-                        sc.set_margin_start(w);
-                        lc.set_margin_start(w);
-                    }
                     let t = ((val - SIDEBAR_COLLAPSED_WIDTH as f64) / (SIDEBAR_EXPANDED_WIDTH as f64 - SIDEBAR_COLLAPSED_WIDTH as f64)).clamp(0.0, 1.0);
+                    if *is_sp.borrow() {
+                        let gutter = (CONTENT_GUTTER_COLLAPSED as f64 + (CONTENT_GUTTER_EXPANDED as f64 - CONTENT_GUTTER_COLLAPSED as f64) * t).round() as i32;
+                        sc.set_margin_start(w + gutter);
+                        lc.set_margin_start(w + gutter);
+                        sc.set_margin_end(gutter);
+                        lc.set_margin_end(gutter);
+                    }
                     if !next_collapsed {
                         bb.set_opacity(t);
                         slb.set_opacity(t);
@@ -603,9 +616,15 @@ impl VolnaWindow {
 
                 anim.connect_done(move |_| {
                     if *is_sp_done.borrow() {
-                        let m = if next_collapsed { SIDEBAR_COLLAPSED_WIDTH } else { SIDEBAR_EXPANDED_WIDTH };
-                        sc_done.set_margin_start(m);
-                        lc_done.set_margin_start(m);
+                        let (w, gutter) = if next_collapsed {
+                            (SIDEBAR_COLLAPSED_WIDTH, CONTENT_GUTTER_COLLAPSED)
+                        } else {
+                            (SIDEBAR_EXPANDED_WIDTH, CONTENT_GUTTER_EXPANDED)
+                        };
+                        sc_done.set_margin_start(w + gutter);
+                        lc_done.set_margin_start(w + gutter);
+                        sc_done.set_margin_end(gutter);
+                        lc_done.set_margin_end(gutter);
                     }
                     if next_collapsed {
                         s_done.set_width_request(SIDEBAR_COLLAPSED_WIDTH);
@@ -2404,13 +2423,19 @@ fn setup_event_listener(
                     view_switcher.set_visible(!is_spotify);
                     header_brand_box.set_visible(!is_spotify);
                     header_right_box.set_visible(!is_spotify);
-                    let m = if is_spotify {
-                        if *is_collapsed.borrow() { 68 } else { 240 }
+                    let (start, end) = if is_spotify {
+                        if *is_collapsed.borrow() {
+                            (SIDEBAR_COLLAPSED_WIDTH + CONTENT_GUTTER_COLLAPSED, CONTENT_GUTTER_COLLAPSED)
+                        } else {
+                            (SIDEBAR_EXPANDED_WIDTH + CONTENT_GUTTER_EXPANDED, CONTENT_GUTTER_EXPANDED)
+                        }
                     } else {
-                        0
+                        (CONTENT_GUTTER_DEFAULT, CONTENT_GUTTER_DEFAULT)
                     };
-                    search_container.set_margin_start(m);
-                    library_container.set_margin_start(m);
+                    search_container.set_margin_start(start);
+                    library_container.set_margin_start(start);
+                    search_container.set_margin_end(end);
+                    library_container.set_margin_end(end);
                 }
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
