@@ -4,47 +4,14 @@
 use serde_json::Value;
 
 use super::client::urlencoding_encode;
-use super::wiki::{trim_extract, ArtistSummary};
-
-const USER_AGENT: &str = "Volna/0.1 (unofficial Yandex Music client; GPL-3.0)";
+use super::wiki::{clean_html_entities_and_tags, same_artist, trim_extract, ArtistSummary, USER_AGENT};
 
 /// Убирает HTML из биографии: ссылки «Read more on Last.fm» вместе с текстом, остальные теги и сущности
 fn strip_html(html: &str) -> String {
-    let mut out = String::new();
-    let mut rest = html;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start..];
-        let Some(end) = tail.find('>') else { break };
-        let tag = tail[..=end].to_lowercase();
-        if tag.starts_with("<a ") {
-            // текст внутри ссылки (в биографии это только «Read more on Last.fm») отбрасываем
-            match tail.to_lowercase().find("</a>") {
-                Some(close) => {
-                    rest = &tail[close + 4..];
-                    continue;
-                }
-                None => break,
-            }
-        }
-        if tag.starts_with("<br") || tag.starts_with("</p") {
-            out.push(' ');
-        }
-        rest = &tail[end + 1..];
-    }
-    out.push_str(rest);
-    let decoded = out
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&");
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Имя в ответе должно совпадать с искомым (без учёта регистра)
-fn same_artist(found: &str, name: &str) -> bool {
-    !name.trim().is_empty() && found.trim().to_lowercase() == name.trim().to_lowercase()
+    clean_html_entities_and_tags(html, true)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Ищет справку об исполнителе в Last.fm; без ключа ничего не делает

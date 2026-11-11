@@ -3,19 +3,33 @@
 use serde_json::Value;
 
 use super::client::urlencoding_encode;
-use super::wiki::{trim_extract, ArtistSummary};
-
-const USER_AGENT: &str = "Volna/0.1 (unofficial Yandex Music client; GPL-3.0)";
-
-/// Имя артиста в Genius должно совпадать с искомым (без учёта регистра): чужого артиста не показываем
-fn same_artist(found: &str, name: &str) -> bool {
-    !name.trim().is_empty() && found.trim().to_lowercase() == name.trim().to_lowercase()
-}
+use super::wiki::{
+    clean_html_entities_and_tags, find_ascii_ci, normalize_paragraphs, same_artist, trim_extract, ArtistSummary,
+    USER_AGENT,
+};
 
 /// Описание в Genius часто пустое или «?»
 fn usable(description: &str) -> bool {
     let d = description.trim();
     d.chars().count() > 20 && d != "?"
+}
+
+/// Очищает HTML-описание артиста из Genius: отсекает служебный подвал с `<hr>`,
+/// убирает теги, нормализует переводы строк и декодирует HTML-сущности
+pub(crate) fn clean_genius_html(html: &str) -> String {
+    let clean = |s: &str| normalize_paragraphs(&clean_html_entities_and_tags(s, false));
+    if let Some(pos) = find_ascii_ci(html, "<hr")
+        && html
+            .as_bytes()
+            .get(pos + 3)
+            .is_some_and(|b| matches!(b, b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        let before = clean(&html[..pos]);
+        if usable(&before) {
+            return before;
+        }
+    }
+    clean(html)
 }
 
 async fn get_json(client: &reqwest::Client, token: &str, url: &str) -> Option<Value> {
@@ -42,14 +56,15 @@ pub async fn artist_summary(name: &str) -> Option<ArtistSummary> {
         same_artist(a["name"].as_str()?, name).then(|| a["id"].as_u64()).flatten()
     })?;
 
-    let page = get_json(&client, &token, &format!("https://api.genius.com/artists/{artist_id}?text_format=plain")).await?;
+    let page = get_json(&client, &token, &format!("https://api.genius.com/artists/{artist_id}?text_format=html")).await?;
     let artist = &page["response"]["artist"];
-    let description = artist["description"]["plain"].as_str().unwrap_or_default();
-    if !usable(description) {
+    let raw = page["response"]["artist"]["description"]["html"].as_str().unwrap_or_default();
+    let description = clean_genius_html(raw);
+    if !usable(&description) {
         return None;
     }
     Some(ArtistSummary {
-        extract: trim_extract(description),
+        extract: trim_extract(&description),
         url: artist["url"].as_str().unwrap_or_default().to_string(),
         source: "Genius",
         license: "",
@@ -71,6 +86,24 @@ mod tests {
         assert!(!usable("?"));
         assert!(!usable("  "));
         assert!(usable("Американская метал-группа из Сакраменто, основанная в 1988 году."));
+    }
+
+    #[test]
+    fn html_description_cuts_footer_and_decodes_entities() {
+        let html = "<p>&laquo;Твоя волна&raquo; — проект &quot;артиста&quot; <a href=\"https://genius.com/artists/X\">Ивана</a> &amp; Co.<br/>Вторая строка с&nbsp;&#39;апострофом&#x27; &lt;2024&gt;.</p>\n\n\n<p>Третий абзац описания.</p><hr><center><h3>Дискография</h3></center><hr><ul><li>Альбом 1 (2022)</li><li>Сообщество ВКонтакте / Телеграм-канал / YouTube</li></ul>";
+        assert_eq!(
+            clean_genius_html(html),
+            "«Твоя волна» — проект \"артиста\" Ивана & Co.\nВторая строка с 'апострофом' <2024>.\n\nТретий абзац описания."
+        );
+    }
+
+    #[test]
+    fn short_prefix_before_hr_keeps_full_cleaned_html() {
+        let html = "<p>?</p><HR /><ul><li>Основное описание артиста начинается после разделителя и достаточно длинное.</li><li>Второй пункт списка.</li></ul>";
+        assert_eq!(
+            clean_genius_html(html),
+            "?\n\nОсновное описание артиста начинается после разделителя и достаточно длинное.\nВторой пункт списка."
+        );
     }
 
     /// Ходит в сеть и берёт токен из конфига: `cargo test genius -- --ignored --nocapture`

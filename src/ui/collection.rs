@@ -1104,18 +1104,21 @@ impl DetailPage {
         self.subtitle.set_markup(&text);
     }
 
-    /// Подгружает краткую справку об исполнителе (если страница в Википедии найдена)
+    /// Подгружает краткую справку об исполнителе (Википедия, Last.fm, Genius, Discogs)
     pub fn load_about(&self, artist: String) {
         let name = artist.clone();
         self.load_info(artist, "Об исполнителе", async move {
-            // Википедия, затем Last.fm, затем Genius
+            // Википедия, затем Last.fm, затем Genius, затем Discogs
             if let Some(s) = crate::api::wiki::artist_summary(&name).await {
                 return Some(s);
             }
             if let Some(s) = crate::api::lastfm::artist_summary(&name).await {
                 return Some(s);
             }
-            crate::api::genius::artist_summary(&name).await
+            if let Some(s) = crate::api::genius::artist_summary(&name).await {
+                return Some(s);
+            }
+            crate::api::discogs::artist_summary(&name).await
         });
     }
 

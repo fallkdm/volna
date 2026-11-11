@@ -582,7 +582,7 @@ pub fn show_preferences_dialog(
     let genius_group = PreferencesGroup::new();
     genius_group.set_title("Справка об исполнителях");
     genius_group.set_description(Some(
-        "Дополнительные источники после Википедии: ключ Last.fm API (last.fm/api/account/create) и токен Genius (genius.com/api-clients). Хранятся в ~/.config/volna/config.json",
+        "Дополнительные источники после Википедии: ключ Last.fm API (last.fm/api/account/create), токен Genius (genius.com/api-clients) и открытый каталог Discogs (без ключа). Ключи хранятся в ~/.config/volna/config.json",
     ));
     let genius_row = PasswordEntryRow::builder().title("Токен Genius").show_apply_button(true).build();
     if let Some(saved) = load_genius_token() {

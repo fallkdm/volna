@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod browser_cookies;
 pub mod client;
+pub mod discogs;
 pub mod genius;
 pub mod lastfm;
 pub mod history;

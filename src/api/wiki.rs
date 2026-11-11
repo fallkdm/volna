@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::client::urlencoding_encode;
 
-const USER_AGENT: &str = "Volna/0.1 (unofficial Yandex Music client; GPL-3.0)";
+pub(crate) const USER_AGENT: &str = "Volna/0.1 (unofficial Yandex Music client; GPL-3.0)";
 /// Подстроки описания страницы, по которым понятно, что это музыкант или коллектив
 const MUSIC_WORDS: [&str; 17] = [
     "групп", "музык", "певец", "певиц", "исполнител", "рэпер", "композитор", "диджей", "дуэт", "вокал",
@@ -24,6 +24,115 @@ pub struct ArtistSummary {
 fn title_matches(title: &str, name: &str) -> bool {
     let (t, n) = (title.to_lowercase(), name.trim().to_lowercase());
     !n.is_empty() && (t == n || t.starts_with(&format!("{} (", n)))
+}
+
+/// Имя артиста в ответе должно совпадать с искомым (без учёта регистра)
+pub(crate) fn same_artist(found: &str, name: &str) -> bool {
+    !name.trim().is_empty() && found.trim().to_lowercase() == name.trim().to_lowercase()
+}
+
+/// Ищет ASCII-подстроку без учёта регистра и возвращает байтовое смещение на границе UTF-8 символов
+pub(crate) fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    debug_assert!(needle.is_ascii());
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&laquo;", "«")
+        .replace("&raquo;", "»")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#X27;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+fn is_html_tag_named(tag_lower: &str, prefix: &str) -> bool {
+    let Some(rest) = tag_lower.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.starts_with('>') || rest.starts_with('/') || rest.starts_with(char::is_whitespace)
+}
+
+fn is_closing_heading_tag(tag_lower: &str) -> bool {
+    let Some(rest) = tag_lower.strip_prefix("</h") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_digit)
+        && bytes.get(1).is_some_and(|b| *b == b'>' || b.is_ascii_whitespace())
+}
+
+/// Удаляет HTML-теги и декодирует основные HTML-сущности.
+/// При `drop_links == true` вырезает ссылки `<a>...</a>` вместе с текстом (например, «Read more on Last.fm»).
+pub(crate) fn clean_html_entities_and_tags(html: &str, drop_links: bool) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let Some(end) = tail.find('>') else { break };
+        let tag = tail[..=end].to_lowercase();
+        if drop_links && is_html_tag_named(&tag, "<a") {
+            match find_ascii_ci(tail, "</a>") {
+                Some(close) => {
+                    rest = &tail[close + 4..];
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if is_html_tag_named(&tag, "<br")
+            || is_html_tag_named(&tag, "</li")
+            || is_html_tag_named(&tag, "<hr")
+            || is_html_tag_named(&tag, "</div")
+            || is_closing_heading_tag(&tag)
+        {
+            out.push('\n');
+        } else if is_html_tag_named(&tag, "</p") {
+            out.push_str("\n\n");
+        } else if (is_html_tag_named(&tag, "<p") || is_html_tag_named(&tag, "<li"))
+            && !out.is_empty()
+            && !out.ends_with('\n')
+        {
+            out.push('\n');
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    decode_html_entities(&out)
+}
+
+/// Нормализует `\r\n` -> `\n`, сжимает пробелы внутри строк и оставляет максимум две `\n` подряд
+pub(crate) fn normalize_paragraphs(text: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut empty_run = 0usize;
+    for raw_line in text.replace("\r\n", "\n").lines() {
+        let line = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            if !lines.is_empty() && empty_run == 0 {
+                lines.push(String::new());
+            }
+            empty_run += 1;
+        } else {
+            empty_run = 0;
+            lines.push(line);
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 fn looks_musical(description: &str) -> bool {
@@ -165,6 +274,14 @@ mod tests {
         let t = trim_extract(&text);
         assert!(t.chars().count() <= MAX_CHARS && t.ends_with('.'));
         assert_eq!(trim_extract("Коротко."), "Коротко.");
+    }
+
+    #[test]
+    fn html_cleaner_and_unicode_ascii_search_work() {
+        let html = "<p>İstanbul &amp; <a href=\"x\">İzmir</a></p>\n\n\n<p>Test</p>";
+        let cleaned = normalize_paragraphs(&clean_html_entities_and_tags(html, true));
+        assert_eq!(cleaned, "İstanbul &\n\nTest");
+        assert_eq!(find_ascii_ci("İstanbul<HR>", "<hr"), Some("İstanbul".len()));
     }
 
     /// Ходит в сеть: `cargo test wiki -- --ignored --nocapture`
