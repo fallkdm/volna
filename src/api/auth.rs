@@ -144,37 +144,31 @@ impl Default for AppConfig {
 static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(test)]
-fn test_config_file_path_with_xdg(xdg: Option<&str>) -> PathBuf {
-    if let Some(xdg) = xdg.map(str::trim).filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg).join("volna").join("config.json");
-    }
-    std::env::temp_dir()
-        .join(format!("volna-unit-test-config-{}", std::process::id()))
-        .join("volna")
-        .join("config.json")
+fn is_cargo_test_binary() -> bool {
+    cfg!(test)
+        || std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().and_then(|p| p.file_name()).map(|n| n == "deps"))
+            .unwrap_or(false)
+}
+
+fn config_file_path_with_env(is_test: bool, xdg: Option<&str>, home: Option<&str>) -> PathBuf {
+    let base_dir = if let Some(xdg) = xdg.map(str::trim).filter(|v| !v.is_empty()) {
+        PathBuf::from(xdg)
+    } else if is_test {
+        std::env::temp_dir().join(format!("volna-test-config-{}", std::process::id()))
+    } else {
+        PathBuf::from(home.unwrap_or(".")).join(".config")
+    };
+
+    base_dir.join("volna").join("config.json")
 }
 
 /// Возвращает путь к файлу конфигурации (~/.config/volna/config.json)
 pub fn config_file_path() -> PathBuf {
-    #[cfg(test)]
-    {
-        let xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        test_config_file_path_with_xdg(xdg.as_deref())
-    }
-    #[cfg(not(test))]
-    {
-        let base_dir = std::env::var("XDG_CONFIG_HOME")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(home).join(".config")
-            });
-
-        base_dir.join("volna").join("config.json")
-    }
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    config_file_path_with_env(is_cargo_test_binary(), xdg.as_deref(), home.as_deref())
 }
 
 /// Атомарно записывает данные в `target` через уникальный временный файл с правами `0o600`.
@@ -834,22 +828,56 @@ mod tests {
 
     #[test]
     fn test_config_path_is_isolated_in_tests() {
+        assert!(is_cargo_test_binary());
+
         let expected_isolated = std::env::temp_dir()
-            .join(format!("volna-unit-test-config-{}", std::process::id()))
+            .join(format!("volna-test-config-{}", std::process::id()))
             .join("volna")
             .join("config.json");
 
-        assert_eq!(test_config_file_path_with_xdg(None), expected_isolated);
-        assert_eq!(test_config_file_path_with_xdg(Some("")), expected_isolated);
-        assert_eq!(test_config_file_path_with_xdg(Some("   ")), expected_isolated);
         assert_eq!(
-            test_config_file_path_with_xdg(Some("/tmp/custom-xdg")),
+            config_file_path_with_env(true, None, Some("/home/tester")),
+            expected_isolated
+        );
+        assert_eq!(
+            config_file_path_with_env(true, Some(""), Some("/home/tester")),
+            expected_isolated
+        );
+        assert_eq!(
+            config_file_path_with_env(true, Some("   "), Some("/home/tester")),
+            expected_isolated
+        );
+        assert_eq!(
+            config_file_path_with_env(true, Some("/tmp/custom-xdg"), Some("/home/tester")),
             PathBuf::from("/tmp/custom-xdg").join("volna").join("config.json")
+        );
+
+        assert_eq!(
+            config_file_path_with_env(false, None, Some("/home/tester")),
+            PathBuf::from("/home/tester")
+                .join(".config")
+                .join("volna")
+                .join("config.json")
+        );
+        assert_eq!(
+            config_file_path_with_env(false, Some("   "), Some("/home/tester")),
+            PathBuf::from("/home/tester")
+                .join(".config")
+                .join("volna")
+                .join("config.json")
+        );
+        assert_eq!(
+            config_file_path_with_env(false, Some("/tmp/custom-xdg"), Some("/home/tester")),
+            PathBuf::from("/tmp/custom-xdg").join("volna").join("config.json")
+        );
+        assert_eq!(
+            config_file_path_with_env(false, None, None),
+            PathBuf::from(".").join(".config").join("volna").join("config.json")
         );
 
         if let Ok(home) = std::env::var("HOME") {
             let real_dir = PathBuf::from(&home).join(".config").join("volna");
-            assert!(!test_config_file_path_with_xdg(None).starts_with(&real_dir));
+            assert!(!config_file_path_with_env(true, None, Some(&home)).starts_with(&real_dir));
             if std::env::var("XDG_CONFIG_HOME")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
