@@ -29,12 +29,12 @@ fn apply_allocator_tuning() {
     }
 
     const M_MMAP_THRESHOLD: std::os::raw::c_int = -3;
-    if let Ok(val) = std::env::var("M_MMAP_THRESHOLD") {
-        if let Ok(thresh) = val.trim().parse::<i32>() {
-            unsafe {
-                let _ = mallopt(M_MMAP_THRESHOLD, thresh);
-            }
-        }
+    let mmap_threshold = std::env::var("M_MMAP_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .unwrap_or(128 * 1024);
+    unsafe {
+        let _ = mallopt(M_MMAP_THRESHOLD, mmap_threshold);
     }
 }
 
