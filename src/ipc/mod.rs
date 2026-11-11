@@ -308,16 +308,10 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
         }
         "mem_info" => {
             let mem = crate::memory_info();
-            let mut resp = serde_json::json!({
+            serde_json::json!({
                 "ok": true,
                 "memory": mem,
-            });
-            if let Some(serde_json::Value::Object(map)) = mem {
-                for (k, v) in map {
-                    resp[k] = v;
-                }
-            }
-            resp
+            })
         }
         "mem_trim" => {
             let before = crate::memory_info();
@@ -429,7 +423,8 @@ mod tests {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
             assert!(resp.get("memory").is_some());
-            assert!(resp.get("arena_mb").is_some());
+            assert!(resp["memory"].get("arena_mb").is_some());
+            assert!(resp.get("arena_mb").is_none());
         }
     }
 
