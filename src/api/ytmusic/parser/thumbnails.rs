@@ -192,32 +192,70 @@ fn find_thumbnails_array(val: &serde_json::Value) -> Option<&Vec<serde_json::Val
     deep_search(val)
 }
 
-/// Извлечение лучшего качества URL обложки из структуры `thumbnails`
-pub fn extract_best_thumbnail(val: &serde_json::Value) -> Option<String> {
+fn normalize_thumbnail_url(url_str: &str) -> String {
+    if url_str.starts_with("//") {
+        format!("https:{}", url_str)
+    } else {
+        url_str.to_string()
+    }
+}
+
+/// Извлекает размеры из полей JSON (`width`/`height`) либо из параметров Google CDN (`=w...-h...`)
+fn parse_url_dimensions(url: &str) -> Option<(f64, f64)> {
+    let idx = url.find("=w")?;
+    let tail = &url[idx + 2..];
+    let h_idx = tail.find("-h")?;
+    let w_str = &tail[..h_idx];
+    let rest = &tail[h_idx + 2..];
+    let h_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let h_str = &rest[..h_end];
+    let width = w_str.parse::<f64>().ok()?;
+    let height = h_str.parse::<f64>().ok()?;
+    Some((width, height))
+}
+
+fn thumbnail_area(item: &serde_json::Value) -> u64 {
+    let w = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
+    let h = item.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+    if w > 0 || h > 0 {
+        return w * h.max(1);
+    }
+    if let Some(url) = item.get("url").and_then(|u| u.as_str())
+        && let Some((uw, uh)) = parse_url_dimensions(url)
+    {
+        return (uw as u64) * (uh as u64).max(1);
+    }
+    0
+}
+
+fn select_thumbnail(
+    val: &serde_json::Value,
+    predicate: fn(&serde_json::Value) -> bool,
+) -> Option<String> {
     if let Some(list) = find_thumbnails_array(val)
-        && let Some(best) = list.iter().max_by_key(|item| {
-            let w = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
-            let h = item.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
-            w * h.max(1)
-        })
+        && let Some(best) = list
+            .iter()
+            .filter(|item| predicate(item))
+            .max_by_key(|item| thumbnail_area(item))
         && let Some(url_str) = best.get("url").and_then(|u| u.as_str())
     {
-        let mut url = url_str.to_string();
-        if url.starts_with("//") {
-            url = format!("https:{}", url);
-        }
-        return Some(url);
+        return Some(normalize_thumbnail_url(url_str));
     }
 
-    if let Some(url_str) = val.get("url").and_then(|u| u.as_str()) {
-        let mut url = url_str.to_string();
-        if url.starts_with("//") {
-            url = format!("https:{}", url);
-        }
-        return Some(url);
+    if let Some(url_str) = val.get("url").and_then(|u| u.as_str())
+        && predicate(val)
+    {
+        return Some(normalize_thumbnail_url(url_str));
     }
 
     None
+}
+
+/// Извлечение лучшего качества URL обложки из структуры `thumbnails`
+pub fn extract_best_thumbnail(val: &serde_json::Value) -> Option<String> {
+    select_thumbnail(val, |_| true)
 }
 
 /// Проверяет, является ли thumbnail широкоформатным баннером (соотношение сторон w > h * 1.3)
@@ -228,54 +266,20 @@ pub fn is_banner_thumbnail(item: &serde_json::Value) -> bool {
         return true;
     }
     if let Some(url) = item.get("url").and_then(|u| u.as_str())
-        && let Some(idx) = url.find("=w")
+        && let Some((width, height)) = parse_url_dimensions(url)
+        && width > height * 1.3
     {
-        let tail = &url[idx + 2..];
-        if let Some(h_idx) = tail.find("-h") {
-            let w_str = &tail[..h_idx];
-            let rest = &tail[h_idx + 2..];
-            let h_end = rest.find('-').unwrap_or(rest.len());
-            let h_str = &rest[..h_end];
-            if let (Ok(width), Ok(height)) = (w_str.parse::<f64>(), h_str.parse::<f64>())
-                && width > height * 1.3
-            {
-                return true;
-            }
-        }
+        return true;
     }
     false
 }
 
 /// Извлечение лучшего качества URL квадратного thumbnail (отсекая широкоформатные баннеры)
 pub fn extract_square_thumbnail(val: &serde_json::Value) -> Option<String> {
-    if let Some(list) = find_thumbnails_array(val) {
-        let square_items: Vec<_> = list
-            .iter()
-            .filter(|item| !is_banner_thumbnail(item))
-            .collect();
-        if let Some(best) = square_items.into_iter().max_by_key(|item| {
-            let w = item.get("width").and_then(|w| w.as_u64()).unwrap_or(0);
-            let h = item.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
-            w * h.max(1)
-        }) && let Some(url_str) = best.get("url").and_then(|u| u.as_str())
-        {
-            let mut url = url_str.to_string();
-            if url.starts_with("//") {
-                url = format!("https:{}", url);
-            }
-            return Some(url);
-        }
-    }
+    select_thumbnail(val, |item| !is_banner_thumbnail(item))
+}
 
-    if let Some(url_str) = val.get("url").and_then(|u| u.as_str())
-        && !is_banner_thumbnail(val)
-    {
-        let mut url = url_str.to_string();
-        if url.starts_with("//") {
-            url = format!("https:{}", url);
-        }
-        return Some(url);
-    }
-
-    None
+/// Извлечение наибольшего широкоформатного баннера (`w > h * 1.3`), отсекая квадратные аватары
+pub fn extract_banner_thumbnail(val: &serde_json::Value) -> Option<String> {
+    select_thumbnail(val, is_banner_thumbnail)
 }

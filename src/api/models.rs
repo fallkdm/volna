@@ -585,6 +585,9 @@ pub struct ArtistBrief {
     /// Зацикленное видео в шапке страницы артиста (у части артистов есть)
     #[serde(default, rename = "backgroundVideoUrl")]
     pub background_video_url: Option<String>,
+    /// Фоновый баннер шапки артиста (широкоформатная обложка YouTube Music)
+    #[serde(default, rename = "backgroundImageUrl")]
+    pub background_image_url: Option<String>,
 }
 
 /// Статистика артиста из `brief-info`

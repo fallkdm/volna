@@ -108,6 +108,23 @@ pub fn parse_artist_browse(
         cover_uri = extract_square_thumbnail(h);
     }
 
+    // Извлекаем широкоформатный фоновый баннер (отдельно от квадратного аватара и foregroundThumbnail)
+    let extract_header_banner = |h: &serde_json::Value| -> Option<String> {
+        h.get("backgroundImage")
+            .and_then(extract_banner_thumbnail)
+            .or_else(|| h.get("thumbnail").and_then(extract_banner_thumbnail))
+            .or_else(|| {
+                h.as_object().and_then(|obj| {
+                    obj.iter()
+                        .filter(|(k, _)| *k != "foregroundThumbnail")
+                        .find_map(|(_, v)| extract_banner_thumbnail(v))
+                })
+            })
+    };
+    let background_image_url = header_obj
+        .and_then(extract_header_banner)
+        .or_else(|| json.get("header").and_then(extract_header_banner));
+
     // Извлекаем треки из первой полки `musicShelfRenderer` («Топ треков» / «Songs»)
     let mut popular_tracks = Vec::new();
     fn find_first_music_shelf(val: &serde_json::Value) -> Option<&serde_json::Value> {
@@ -217,5 +234,6 @@ pub fn parse_artist_browse(
         stats: None,
         all_covers,
         background_video_url: None,
+        background_image_url,
     })
 }

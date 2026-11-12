@@ -97,6 +97,23 @@ pub fn clear_cover_memory_cache() -> usize {
     })
 }
 
+fn shared_http_client() -> &'static reqwest::Client {
+    static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+#[derive(Clone)]
+struct BannerRgba {
+    width: i32,
+    height: i32,
+    rgba: Vec<u8>,
+}
+
 /// Загружает обложку по URL в `Image` (кэш в памяти; при ошибке остаётся заглушка)
 pub fn load_cover(image: &Image, url: Option<String>) {
     let Some(url) = url else { return };
@@ -104,14 +121,7 @@ pub fn load_cover(image: &Image, url: Option<String>) {
         image.set_paintable(Some(&tex));
         return;
     }
-    static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-            .build()
-            .unwrap_or_default()
-    });
-    let client = client.clone();
+    let client = shared_http_client().clone();
     let weak = image.downgrade();
     glib::spawn_future_local(async move {
         let Ok(resp) = client.get(&url).send().await else { return };
@@ -330,10 +340,16 @@ pub struct DetailPage {
     photos: Rc<RefCell<Vec<String>>>,
     /// Размытое свечение того же видео на всю ширину шапки
     ambient_pic: gtk4::Picture,
+    /// Верхний чёткий слой фонового баннера YouTube Music (внутри `Overflow::Hidden` + scrim)
+    banner_wrap: gtk4::Overlay,
+    banner_pic: gtk4::Picture,
+    banner_src: Rc<RefCell<Option<BannerRgba>>>,
+    banner_rendered_w: Rc<std::cell::Cell<i32>>,
+    banner_resize_pending: Rc<std::cell::Cell<bool>>,
     video: super::wave_clip::ClipController,
     video_shared: std::sync::Arc<super::wave_clip::ClipShared>,
-    /// Номер показа видео: таймер кадров и запоздавшие загрузки устаревшего видео отбрасываются
-    video_gen: std::cell::Cell<u32>,
+    /// Номер показа видео/баннера: таймер кадров и запоздавшие загрузки устаревшего фона отбрасываются
+    video_gen: Rc<std::cell::Cell<u32>>,
     /// Плашка «N слушателей в месяц» у артиста
     listeners: GtkBox,
     listeners_label: Label,
@@ -527,6 +543,100 @@ impl DetailPage {
         ambient_pic.set_can_target(false);
         ambient_pic.add_css_class("artist-ambient");
         ambient_pic.set_visible(false);
+
+        let video_gen: Rc<std::cell::Cell<u32>> = Default::default();
+        let banner_src: Rc<RefCell<Option<BannerRgba>>> = Default::default();
+        let banner_rendered_w: Rc<std::cell::Cell<i32>> = Default::default();
+        let banner_resize_pending: Rc<std::cell::Cell<bool>> = Default::default();
+
+        let banner_pic = gtk4::Picture::new();
+        banner_pic.set_content_fit(gtk4::ContentFit::Fill);
+        banner_pic.set_can_shrink(true);
+        banner_pic.set_can_target(false);
+        banner_pic.add_css_class("artist-yt-banner");
+
+        let banner_scrim = GtkBox::new(Orientation::Vertical, 0);
+        banner_scrim.set_can_target(false);
+        banner_scrim.add_css_class("artist-yt-scrim");
+
+        let banner_wrap = gtk4::Overlay::new();
+        banner_wrap.set_can_target(false);
+        banner_wrap.set_overflow(Overflow::Hidden);
+        banner_wrap.set_visible(false);
+        banner_wrap.set_child(Some(&GtkBox::new(Orientation::Vertical, 0)));
+        banner_wrap.add_overlay(&banner_pic);
+        banner_wrap.add_overlay(&banner_scrim);
+        {
+            let (pic_ref, src_ref, rendered_w, pending, gen_ref, wrap_weak) = (
+                banner_pic.clone(),
+                banner_src.clone(),
+                banner_rendered_w.clone(),
+                banner_resize_pending.clone(),
+                video_gen.clone(),
+                banner_wrap.downgrade(),
+            );
+            banner_wrap.connect_get_child_position(move |ov, child| {
+                if child != pic_ref.upcast_ref::<gtk4::Widget>() {
+                    return None;
+                }
+                let paintable = pic_ref.paintable()?;
+                let (sw, sh) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+                let (tw, th) = (ov.width(), ov.height());
+                if tw > 16
+                    && (tw - rendered_w.get()).abs() > 64
+                    && !pending.get()
+                    && src_ref.borrow().is_some()
+                {
+                    pending.set(true);
+                    let token = gen_ref.get();
+                    let (pic, src, rw, pend, gref, wweak) = (
+                        pic_ref.clone(),
+                        src_ref.clone(),
+                        rendered_w.clone(),
+                        pending.clone(),
+                        gen_ref.clone(),
+                        wrap_weak.clone(),
+                    );
+                    glib::idle_add_local_once(move || {
+                        pend.set(false);
+                        if gref.get() != token {
+                            return;
+                        }
+                        let Some(wrap) = wweak.upgrade() else { return };
+                        let cur_w = wrap.width();
+                        if cur_w <= 16 {
+                            return;
+                        }
+                        if let Some(banner) = src.borrow().as_ref() {
+                            let crop = banner_cover_rect(
+                                banner.width,
+                                banner.height,
+                                cur_w,
+                                BANNER_HEIGHT,
+                                BANNER_FOCUS_Y,
+                            );
+                            let faded = banner_fade_rgba(
+                                &banner.rgba,
+                                banner.width as usize,
+                                banner.height as usize,
+                                crop,
+                                BANNER_HEIGHT,
+                            );
+                            let tex = gdk::MemoryTexture::new(
+                                banner.width,
+                                banner.height,
+                                gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                                &glib::Bytes::from_owned(faded),
+                                (banner.width * 4) as usize,
+                            );
+                            rw.set(cur_w);
+                            pic.set_paintable(Some(&tex));
+                        }
+                    });
+                }
+                Some(banner_cover_rect(sw, sh, tw, th, BANNER_FOCUS_Y))
+            });
+        }
         content.append(&hero);
         let video_shared = std::sync::Arc::new(super::wave_clip::ClipShared::default());
         let video = super::wave_clip::ClipController::new(video_shared.clone());
@@ -638,15 +748,19 @@ impl DetailPage {
         page_overlay.set_vexpand(true);
         page_overlay.set_child(Some(&gtk4::Box::new(Orientation::Vertical, 0)));
         page_overlay.add_overlay(&ambient_pic);
+        page_overlay.add_overlay(&banner_wrap);
         page_overlay.add_overlay(&scrolled);
-        // видео занимает верх страницы на всю ширину и уезжает вверх вместе с прокруткой
+        // видео и баннер занимают верх страницы на всю ширину и уезжают вверх вместе с прокруткой
         {
-            let (bg, adj) = (ambient_pic.clone(), scrolled.vadjustment());
+            let (bg, banner, adj) = (ambient_pic.clone(), banner_wrap.clone(), scrolled.vadjustment());
             page_overlay.connect_get_child_position(move |ov, child| {
-                if child != bg.upcast_ref::<gtk4::Widget>() {
-                    return None;
+                if child == bg.upcast_ref::<gtk4::Widget>() {
+                    return Some(gdk::Rectangle::new(0, -(adj.value() as i32) - AMBIENT_LIFT, ov.width(), AMBIENT_HEIGHT));
                 }
-                Some(gdk::Rectangle::new(0, -(adj.value() as i32) - AMBIENT_LIFT, ov.width(), AMBIENT_HEIGHT))
+                if child == banner.upcast_ref::<gtk4::Widget>() {
+                    return Some(gdk::Rectangle::new(0, -(adj.value() as i32), ov.width(), BANNER_HEIGHT));
+                }
+                None
             });
             let ov = page_overlay.clone();
             scrolled.vadjustment().connect_value_changed(move |_| ov.queue_allocate());
@@ -701,7 +815,7 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, video, video_shared, video_gen: Default::default(), listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), link_artists: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, banner_wrap, banner_pic, banner_src, banner_rendered_w, banner_resize_pending, video, video_shared, video_gen, listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), link_artists: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
     }
 
     /// Кнопка-описание у своего плейлиста: клик открывает редактирование
@@ -1002,8 +1116,17 @@ impl DetailPage {
         });
     }
 
+    fn clear_yt_banner(&self) {
+        self.banner_resize_pending.set(false);
+        self.banner_rendered_w.set(0);
+        *self.banner_src.borrow_mut() = None;
+        self.banner_pic.set_paintable(None::<&gdk::Paintable>);
+        self.banner_wrap.set_visible(false);
+    }
+
     /// Включает зацикленное видео в шапке (беззвучно); кадры забирает таймер, пока страница на этом видео
     pub fn play_background_video(self: &Rc<Self>, path: &str) {
+        self.clear_yt_banner();
         let token = self.video_gen.get() + 1;
         self.video_gen.set(token);
         self.ambient_pic.set_visible(true);
@@ -1024,12 +1147,88 @@ impl DetailPage {
         });
     }
 
-    /// Останавливает видео шапки и возвращает обычную обложку
+    /// Загружает фоновый баннер артиста YouTube Music в двухслойный backdrop (`ambient_pic` + чёткий верхний баннер)
+    pub fn load_background_banner(self: &Rc<Self>, url: String) {
+        let token = self.video_token();
+        let page = self.clone();
+        glib::spawn_future_local(async move {
+            let cache_key = format!("yt-banner-raw:{url}");
+            let tex = if let Some(cached) = COVERS.with(|c| c.borrow_mut().get(&cache_key)) {
+                cached
+            } else {
+                let Ok(resp) = shared_http_client().get(&url).send().await else { return };
+                let Ok(bytes) = resp.bytes().await else { return };
+                let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
+                COVERS.with(|c| c.borrow_mut().insert(cache_key, tex.clone()));
+                tex
+            };
+
+            if page.video_token() != token {
+                return;
+            }
+
+            let (w, h) = (tex.width(), tex.height());
+            if w <= 0 || h <= 0 {
+                return;
+            }
+
+            let mut downloader = gdk::TextureDownloader::new(&tex);
+            downloader.set_format(gdk::MemoryFormat::R8g8b8a8);
+            let (raw_bytes, stride) = downloader.download_bytes();
+            let row_bytes = (w as usize) * 4;
+            let rgba = if stride == row_bytes && raw_bytes.len() >= row_bytes * (h as usize) {
+                raw_bytes[..row_bytes * (h as usize)].to_vec()
+            } else {
+                let mut flat = Vec::with_capacity(row_bytes * (h as usize));
+                for y in 0..(h as usize) {
+                    let start = y * stride;
+                    let end = start + row_bytes;
+                    if end > raw_bytes.len() {
+                        return;
+                    }
+                    flat.extend_from_slice(&raw_bytes[start..end]);
+                }
+                flat
+            };
+
+            let target_w = page.widget.width().max(page.ambient_pic.width()).max(900);
+            let ambient_ratio = target_w as f32 / AMBIENT_HEIGHT as f32;
+            let (aw, ah, glow) = ambient_rgba(&rgba, w as usize, h as usize, ambient_ratio, BANNER_FOCUS_Y);
+            let glow_tex = gdk::MemoryTexture::new(
+                aw,
+                ah,
+                gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                &glib::Bytes::from_owned(glow),
+                (aw * 4) as usize,
+            );
+
+            let crop = banner_cover_rect(w, h, target_w, BANNER_HEIGHT, BANNER_FOCUS_Y);
+            let faded = banner_fade_rgba(&rgba, w as usize, h as usize, crop, BANNER_HEIGHT);
+            let banner_tex = gdk::MemoryTexture::new(
+                w,
+                h,
+                gdk::MemoryFormat::R8g8b8a8Premultiplied,
+                &glib::Bytes::from_owned(faded),
+                (w * 4) as usize,
+            );
+
+            *page.banner_src.borrow_mut() = Some(BannerRgba { width: w, height: h, rgba });
+            page.banner_rendered_w.set(target_w);
+            page.ambient_pic.set_paintable(Some(&glow_tex));
+            page.ambient_pic.set_visible(true);
+            page.banner_pic.set_paintable(Some(&banner_tex));
+            page.banner_wrap.set_visible(true);
+            page.banner_wrap.queue_allocate();
+        });
+    }
+
+    /// Останавливает видео/баннер шапки и возвращает обычную обложку
     pub fn stop_background_video(&self) {
         self.video_gen.set(self.video_gen.get() + 1);
         self.video.stop();
         self.ambient_pic.set_paintable(None::<&gdk::Paintable>);
         self.ambient_pic.set_visible(false);
+        self.clear_yt_banner();
     }
 
     /// Номер показа видео: по нему загрузка проверяет, что страница ещё та же
@@ -1734,8 +1933,17 @@ pub fn open_artist(
                     });
                 }
 
-                // видео шапки: только https и хосты Яндекса, ссылка приходит из ответа сервера
-                if let Some(url) = brief.background_video_url.clone().filter(|u| trusted_video_url(u)) {
+                // видео шапки (Яндекс) или фоновый баннер (только YouTube Music)
+                if source == TrackSource::YouTubeMusic {
+                    if let Some(url) = brief
+                        .background_image_url
+                        .as_deref()
+                        .map(crate::api::models::reachable_image_url)
+                        .filter(|u| u.starts_with("https://"))
+                    {
+                        page.load_background_banner(url);
+                    }
+                } else if let Some(url) = brief.background_video_url.clone().filter(|u| trusted_video_url(u)) {
                     let (page, token) = (page.clone(), page.video_token());
                     glib::spawn_future_local(async move {
                         if let Some(path) = crate::cache::fetch_clip_cached(&url).await {
@@ -2597,47 +2805,147 @@ mod video_url_tests {
 const AMBIENT_HEIGHT: i32 = 580;
 /// На сколько видео поднято выше верха страницы: верх кадра обычно тёмный пустой, его уводим за край
 const AMBIENT_LIFT: i32 = 40;
+/// Высота чёткого верхнего слоя баннера YouTube Music, px
+const BANNER_HEIGHT: i32 = 340;
+/// Верхне-смещённый Y-фокус (~22%), чтобы не обрезать головы артистов
+const BANNER_FOCUS_Y: f32 = 0.22;
 
-/// Кадр для свечения за шапкой: вырезка под пропорции области, уменьшенная до 64 px по ширине.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Прямоугольник заполнения (`cover`) для баннера с заданным Y-фокусом (`0.0` = верх, `0.5` = центр)
+fn banner_cover_rect(src_w: i32, src_h: i32, target_w: i32, target_h: i32, focus_y: f32) -> gdk::Rectangle {
+    if src_w <= 0 || src_h <= 0 || target_w <= 0 || target_h <= 0 {
+        return gdk::Rectangle::new(0, 0, target_w.max(1), target_h.max(1));
+    }
+    let src_ratio = src_w as f32 / src_h as f32;
+    let target_ratio = target_w as f32 / target_h as f32;
+    if src_ratio < target_ratio {
+        let w = target_w;
+        let h = ((target_w as f32 / src_ratio).round() as i32).max(target_h);
+        let y = -(((h - target_h) as f32 * focus_y.clamp(0.0, 1.0)).round() as i32);
+        gdk::Rectangle::new(0, y, w, h)
+    } else {
+        let h = target_h;
+        let w = ((target_h as f32 * src_ratio).round() as i32).max(target_w);
+        let x = -((w - target_w) / 2);
+        gdk::Rectangle::new(x, 0, w, h)
+    }
+}
+
+/// Подготавливает премультиплицированный RGBA для верхнего чёткого слоя баннера с плавным затуханием книзу
+fn banner_fade_rgba(
+    rgba: &[u8],
+    sw: usize,
+    sh: usize,
+    crop: gdk::Rectangle,
+    target_h: i32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(sw * sh * 4);
+    if rgba.len() < sw * sh * 4 || sw == 0 || sh == 0 || target_h <= 0 || crop.height() <= 0 {
+        return out;
+    }
+    let cy = crop.y() as f32;
+    let ch = crop.height() as f32;
+    let th = target_h as f32;
+    let fade_start = th * 0.52;
+    let fade_end = th * 0.98;
+    let fade_span = (fade_end - fade_start).max(1.0);
+    for sy in 0..sh {
+        let screen_y = cy + (sy as f32 + 0.5) / sh as f32 * ch;
+        let fy = smoothstep((fade_end - screen_y) / fade_span);
+        let row_off = sy * sw * 4;
+        if fy >= 0.999 {
+            for sx in 0..sw {
+                let i = row_off + sx * 4;
+                let sa = rgba[i + 3];
+                if sa == 255 {
+                    out.extend_from_slice(&[rgba[i], rgba[i + 1], rgba[i + 2], 255]);
+                } else {
+                    let a = sa as f32 / 255.0;
+                    out.extend_from_slice(&[
+                        (rgba[i] as f32 * a) as u8,
+                        (rgba[i + 1] as f32 * a) as u8,
+                        (rgba[i + 2] as f32 * a) as u8,
+                        sa,
+                    ]);
+                }
+            }
+        } else if fy <= 0.001 {
+            out.resize(out.len() + sw * 4, 0);
+        } else {
+            for sx in 0..sw {
+                let i = row_off + sx * 4;
+                let a = (rgba[i + 3] as f32 / 255.0) * fy;
+                out.extend_from_slice(&[
+                    (rgba[i] as f32 * a) as u8,
+                    (rgba[i + 1] as f32 * a) as u8,
+                    (rgba[i + 2] as f32 * a) as u8,
+                    (a * 255.0) as u8,
+                ]);
+            }
+        }
+    }
+    out
+}
+
+/// Кадр для свечения за шапкой: вырезка под пропорции области, уменьшенная до 112 px по ширине.
 /// Растягивание маленькой картинки и CSS-размытие дают мягкое цветное пятно; к низу и бокам оно
 /// становится прозрачным (премультиплицированный RGBA) и затемняется, чтобы текст шапки читался.
-fn ambient_frame(f: &super::wave_clip::ClipFrame, ratio: f32) -> (i32, i32, Vec<u8>) {
+fn ambient_rgba(rgba: &[u8], sw: usize, sh: usize, ratio: f32, y_focus: f32) -> (i32, i32, Vec<u8>) {
     const W: usize = 112;
-    let (sw, sh) = (f.width.max(1) as usize, f.height.max(1) as usize);
-    let (cw, ch) = if sw as f32 / sh as f32 > ratio { ((sh as f32 * ratio) as usize, sh) } else { (sw, (sw as f32 / ratio) as usize) };
-    let (cw, ch) = (cw.clamp(1, sw), ch.clamp(1, sh));
-    let (x0, y0) = ((sw - cw) / 2, ((sh - ch) as f32 * 0.3) as usize);
-    let h = ((W as f32 / ratio.max(0.1)) as usize).clamp(4, 112);
-    let smooth = |t: f32| {
-        let t = t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
+    let (sw, sh) = (sw.max(1), sh.max(1));
+    if rgba.len() < sw * sh * 4 {
+        return (1, 1, vec![0, 0, 0, 0]);
+    }
+    let (cw, ch) = if sw as f32 / sh as f32 > ratio {
+        ((sh as f32 * ratio) as usize, sh)
+    } else {
+        (sw, (sw as f32 / ratio) as usize)
     };
+    let (cw, ch) = (cw.clamp(1, sw), ch.clamp(1, sh));
+    let (x0, y0) = ((sw - cw) / 2, ((sh - ch) as f32 * y_focus.clamp(0.0, 1.0)) as usize);
+    let h = ((W as f32 / ratio.max(0.1)) as usize).clamp(4, 112);
+    let step_x = (cw / W / 3).max(2);
+    let step_y = (ch / h / 3).max(2);
     let mut out = Vec::with_capacity(W * h * 4);
     for oy in 0..h {
         // прозрачность: сверху плотно, нижние 55% растворяются; по бокам короткое растворение
-        let fy = smooth((h - 1 - oy) as f32 / (h - 1).max(1) as f32 / 0.62);
+        let fy = smoothstep((h - 1 - oy) as f32 / (h - 1).max(1) as f32 / 0.62);
         for ox in 0..W {
-            let fx = smooth(ox as f32 / W as f32 / 0.12) * smooth((W - 1 - ox) as f32 / W as f32 / 0.12);
+            let fx = smoothstep(ox as f32 / W as f32 / 0.12)
+                * smoothstep((W - 1 - ox) as f32 / W as f32 / 0.12);
             // среднее по блоку исходного кадра
             let (bx0, bx1) = (x0 + ox * cw / W, (x0 + (ox + 1) * cw / W).max(x0 + ox * cw / W + 1));
             let (by0, by1) = (y0 + oy * ch / h, (y0 + (oy + 1) * ch / h).max(y0 + oy * ch / h + 1));
             let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for y in (by0..by1.min(sh)).step_by(2) {
-                for x in (bx0..bx1.min(sw)).step_by(2) {
+            for y in (by0..by1.min(sh)).step_by(step_y) {
+                for x in (bx0..bx1.min(sw)).step_by(step_x) {
                     let i = (y * sw + x) * 4;
-                    r += f.data[i] as u32;
-                    g += f.data[i + 1] as u32;
-                    b += f.data[i + 2] as u32;
+                    r += rgba[i] as u32;
+                    g += rgba[i + 1] as u32;
+                    b += rgba[i + 2] as u32;
                     n += 1;
                 }
             }
             let n = n.max(1) as f32;
             let a = fx * fy;
-            let m = a * 0.88; // лёгкое затемнение: текст шапки читается, видео остаётся заметным
-            out.extend_from_slice(&[(r as f32 / n * m) as u8, (g as f32 / n * m) as u8, (b as f32 / n * m) as u8, (a * 255.0) as u8]);
+            let m = a * 0.88; // лёгкое затемнение: текст шапки читается, фон остаётся заметным
+            out.extend_from_slice(&[
+                (r as f32 / n * m) as u8,
+                (g as f32 / n * m) as u8,
+                (b as f32 / n * m) as u8,
+                (a * 255.0) as u8,
+            ]);
         }
     }
     (W as i32, h as i32, out)
+}
+
+fn ambient_frame(f: &super::wave_clip::ClipFrame, ratio: f32) -> (i32, i32, Vec<u8>) {
+    ambient_rgba(&f.data, f.width.max(1) as usize, f.height.max(1) as usize, ratio, 0.3)
 }
 
 #[cfg(test)]
@@ -2655,6 +2963,36 @@ mod ambient_tests {
         assert!(alpha(56, 27) < 5, "низ прозрачен");
         assert!(alpha(0, 0) < 5 && alpha(111, 0) < 5, "края по бокам прозрачны");
         assert!(d[56 * 4] < 200, "кадр слегка затемнён");
+    }
+
+    #[test]
+    fn banner_cover_rect_uses_top_weighted_focus_y() {
+        // Баннер 1080x450 (2.4:1) в широкой области 1200x340 (3.53:1): масштабируется до 1200x500,
+        // лишние 160 px распределяются с y-фокусом 0.22 => y = -35, а не -80 (центр)
+        let r = banner_cover_rect(1080, 450, 1200, 340, BANNER_FOCUS_Y);
+        assert_eq!(r.x(), 0);
+        assert_eq!(r.width(), 1200);
+        assert_eq!(r.height(), 500);
+        assert_eq!(r.y(), -35);
+
+        // В узкой области 600x340 (1.76:1 < 2.4:1) баннер центрируется по X: 816x340, x = -108, y = 0
+        let r_narrow = banner_cover_rect(1080, 450, 600, 340, BANNER_FOCUS_Y);
+        assert_eq!(r_narrow.y(), 0);
+        assert_eq!(r_narrow.height(), 340);
+        assert_eq!(r_narrow.width(), 816);
+        assert_eq!(r_narrow.x(), -108);
+    }
+
+    #[test]
+    fn banner_fade_rgba_keeps_top_opaque_and_fades_bottom_to_zero() {
+        let (w, h) = (8, 100);
+        let rgba = vec![255u8; w * h * 4];
+        let crop = gdk::Rectangle::new(0, 0, 1200, 340);
+        let faded = banner_fade_rgba(&rgba, w, h, crop, 340);
+        let alpha_at = |y: usize| faded[(y * w + 0) * 4 + 3];
+        assert_eq!(alpha_at(10), 255, "верхняя часть баннера полностью непрозрачна");
+        assert!(alpha_at(75) > 0 && alpha_at(75) < 255, "средне-нижняя зона плавно затухает");
+        assert_eq!(alpha_at(99), 0, "нижний край полностью прозрачен для бесшовного перехода в ambient");
     }
 }
 

@@ -203,6 +203,91 @@ fn test_parse_artist_browse_ignores_banner() {
         None,
         "Wide header banner should not be used as artist avatar"
     );
+    assert_eq!(
+        brief.background_image_url.as_deref(),
+        Some("https://lh3.googleusercontent.com/banner=w1080-h450"),
+        "Wide header banner should be extracted into background_image_url"
+    );
+}
+
+#[test]
+fn test_parse_artist_browse_separates_avatar_and_banner_in_both_renderers() {
+    // 1. musicVisualHeaderRenderer: квадрат в foregroundThumbnail, баннер в thumbnail
+    let visual_json = json!({
+        "header": {
+            "musicVisualHeaderRenderer": {
+                "title": { "runs": [{ "text": "Linkin Park" }] },
+                "foregroundThumbnail": {
+                    "musicThumbnailRenderer": {
+                        "thumbnail": {
+                            "thumbnails": [
+                                { "url": "https://lh3.googleusercontent.com/lp_avatar=w544-h544", "width": 544, "height": 544 }
+                            ]
+                        }
+                    }
+                },
+                "thumbnail": {
+                    "musicThumbnailRenderer": {
+                        "thumbnail": {
+                            "thumbnails": [
+                                { "url": "//lh3.googleusercontent.com/lp_banner=w1080-h450", "width": 1080, "height": 450 },
+                                { "url": "//lh3.googleusercontent.com/lp_banner=w1920-h800", "width": 1920, "height": 800 }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let visual_brief =
+        parse_artist_browse(&visual_json, "UC_lp").expect("Should parse visual header");
+    assert_eq!(
+        visual_brief.artist.cover_url(400).as_deref(),
+        Some("https://lh3.googleusercontent.com/lp_avatar=w544-h544")
+    );
+    assert_eq!(
+        visual_brief.background_image_url.as_deref(),
+        Some("https://lh3.googleusercontent.com/lp_banner=w1920-h800")
+    );
+
+    // 2. musicImmersiveHeaderRenderer: квадрат в foregroundThumbnail и баннер в backgroundImage
+    let immersive_json = json!({
+        "header": {
+            "musicImmersiveHeaderRenderer": {
+                "title": { "runs": [{ "text": "Radiohead" }] },
+                "foregroundThumbnail": {
+                    "musicThumbnailRenderer": {
+                        "thumbnail": {
+                            "thumbnails": [
+                                { "url": "https://lh3.googleusercontent.com/rh_avatar=w544-h544", "width": 544, "height": 544 }
+                            ]
+                        }
+                    }
+                },
+                "backgroundImage": {
+                    "musicThumbnailRenderer": {
+                        "thumbnail": {
+                            "thumbnails": [
+                                { "url": "https://lh3.googleusercontent.com/rh_banner=w1440-h600", "width": 1440, "height": 600 }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let immersive_brief =
+        parse_artist_browse(&immersive_json, "UC_rh").expect("Should parse immersive header");
+    assert_eq!(
+        immersive_brief.artist.cover_url(400).as_deref(),
+        Some("https://lh3.googleusercontent.com/rh_avatar=w544-h544")
+    );
+    assert_eq!(
+        immersive_brief.background_image_url.as_deref(),
+        Some("https://lh3.googleusercontent.com/rh_banner=w1440-h600")
+    );
 }
 
 #[test]
@@ -1757,6 +1842,54 @@ fn test_extract_square_thumbnail_skips_banner() {
         extract_best_thumbnail(&json).as_deref(),
         Some("https://lh3.googleusercontent.com/banner.jpg=w1920-h540")
     );
+}
+
+#[test]
+fn test_extract_banner_thumbnail_selects_largest_and_skips_square() {
+    let json = json!({
+        "thumbnails": [
+            {
+                "url": "https://lh3.googleusercontent.com/avatar.jpg=w1200-h1200",
+                "width": 1200,
+                "height": 1200
+            },
+            {
+                "url": "//lh3.googleusercontent.com/banner_small=w540-h225",
+                "width": 540,
+                "height": 225
+            },
+            {
+                "url": "//lh3.googleusercontent.com/banner_hd=w1440-h600",
+                "width": 1440,
+                "height": 600
+            }
+        ]
+    });
+    assert_eq!(
+        extract_banner_thumbnail(&json).as_deref(),
+        Some("https://lh3.googleusercontent.com/banner_hd=w1440-h600")
+    );
+
+    // Если поля width/height отсутствуют в JSON, но есть =w...-h... в URL
+    let url_only = json!({
+        "thumbnails": [
+            { "url": "//lh3.googleusercontent.com/sq=w800-h800" },
+            { "url": "//lh3.googleusercontent.com/b1=w540-h225" },
+            { "url": "//lh3.googleusercontent.com/b2=w1920-h800" }
+        ]
+    });
+    assert_eq!(
+        extract_banner_thumbnail(&url_only).as_deref(),
+        Some("https://lh3.googleusercontent.com/b2=w1920-h800")
+    );
+
+    // Только квадратные обложки -> None
+    let only_square = json!({
+        "thumbnails": [
+            { "url": "https://lh3.googleusercontent.com/sq=w544-h544", "width": 544, "height": 544 }
+        ]
+    });
+    assert_eq!(extract_banner_thumbnail(&only_square), None);
 }
 
 // --- Радио и очередь воспроизведения ---

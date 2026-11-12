@@ -843,6 +843,7 @@ impl MusicProvider for VkProvider {
             all_covers: Vec::new(),
             stats: None,
             background_video_url: None,
+            background_image_url: None,
         })
     }
 }
