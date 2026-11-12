@@ -708,15 +708,9 @@ toast {
     filter: blur(9px) saturate(1.15);
 }
 
-/* баннер артиста YouTube Music: чёткий верхний слой и тёмный scrim для читаемости текста */
+/* баннер артиста YouTube Music: чёткий верхний слой (затемнение вшито в RGBA до альфы) */
 .artist-yt-banner {
     opacity: 0.94;
-}
-
-.artist-yt-scrim {
-    background-image:
-        linear-gradient(90deg, rgba(20, 20, 20, 0.80) 0%, rgba(20, 20, 20, 0.42) 45%, rgba(20, 20, 20, 0.12) 100%),
-        linear-gradient(180deg, rgba(20, 20, 20, 0.22) 0%, rgba(20, 20, 20, 0.04) 40%, rgba(20, 20, 20, 0.45) 100%);
 }
 
 /* ================= Сайдбар навигации (Spotify-Style) ================= */

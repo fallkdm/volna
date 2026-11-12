@@ -555,17 +555,12 @@ impl DetailPage {
         banner_pic.set_can_target(false);
         banner_pic.add_css_class("artist-yt-banner");
 
-        let banner_scrim = GtkBox::new(Orientation::Vertical, 0);
-        banner_scrim.set_can_target(false);
-        banner_scrim.add_css_class("artist-yt-scrim");
-
         let banner_wrap = gtk4::Overlay::new();
         banner_wrap.set_can_target(false);
         banner_wrap.set_overflow(Overflow::Hidden);
         banner_wrap.set_visible(false);
         banner_wrap.set_child(Some(&GtkBox::new(Orientation::Vertical, 0)));
         banner_wrap.add_overlay(&banner_pic);
-        banner_wrap.add_overlay(&banner_scrim);
         {
             let (pic_ref, src_ref, rendered_w, pending, gen_ref, wrap_weak) = (
                 banner_pic.clone(),
@@ -583,7 +578,7 @@ impl DetailPage {
                 let (sw, sh) = (paintable.intrinsic_width(), paintable.intrinsic_height());
                 let (tw, th) = (ov.width(), ov.height());
                 if tw > 16
-                    && (tw - rendered_w.get()).abs() > 64
+                    && (tw - rendered_w.get()).abs() > 32
                     && !pending.get()
                     && src_ref.borrow().is_some()
                 {
@@ -620,6 +615,7 @@ impl DetailPage {
                                 banner.width as usize,
                                 banner.height as usize,
                                 crop,
+                                cur_w,
                                 BANNER_HEIGHT,
                             );
                             let tex = gdk::MemoryTexture::new(
@@ -1147,9 +1143,13 @@ impl DetailPage {
         });
     }
 
-    /// Загружает фоновый баннер артиста YouTube Music в двухслойный backdrop (`ambient_pic` + чёткий верхний баннер)
+    /// Загружает фоновый баннер артиста YouTube Music в верхний слой (`banner_pic`) с 4-сторонним затуханием
     pub fn load_background_banner(self: &Rc<Self>, url: String) {
-        let token = self.video_token();
+        self.video.stop();
+        self.ambient_pic.set_paintable(None::<&gdk::Paintable>);
+        self.ambient_pic.set_visible(false);
+        let token = self.video_gen.get() + 1;
+        self.video_gen.set(token);
         let page = self.clone();
         glib::spawn_future_local(async move {
             let cache_key = format!("yt-banner-raw:{url}");
@@ -1191,19 +1191,9 @@ impl DetailPage {
                 flat
             };
 
-            let target_w = page.widget.width().max(page.ambient_pic.width()).max(900);
-            let ambient_ratio = target_w as f32 / AMBIENT_HEIGHT as f32;
-            let (aw, ah, glow) = ambient_rgba(&rgba, w as usize, h as usize, ambient_ratio, BANNER_FOCUS_Y);
-            let glow_tex = gdk::MemoryTexture::new(
-                aw,
-                ah,
-                gdk::MemoryFormat::R8g8b8a8Premultiplied,
-                &glib::Bytes::from_owned(glow),
-                (aw * 4) as usize,
-            );
-
+            let target_w = page.banner_wrap.width().max(page.widget.width()).max(900);
             let crop = banner_cover_rect(w, h, target_w, BANNER_HEIGHT, BANNER_FOCUS_Y);
-            let faded = banner_fade_rgba(&rgba, w as usize, h as usize, crop, BANNER_HEIGHT);
+            let faded = banner_fade_rgba(&rgba, w as usize, h as usize, crop, target_w, BANNER_HEIGHT);
             let banner_tex = gdk::MemoryTexture::new(
                 w,
                 h,
@@ -1214,8 +1204,8 @@ impl DetailPage {
 
             *page.banner_src.borrow_mut() = Some(BannerRgba { width: w, height: h, rgba });
             page.banner_rendered_w.set(target_w);
-            page.ambient_pic.set_paintable(Some(&glow_tex));
-            page.ambient_pic.set_visible(true);
+            page.ambient_pic.set_paintable(None::<&gdk::Paintable>);
+            page.ambient_pic.set_visible(false);
             page.banner_pic.set_paintable(Some(&banner_tex));
             page.banner_wrap.set_visible(true);
             page.banner_wrap.queue_allocate();
@@ -2806,7 +2796,7 @@ const AMBIENT_HEIGHT: i32 = 580;
 /// На сколько видео поднято выше верха страницы: верх кадра обычно тёмный пустой, его уводим за край
 const AMBIENT_LIFT: i32 = 40;
 /// Высота чёткого верхнего слоя баннера YouTube Music, px
-const BANNER_HEIGHT: i32 = 340;
+const BANNER_HEIGHT: i32 = 420;
 /// Верхне-смещённый Y-фокус (~22%), чтобы не обрезать головы артистов
 const BANNER_FOCUS_Y: f32 = 0.22;
 
@@ -2835,54 +2825,68 @@ fn banner_cover_rect(src_w: i32, src_h: i32, target_w: i32, target_h: i32, focus
     }
 }
 
-/// Подготавливает премультиплицированный RGBA для верхнего чёткого слоя баннера с плавным затуханием книзу
+/// Подготавливает премультиплицированный RGBA для верхнего чёткого слоя баннера
+/// с 4-сторонним плавным затуханием в фон `#141414` и мягким затемнением зоны текста/кнопок.
 fn banner_fade_rgba(
     rgba: &[u8],
     sw: usize,
     sh: usize,
     crop: gdk::Rectangle,
+    target_w: i32,
     target_h: i32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(sw * sh * 4);
-    if rgba.len() < sw * sh * 4 || sw == 0 || sh == 0 || target_h <= 0 || crop.height() <= 0 {
+    if rgba.len() < sw * sh * 4
+        || sw == 0
+        || sh == 0
+        || target_w <= 0
+        || target_h <= 0
+        || crop.width() <= 0
+        || crop.height() <= 0
+    {
         return out;
     }
+    let cx = crop.x() as f32;
     let cy = crop.y() as f32;
+    let cw = crop.width() as f32;
     let ch = crop.height() as f32;
+    let tw = target_w as f32;
     let th = target_h as f32;
-    let fade_start = th * 0.52;
-    let fade_end = th * 0.98;
-    let fade_span = (fade_end - fade_start).max(1.0);
+    let fade_bottom_start = th * 0.45;
+    let fade_bottom_end = th * 0.96;
+    let fade_bottom_span = (fade_bottom_end - fade_bottom_start).max(1.0);
     for sy in 0..sh {
         let screen_y = cy + (sy as f32 + 0.5) / sh as f32 * ch;
-        let fy = smoothstep((fade_end - screen_y) / fade_span);
-        let row_off = sy * sw * 4;
-        if fy >= 0.999 {
-            for sx in 0..sw {
-                let i = row_off + sx * 4;
-                let sa = rgba[i + 3];
-                if sa == 255 {
-                    out.extend_from_slice(&[rgba[i], rgba[i + 1], rgba[i + 2], 255]);
-                } else {
-                    let a = sa as f32 / 255.0;
-                    out.extend_from_slice(&[
-                        (rgba[i] as f32 * a) as u8,
-                        (rgba[i + 1] as f32 * a) as u8,
-                        (rgba[i + 2] as f32 * a) as u8,
-                        sa,
-                    ]);
-                }
-            }
-        } else if fy <= 0.001 {
+        let fy_top = smoothstep(screen_y / 32.0);
+        let fy_bottom = smoothstep((fade_bottom_end - screen_y) / fade_bottom_span);
+        let fy = fy_top * fy_bottom;
+        if fy <= 0.001 {
             out.resize(out.len() + sw * 4, 0);
-        } else {
-            for sx in 0..sw {
-                let i = row_off + sx * 4;
-                let a = (rgba[i + 3] as f32 / 255.0) * fy;
+            continue;
+        }
+        let v = (screen_y / th).clamp(0.0, 1.0);
+        let bottom_t = smoothstep(((v - 0.35) / 0.45).clamp(0.0, 1.0));
+        let dim_y = 1.0 - 0.20 * bottom_t;
+        let row_off = sy * sw * 4;
+        for sx in 0..sw {
+            let screen_x = cx + (sx as f32 + 0.5) / sw as f32 * cw;
+            let fx_left = smoothstep(screen_x / 24.0);
+            let fx_right = smoothstep((tw - screen_x) / 44.0);
+            let fx = fx_left * fx_right;
+            let i = row_off + sx * 4;
+            let a = (rgba[i + 3] as f32 / 255.0) * fx * fy;
+            if a <= 0.001 {
+                out.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                let u = (screen_x / tw).clamp(0.0, 1.0);
+                let left_t = smoothstep(1.0 - (u / 0.58).clamp(0.0, 1.0));
+                let dim_x = 0.56 + 0.32 * (1.0 - left_t);
+                let dim = dim_x * dim_y;
+                let m = a * dim;
                 out.extend_from_slice(&[
-                    (rgba[i] as f32 * a) as u8,
-                    (rgba[i + 1] as f32 * a) as u8,
-                    (rgba[i + 2] as f32 * a) as u8,
+                    (rgba[i] as f32 * m) as u8,
+                    (rgba[i + 1] as f32 * m) as u8,
+                    (rgba[i + 2] as f32 * m) as u8,
                     (a * 255.0) as u8,
                 ]);
             }
@@ -2984,15 +2988,65 @@ mod ambient_tests {
     }
 
     #[test]
-    fn banner_fade_rgba_keeps_top_opaque_and_fades_bottom_to_zero() {
-        let (w, h) = (8, 100);
+    fn banner_fade_rgba_fades_all_four_edges_and_dims_readability_zone() {
+        let (w, h) = (1200, BANNER_HEIGHT as usize);
         let rgba = vec![255u8; w * h * 4];
-        let crop = gdk::Rectangle::new(0, 0, 1200, 340);
-        let faded = banner_fade_rgba(&rgba, w, h, crop, 340);
-        let alpha_at = |y: usize| faded[(y * w + 0) * 4 + 3];
-        assert_eq!(alpha_at(10), 255, "верхняя часть баннера полностью непрозрачна");
-        assert!(alpha_at(75) > 0 && alpha_at(75) < 255, "средне-нижняя зона плавно затухает");
-        assert_eq!(alpha_at(99), 0, "нижний край полностью прозрачен для бесшовного перехода в ambient");
+        let crop = gdk::Rectangle::new(0, 0, w as i32, BANNER_HEIGHT);
+        let faded = banner_fade_rgba(&rgba, w, h, crop, w as i32, BANNER_HEIGHT);
+        let px = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * w + x) * 4;
+            [faded[i], faded[i + 1], faded[i + 2], faded[i + 3]]
+        };
+
+        assert!(px(600, 0)[3] < 5, "верхний край у y=0 плавно растворяется");
+        assert_eq!(px(600, h - 1), [0, 0, 0, 0], "нижний край полностью прозрачен без остатков цвета");
+        assert!(px(0, 120)[3] < 5, "левый край плавно затухает");
+        assert!(px(w - 1, 120)[3] < 5, "правый край у скроллбара плавно затухает");
+
+        let face = px(760, 110);
+        assert_eq!(face[3], 255, "верхне-центральная зона лиц полностью непрозрачна");
+        assert!(face[0] >= 210, "зона лиц остаётся яркой: {}", face[0]);
+
+        let left_header = px(120, 110);
+        assert_eq!(left_header[3], 255, "левая зона заголовка непрозрачна");
+        assert!(left_header[0] < face[0], "левая зона затемнена для читаемости текста");
+
+        let lower_left = px(240, 270);
+        assert!(lower_left[3] > 0 && lower_left[3] < 255, "нижняя зона плавно затухает");
+        let lower_brightness = lower_left[0] as f32 / lower_left[3] as f32;
+        let face_brightness = face[0] as f32 / face[3] as f32;
+        assert!(lower_brightness < face_brightness, "нижняя зона темнее зоны лиц");
+    }
+
+    #[test]
+    fn banner_fade_rgba_zeroes_cropped_out_pixels_outside_widget() {
+        let (w, h) = (1200, BANNER_HEIGHT as usize);
+        let rgba = [200u8, 200, 200, 255].repeat(w * h);
+        let target_w = 600;
+        let crop_narrow = banner_cover_rect(w as i32, h as i32, target_w, BANNER_HEIGHT, BANNER_FOCUS_Y);
+        assert_eq!(crop_narrow.x(), -300);
+        let faded_narrow = banner_fade_rgba(&rgba, w, h, crop_narrow, target_w, BANNER_HEIGHT);
+        let px_narrow = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * w + x) * 4;
+            [faded_narrow[i], faded_narrow[i + 1], faded_narrow[i + 2], faded_narrow[i + 3]]
+        };
+        assert_eq!(px_narrow(10, 120), [0, 0, 0, 0], "обрезанный левый край строго прозрачен");
+        assert_eq!(px_narrow(1190, 120), [0, 0, 0, 0], "обрезанный правый край строго прозрачен");
+        assert!(px_narrow(300, 120)[3] < 5, "левая видимая граница плавно затухает");
+        assert!(px_narrow(899, 120)[3] < 5, "правая видимая граница плавно затухает");
+        assert_eq!(px_narrow(600, 120)[3], 255, "центр видимой области непрозрачен");
+
+        let (sw, sh) = (1080usize, 450usize);
+        let rgba_tall = [200u8, 200, 200, 255].repeat(sw * sh);
+        let crop_wide = banner_cover_rect(sw as i32, sh as i32, 1200, BANNER_HEIGHT, BANNER_FOCUS_Y);
+        assert!(crop_wide.y() < 0);
+        let faded_wide = banner_fade_rgba(&rgba_tall, sw, sh, crop_wide, 1200, BANNER_HEIGHT);
+        let px_wide = |x: usize, y: usize| -> [u8; 4] {
+            let i = (y * sw + x) * 4;
+            [faded_wide[i], faded_wide[i + 1], faded_wide[i + 2], faded_wide[i + 3]]
+        };
+        assert_eq!(px_wide(540, 0), [0, 0, 0, 0], "обрезанный верх строго прозрачен");
+        assert_eq!(px_wide(540, sh - 1), [0, 0, 0, 0], "низ за 96% BANNER_HEIGHT строго прозрачен");
     }
 }
 
