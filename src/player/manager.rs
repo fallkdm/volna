@@ -405,18 +405,44 @@ impl PlayerManager {
         // Порядок: refresh-токен (долговечный) → свежая сессия из браузера →
         // сохранённая кука → гость. Свежая кука важнее сохранённой: браузер
         // обновляет её сам, а скопированная когда-то давно уже мертва.
+        let mut needs_startup_ytcfg_sync = false;
         let yt_client = if let Some(token) = crate::api::auth::load_ytmusic_refresh_token() {
+            println!("[ytmusic] старт с сохранённым OAuth refresh_token");
             YtMusicClient::with_refresh_token(token)
         } else if let Some(imported) = crate::api::browser_cookies::import_youtube_cookie() {
             println!("[ytmusic] сессия взята из браузера: {}", imported.source);
-            let _ = crate::api::auth::save_ytmusic_cookie(&imported.cookie);
-            YtMusicClient::with_cookie(imported.cookie)
-        } else if let Some(cookie) = crate::api::auth::load_ytmusic_cookie() {
-            YtMusicClient::with_cookie(cookie)
+            let previous_cookie = crate::api::auth::load_ytmusic_cookie();
+            let initial_authuser = if previous_cookie.as_deref() == Some(imported.cookie.as_str()) {
+                crate::api::auth::load_ytmusic_authuser()
+            } else {
+                None
+            };
+            if let Err(e) = crate::api::auth::save_ytmusic_cookie(&imported.cookie) {
+                eprintln!("[ytmusic] не удалось сохранить импортированную куку: {e}");
+            }
+            needs_startup_ytcfg_sync = true;
+            YtMusicClient::with_cookie_and_authuser(imported.cookie, initial_authuser)
         } else {
-            YtMusicClient::new()
+            println!("[ytmusic] импорт сессии из браузера не дал результата (сессия не найдена или ключ недоступен)");
+            if let Some(cookie) = crate::api::auth::load_ytmusic_cookie() {
+                println!("[ytmusic] используем сохранённую cookie из конфигурации");
+                needs_startup_ytcfg_sync = true;
+                YtMusicClient::with_cookie_and_authuser(
+                    cookie,
+                    crate::api::auth::load_ytmusic_authuser(),
+                )
+            } else {
+                println!("[ytmusic] сохранённой cookie нет — запуск YouTube Music в гостевом режиме");
+                YtMusicClient::new()
+            }
         };
-        let yt_client_arc = Arc::new(yt_client.clone());
+        let yt_client_arc = Arc::new(yt_client);
+        if needs_startup_ytcfg_sync && tokio::runtime::Handle::try_current().is_ok() {
+            let yt_startup = yt_client_arc.clone();
+            tokio::spawn(async move {
+                yt_startup.validate_and_sync_session_on_startup().await;
+            });
+        }
         let clip_telemetry = Arc::new(super::clip_telemetry::ClipTelemetry::new());
         clip_telemetry.set_enabled(crate::api::auth::load_clips());
         let event_senders_arc = Arc::new(Mutex::new(event_senders));
@@ -428,7 +454,7 @@ impl PlayerManager {
         );
 
         let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
-        let ytmusic_provider = Arc::new(yt_client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = yt_client_arc.clone() as Arc<dyn MusicProvider>;
         let provider_manager = ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
         if let Some(token) = crate::api::vk::auth::load_vk_token() {
             let owner_id = crate::api::auth::load_vk_user_id().unwrap_or(0);

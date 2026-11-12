@@ -138,6 +138,16 @@ pub enum YtLyrics {
     Failed,
 }
 
+/// Время ожидания между автоматическими переимпортами cookie из браузера.
+const BROWSER_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Состояние сессии из `ytcfg` со страницы `https://music.youtube.com/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YtCfgSession {
+    pub logged_in: bool,
+    pub session_index: Option<String>,
+}
+
 /// Клиент YouTube Music на базе Google InnerTube API
 #[derive(Clone)]
 pub struct YtMusicClient {
@@ -149,6 +159,9 @@ pub struct YtMusicClient {
     last_seed: Arc<RwLock<Option<String>>>,
     authuser: Arc<RwLock<Option<String>>>,
     liked_total_count: Arc<RwLock<Option<u32>>>,
+    last_browser_refresh: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
+    authuser_resolve_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for YtMusicClient {
@@ -170,28 +183,26 @@ impl YtMusicClient {
             cookie: Arc::new(RwLock::new(None)),
             visitor_id: Arc::new(RwLock::new(None)),
             last_seed: Arc::new(RwLock::new(None)),
-            authuser: Arc::new(RwLock::new(Some("3".to_string()))),
+            authuser: Arc::new(RwLock::new(None)),
             liked_total_count: Arc::new(RwLock::new(None)),
+            last_browser_refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            authuser_resolve_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
-    /// Создает клиента с сессионной кукой браузера
+    /// Создает клиента с сессионной кукой браузера (без предположения `authuser=3`)
     pub fn with_cookie(cookie: String) -> Self {
-        let detected_authuser = if cookie.contains("authuser=3") {
-            Some("3".to_string())
-        } else if let Some(pos) = cookie.find("authuser=") {
-            let num: String = cookie[pos + 9..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if !num.is_empty() {
-                Some(num)
-            } else {
-                Some("3".to_string())
-            }
-        } else {
-            Some("3".to_string())
-        };
+        Self::with_cookie_and_authuser(cookie, None)
+    }
+
+    /// Создает клиента с сессионной кукой браузера и опционально сохранённым `authuser`
+    pub fn with_cookie_and_authuser(cookie: String, saved_authuser: Option<String>) -> Self {
+        let initial_authuser = extract_authuser_from_cookie(&cookie).or_else(|| {
+            saved_authuser
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
 
         Self {
             http: reqwest::Client::builder()
@@ -203,8 +214,11 @@ impl YtMusicClient {
             cookie: Arc::new(RwLock::new(Some(cookie))),
             visitor_id: Arc::new(RwLock::new(None)),
             last_seed: Arc::new(RwLock::new(None)),
-            authuser: Arc::new(RwLock::new(detected_authuser)),
+            authuser: Arc::new(RwLock::new(initial_authuser)),
             liked_total_count: Arc::new(RwLock::new(None)),
+            last_browser_refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            authuser_resolve_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -220,8 +234,11 @@ impl YtMusicClient {
             cookie: Arc::new(RwLock::new(None)),
             visitor_id: Arc::new(RwLock::new(None)),
             last_seed: Arc::new(RwLock::new(None)),
-            authuser: Arc::new(RwLock::new(Some("3".to_string()))),
+            authuser: Arc::new(RwLock::new(None)),
             liked_total_count: Arc::new(RwLock::new(None)),
+            last_browser_refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+            authuser_resolve_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let c = client.clone();
         tokio::spawn(async move {
@@ -232,8 +249,38 @@ impl YtMusicClient {
 
     /// Устанавливает или обновляет сессионную куку браузера
     pub async fn set_cookie(&self, cookie: String) {
-        let mut c = self.cookie.write().await;
-        *c = Some(cookie);
+        let extracted = extract_authuser_from_cookie(&cookie);
+        {
+            let mut c = self.cookie.write().await;
+            *c = Some(cookie);
+        }
+        let mut au = self.authuser.write().await;
+        *au = extracted;
+    }
+
+    /// Переводит клиента в гостевой режим (синхронизировано для `yt_client` и `providers`)
+    pub async fn clear_session(&self) {
+        *self.auth.write().await = None;
+        *self.refresh_token.write().await = None;
+        *self.cookie.write().await = None;
+        *self.authuser.write().await = None;
+        *self.liked_total_count.write().await = None;
+        *self.last_seed.write().await = None;
+        *self.last_browser_refresh.lock().await = None;
+    }
+
+    /// Применяет OAuth refresh_token к существующему клиенту
+    pub async fn apply_refresh_token(&self, token: String) {
+        *self.cookie.write().await = None;
+        *self.authuser.write().await = None;
+        *self.auth.write().await = None;
+        *self.liked_total_count.write().await = None;
+        self.set_refresh_token(token).await;
+    }
+
+    /// Проверяет, задана ли сейчас браузерная кука
+    pub async fn has_cookie(&self) -> bool {
+        self.cookie.read().await.is_some()
     }
 
     /// Устанавливает токен обновления и инициирует обновление access_token
@@ -294,7 +341,7 @@ impl YtMusicClient {
         has_cookie || has_token
     }
 
-    /// Возвращает актуальный номер Google профиля X-Goog-AuthUser (по умолчанию "3" для профиля пользователя)
+    /// Возвращает актуальный номер Google профиля X-Goog-AuthUser (по умолчанию "0", если не определён)
     pub async fn get_authuser(&self) -> String {
         {
             let guard = self.authuser.read().await;
@@ -302,7 +349,12 @@ impl YtMusicClient {
                 return au.clone();
             }
         }
-        "3".to_string()
+        "0".to_string()
+    }
+
+    /// Текущее сохранённое значение `authuser` без подстановки дефолта
+    pub async fn current_authuser(&self) -> Option<String> {
+        self.authuser.read().await.clone()
     }
 
     /// Устанавливает номер Google профиля authuser
@@ -311,13 +363,290 @@ impl YtMusicClient {
         *guard = Some(authuser);
     }
 
-    /// Выполнение POST-запроса к InnerTube API с контекстом клиента
+    /// Загружает `https://music.youtube.com/` с заданной cookie и извлекает `ytcfg` (`LOGGED_IN`, `SESSION_INDEX`)
+    async fn fetch_ytcfg_session_with_cookie(
+        &self,
+        cookie: &str,
+    ) -> Result<YtCfgSession, YtMusicError> {
+        let resp = self
+            .http
+            .get("https://music.youtube.com/")
+            .header("User-Agent", UA_CHROME_124)
+            .header("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Cookie", cookie)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(YtMusicError::Http { status, body });
+        }
+
+        let html = resp.text().await?;
+        parse_ytcfg_session(&html).ok_or_else(|| {
+            YtMusicError::Message("Не удалось извлечь ytcfg со страницы music.youtube.com".into())
+        })
+    }
+
+    /// Загружает `ytcfg` (`LOGGED_IN`, `SESSION_INDEX`) для текущей cookie клиента
+    pub async fn fetch_ytcfg_session(&self) -> Result<YtCfgSession, YtMusicError> {
+        let cookie = self
+            .cookie
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| YtMusicError::Message("Cookie не установлена".into()))?;
+        self.fetch_ytcfg_session_with_cookie(&cookie).await
+    }
+
+    /// Гарантирует, что `authuser` определён (динамически из `ytcfg`, если отсутствует)
+    async fn ensure_authuser(&self) -> String {
+        if let Some(au) = self.current_authuser().await {
+            return au;
+        }
+        let cookie_opt = self.cookie.read().await.clone();
+        let Some(cookie) = cookie_opt else {
+            return "0".to_string();
+        };
+
+        let _guard = self.authuser_resolve_lock.lock().await;
+        if let Some(au) = self.current_authuser().await {
+            return au;
+        }
+
+        match self.fetch_ytcfg_session_with_cookie(&cookie).await {
+            Ok(session) if session.logged_in => {
+                let au = session.session_index.unwrap_or_else(|| "0".to_string());
+                self.set_authuser(au.clone()).await;
+                let _ = crate::api::auth::save_ytmusic_authuser(&au);
+                println!("[ytmusic] Определён SESSION_INDEX из ytcfg: {au}");
+                au
+            }
+            Ok(_) => {
+                eprintln!("[ytmusic] ytcfg сообщил LOGGED_IN=false при определении SESSION_INDEX");
+                "0".to_string()
+            }
+            Err(e) => {
+                eprintln!("[ytmusic] Не удалось определить SESSION_INDEX через ytcfg: {e}");
+                "0".to_string()
+            }
+        }
+    }
+
+    /// Применяет новую cookie, определяет `SESSION_INDEX` через `ytcfg` и при `persist_config=true` сохраняет в `config.json`
+    pub async fn apply_cookie_and_resolve_authuser(
+        &self,
+        cookie: String,
+        persist_config: bool,
+    ) -> Option<YtCfgSession> {
+        let extracted = extract_authuser_from_cookie(&cookie);
+        {
+            let mut c = self.cookie.write().await;
+            *c = Some(cookie.clone());
+        }
+        {
+            let mut au = self.authuser.write().await;
+            *au = extracted.clone();
+        }
+        if persist_config && let Err(e) = crate::api::auth::save_ytmusic_cookie(&cookie) {
+            eprintln!("[ytmusic] Ошибка сохранения cookie: {e}");
+        }
+
+        match self.fetch_ytcfg_session_with_cookie(&cookie).await {
+            Ok(session) => {
+                if session.logged_in {
+                    let au = session
+                        .session_index
+                        .clone()
+                        .or(extracted)
+                        .unwrap_or_else(|| "0".to_string());
+                    self.set_authuser(au.clone()).await;
+                    if persist_config {
+                        let _ = crate::api::auth::save_ytmusic_authuser(&au);
+                    }
+                    println!("[ytmusic] Cookie применена (LOGGED_IN=true, SESSION_INDEX={au})");
+                } else {
+                    *self.authuser.write().await = None;
+                    if persist_config {
+                        let _ = crate::api::auth::clear_ytmusic_authuser();
+                    }
+                    eprintln!("[ytmusic] Применённая cookie не авторизована (LOGGED_IN=false)");
+                }
+                Some(session)
+            }
+            Err(e) => {
+                if persist_config && let Some(ref au) = extracted {
+                    let _ = crate::api::auth::save_ytmusic_authuser(au);
+                }
+                eprintln!("[ytmusic] Не удалось проверить ytcfg после установки cookie: {e}");
+                None
+            }
+        }
+    }
+
+    /// Фоновая проверка при старте: подтверждает `LOGGED_IN` / `SESSION_INDEX`, а при `LOGGED_IN=false` переимпортирует из браузера
+    pub async fn validate_and_sync_session_on_startup(&self) {
+        if !self.has_cookie().await {
+            return;
+        }
+        match self.fetch_ytcfg_session().await {
+            Ok(session) if session.logged_in => {
+                let au = session.session_index.unwrap_or_else(|| "0".to_string());
+                let changed = self.current_authuser().await.as_deref() != Some(au.as_str());
+                if changed {
+                    self.set_authuser(au.clone()).await;
+                    let _ = crate::api::auth::save_ytmusic_authuser(&au);
+                }
+                println!(
+                    "[ytmusic] Стартовая валидация ytcfg: LOGGED_IN=true, SESSION_INDEX={au}"
+                );
+            }
+            Ok(_) => {
+                eprintln!(
+                    "[ytmusic] Стартовая валидация ytcfg: LOGGED_IN=false — переимпорт cookie из браузера"
+                );
+                let _ = self.refresh_session_from_browser(true).await;
+            }
+            Err(e) => {
+                eprintln!("[ytmusic] Стартовая валидация ytcfg не удалась (офлайн?): {e}");
+            }
+        }
+    }
+
+    /// Переимпортирует cookie из браузера (с защитой по cooldown, если `force == false`),
+    /// определяет `SESSION_INDEX` через `ytcfg`, обновляет клиента и `config.json`.
+    pub async fn refresh_session_from_browser(&self, force: bool) -> bool {
+        let client = self.clone();
+        self.refresh_session_with(
+            force,
+            true,
+            BROWSER_REFRESH_COOLDOWN,
+            || async {
+                tokio::task::spawn_blocking(crate::api::browser_cookies::import_youtube_cookie)
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            move |cookie| {
+                let client = client.clone();
+                async move { client.fetch_ytcfg_session_with_cookie(&cookie).await.ok() }
+            },
+        )
+        .await
+    }
+
+    async fn refresh_session_with<I, IFut, R, RFut>(
+        &self,
+        force: bool,
+        persist_config: bool,
+        cooldown: std::time::Duration,
+        importer: I,
+        resolver: R,
+    ) -> bool
+    where
+        I: FnOnce() -> IFut,
+        IFut: std::future::Future<Output = Option<crate::api::browser_cookies::ImportedCookie>>,
+        R: FnOnce(String) -> RFut,
+        RFut: std::future::Future<Output = Option<YtCfgSession>>,
+    {
+        let _guard = self.refresh_lock.lock().await;
+
+        let now = tokio::time::Instant::now();
+        {
+            let mut last_guard = self.last_browser_refresh.lock().await;
+            if !force && !cooldown_allows_refresh(*last_guard, now, cooldown) {
+                return false;
+            }
+            *last_guard = Some(now);
+        }
+
+        let Some(imported) = importer().await else {
+            eprintln!("[ytmusic] Переимпорт cookie из браузера не нашёл активную сессию");
+            return false;
+        };
+
+        let extracted = extract_authuser_from_cookie(&imported.cookie);
+        let session = resolver(imported.cookie.clone()).await;
+
+        let logged_in = session.as_ref().is_none_or(|s| s.logged_in);
+        let resolved_authuser = session
+            .as_ref()
+            .filter(|s| s.logged_in)
+            .and_then(|s| s.session_index.clone())
+            .or(extracted)
+            .or_else(|| logged_in.then(|| "0".to_string()));
+
+        {
+            let mut c = self.cookie.write().await;
+            *c = Some(imported.cookie.clone());
+        }
+        {
+            let mut au = self.authuser.write().await;
+            *au = resolved_authuser.clone();
+        }
+
+        if persist_config {
+            if let Err(e) = crate::api::auth::save_ytmusic_cookie(&imported.cookie) {
+                eprintln!("[ytmusic] Ошибка сохранения обновлённой cookie: {e}");
+            }
+            if let Some(ref au) = resolved_authuser {
+                let _ = crate::api::auth::save_ytmusic_authuser(au);
+            } else {
+                let _ = crate::api::auth::clear_ytmusic_authuser();
+            }
+        }
+
+        if !logged_in {
+            eprintln!(
+                "[ytmusic] Переимпортированная из {} сессия не авторизована (LOGGED_IN=false)",
+                imported.source
+            );
+            return false;
+        }
+
+        println!(
+            "[ytmusic] Сессия обновлена из {} (SESSION_INDEX={})",
+            imported.source,
+            resolved_authuser.as_deref().unwrap_or("0")
+        );
+        true
+    }
+
+    /// Выполнение POST-запроса к InnerTube API с контекстом клиента (с однократным рефрешем при 401/403 или `loggedOut`)
     async fn post_innertube(
         &self,
         endpoint: &str,
         client_name: &str,
         client_version: &str,
         body: serde_json::Value,
+    ) -> Result<serde_json::Value, YtMusicError> {
+        let first = self
+            .post_innertube_once(endpoint, client_name, client_version, &body)
+            .await;
+
+        let needs_refresh = !client_name.starts_with("TVHTML5")
+            && self.has_cookie().await
+            && match &first {
+                Err(err) => err.is_auth(),
+                Ok(json) => is_innertube_logged_out(json),
+            };
+
+        if needs_refresh && self.refresh_session_from_browser(false).await {
+            return self
+                .post_innertube_once(endpoint, client_name, client_version, &body)
+                .await;
+        }
+
+        first
+    }
+
+    async fn post_innertube_once(
+        &self,
+        endpoint: &str,
+        client_name: &str,
+        client_version: &str,
+        body: &serde_json::Value,
     ) -> Result<serde_json::Value, YtMusicError> {
         let url = format!("https://music.youtube.com/youtubei/v1/{}", endpoint);
 
@@ -362,7 +691,7 @@ impl YtMusicClient {
         if let Some(token) = bearer {
             req = req.header("Authorization", format!("Bearer {}", token));
         } else if let Some(cookie) = cookie_opt {
-            let authuser = self.get_authuser().await;
+            let authuser = self.ensure_authuser().await;
             req = req
                 .header("Cookie", &cookie)
                 .header("Origin", "https://music.youtube.com")
@@ -375,7 +704,15 @@ impl YtMusicClient {
             }
         }
 
-        let resp = req.json(&req_body).send().await?.error_for_status()?;
+        let resp = req.json(&req_body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(YtMusicError::Http {
+                status,
+                body: err_body,
+            });
+        }
         let json = resp.json::<serde_json::Value>().await?;
         Ok(json)
     }
@@ -905,8 +1242,46 @@ impl YtMusicClient {
         Ok(Vec::new())
     }
 
-    /// Запрос HTML страницы YouTube Music с кукой пользователя
+    /// Запрос HTML страницы YouTube Music с кукой пользователя (и однократным переимпортом при 401/403 или LOGGED_IN=false)
     pub async fn fetch_ytmusic_html(&self, url: &str) -> Result<String, YtMusicError> {
+        let first = self.fetch_ytmusic_html_once(url).await;
+        if !self.has_cookie().await {
+            return first;
+        }
+
+        match first {
+            Err(ref err) if err.is_auth() => {
+                eprintln!(
+                    "[ytmusic] HTML {url} отклонил авторизацию ({err}) — пробуем переимпорт cookie"
+                );
+                if self.refresh_session_from_browser(false).await {
+                    return self.fetch_ytmusic_html_once(url).await;
+                }
+                first
+            }
+            Ok(ref html) => {
+                if let Some(session) = parse_ytcfg_session(html) {
+                    if !session.logged_in {
+                        eprintln!(
+                            "[ytmusic] HTML {url} вернул LOGGED_IN=false при наличии cookie — пробуем переимпорт cookie"
+                        );
+                        if self.refresh_session_from_browser(false).await {
+                            return self.fetch_ytmusic_html_once(url).await;
+                        }
+                    } else if let Some(idx) = session.session_index
+                        && self.current_authuser().await.as_deref() != Some(idx.as_str())
+                    {
+                        self.set_authuser(idx.clone()).await;
+                        let _ = crate::api::auth::save_ytmusic_authuser(&idx);
+                    }
+                }
+                first
+            }
+            Err(_) => first,
+        }
+    }
+
+    async fn fetch_ytmusic_html_once(&self, url: &str) -> Result<String, YtMusicError> {
         let cookie_opt = {
             let guard = self.cookie.read().await;
             guard.clone()
@@ -924,7 +1299,12 @@ impl YtMusicClient {
             req = req.header("Cookie", cookie);
         }
 
-        let resp = req.send().await?.error_for_status()?;
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(YtMusicError::Http { status, body });
+        }
         let text = resp.text().await?;
         Ok(text)
     }
@@ -1039,8 +1419,24 @@ impl YtMusicClient {
         Ok(resolved_url)
     }
 
-    /// Отправляет действие оценки (like/like, like/dislike, like/removelike) во все связанные профили Google и домены (YouTube Music и YouTube Video)
+    /// Отправляет действие оценки (like/like, like/dislike, like/removelike) в YouTube Music и YouTube Video
     pub async fn send_rating_action(
+        &self,
+        endpoint: &str,
+        track_id: &str,
+    ) -> Result<(), YtMusicError> {
+        let first = self.send_rating_action_once(endpoint, track_id).await;
+        if let Err(ref err) = first
+            && err.is_auth()
+            && self.has_cookie().await
+            && self.refresh_session_from_browser(false).await
+        {
+            return self.send_rating_action_once(endpoint, track_id).await;
+        }
+        first
+    }
+
+    async fn send_rating_action_once(
         &self,
         endpoint: &str,
         track_id: &str,
@@ -1062,65 +1458,69 @@ impl YtMusicClient {
             targets.push(("https://music.youtube.com", "TVHTML5", "7.20250101.10.00"));
         }
 
-        let authusers = ["3", "0"];
+        let authuser = if cookie_opt.is_some() {
+            self.ensure_authuser().await
+        } else {
+            "0".to_string()
+        };
 
         for (origin, client_name, client_version) in &targets {
-            for au in &authusers {
-                let url = format!("{}/youtubei/v1/{}", origin, endpoint);
-                let body = serde_json::json!({
-                    "context": {
-                        "client": {
-                            "clientName": client_name,
-                            "clientVersion": client_version,
-                            "hl": "ru",
-                            "gl": "RU"
-                        }
-                    },
-                    "target": {
-                        "videoId": track_id
+            let url = format!("{}/youtubei/v1/{}", origin, endpoint);
+            let body = serde_json::json!({
+                "context": {
+                    "client": {
+                        "clientName": client_name,
+                        "clientVersion": client_version,
+                        "hl": "ru",
+                        "gl": "RU"
                     }
-                });
-
-                let mut req = self
-                    .http
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("User-Agent", UA_CHROME_124)
-                    .header("X-Goog-Api-Format-Version", "2")
-                    .header("Origin", *origin)
-                    .header("X-Origin", *origin)
-                    .header("Referer", format!("{}/", origin));
-
-                let bearer = if client_name.starts_with("TVHTML5")
-                    && self.refresh_token.read().await.is_some()
-                {
-                    self.get_valid_access_token().await
-                } else {
-                    None
-                };
-                if let Some(token) = bearer {
-                    req = req.header("Authorization", format!("Bearer {}", token));
-                } else if let Some(cookie) = &cookie_opt {
-                    req = req.header("Cookie", cookie).header("X-Goog-AuthUser", *au);
-
-                    if let Some(sapisid) = auth::extract_sapisid(cookie) {
-                        let auth_header = auth::build_sapisid_hash(&sapisid, origin);
-                        req = req.header("Authorization", auth_header);
-                    }
+                },
+                "target": {
+                    "videoId": track_id
                 }
+            });
 
-                match req.json(&body).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        success = true;
-                    }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let text = resp.text().await.unwrap_or_default();
-                        last_error = Some(YtMusicError::Http { status, body: text });
-                    }
-                    Err(e) => {
-                        last_error = Some(YtMusicError::Network(e));
-                    }
+            let mut req = self
+                .http
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", UA_CHROME_124)
+                .header("X-Goog-Api-Format-Version", "2")
+                .header("Origin", *origin)
+                .header("X-Origin", *origin)
+                .header("Referer", format!("{}/", origin));
+
+            let bearer = if client_name.starts_with("TVHTML5")
+                && self.refresh_token.read().await.is_some()
+            {
+                self.get_valid_access_token().await
+            } else {
+                None
+            };
+            if let Some(token) = bearer {
+                req = req.header("Authorization", format!("Bearer {}", token));
+            } else if let Some(cookie) = &cookie_opt {
+                req = req
+                    .header("Cookie", cookie)
+                    .header("X-Goog-AuthUser", &authuser);
+
+                if let Some(sapisid) = auth::extract_sapisid(cookie) {
+                    let auth_header = auth::build_sapisid_hash(&sapisid, origin);
+                    req = req.header("Authorization", auth_header);
+                }
+            }
+
+            match req.json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    success = true;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    last_error = Some(YtMusicError::Http { status, body: text });
+                }
+                Err(e) => {
+                    last_error = Some(YtMusicError::Network(e));
                 }
             }
         }
@@ -2054,6 +2454,163 @@ impl MusicProvider for YtMusicClient {
     }
 }
 
+/// Извлекает явный параметр `authuser=<digits>` из строки cookie, если он присутствует.
+fn extract_authuser_from_cookie(cookie: &str) -> Option<String> {
+    for part in cookie.split(';') {
+        let part = part.trim();
+        if let Some(val) = part.strip_prefix("authuser=") {
+            let digits: String = val.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return Some(digits);
+            }
+        }
+    }
+    None
+}
+
+fn cooldown_allows_refresh(
+    last: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    cooldown: std::time::Duration,
+) -> bool {
+    match last {
+        Some(prev) => now.saturating_duration_since(prev) >= cooldown,
+        None => true,
+    }
+}
+
+fn is_innertube_logged_out(json: &serde_json::Value) -> bool {
+    json.get("responseContext")
+        .and_then(|rc| rc.get("mainAppWebResponseContext"))
+        .and_then(|ctx| ctx.get("loggedOut"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
+fn extract_balanced_json_object(input: &str) -> Option<&str> {
+    let start = input.find('{')?;
+    let bytes = input.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, &b) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(&input[start..start + offset + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn scan_json_bool_field(text: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let mut pos = 0;
+    while let Some(idx) = text[pos..].find(&needle) {
+        let after_key = &text[pos + idx + needle.len()..];
+        let trimmed = after_key.trim_start();
+        if let Some(after_colon) = trimmed.strip_prefix(':') {
+            let val = after_colon.trim_start();
+            if val.starts_with("true") {
+                return Some(true);
+            }
+            if val.starts_with("false") {
+                return Some(false);
+            }
+        }
+        pos += idx + needle.len();
+    }
+    None
+}
+
+fn scan_json_scalar_as_string(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut pos = 0;
+    while let Some(idx) = text[pos..].find(&needle) {
+        let after_key = &text[pos + idx + needle.len()..];
+        let trimmed = after_key.trim_start();
+        if let Some(after_colon) = trimmed.strip_prefix(':') {
+            let val = after_colon.trim_start();
+            if let Some(rest) = val.strip_prefix('"') {
+                if let Some(end_q) = rest.find('"') {
+                    let s = rest[..end_q].trim();
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            } else {
+                let digits: String = val.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !digits.is_empty() {
+                    return Some(digits);
+                }
+            }
+        }
+        pos += idx + needle.len();
+    }
+    None
+}
+
+/// Извлекает `LOGGED_IN` и `SESSION_INDEX` из `ytcfg` на странице `music.youtube.com`.
+pub fn parse_ytcfg_session(html: &str) -> Option<YtCfgSession> {
+    let mut logged_in: Option<bool> = None;
+    let mut session_index: Option<String> = None;
+
+    let mut search_pos = 0;
+    while let Some(idx) = html[search_pos..].find("ytcfg.set") {
+        let after_set = &html[search_pos + idx + "ytcfg.set".len()..];
+        let trimmed = after_set.trim_start();
+        if let Some(after_paren) = trimmed.strip_prefix('(')
+            && let Some(obj_str) = extract_balanced_json_object(after_paren)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(obj_str)
+        {
+            if let Some(b) = val.get("LOGGED_IN").and_then(|v| v.as_bool()) {
+                logged_in = Some(b);
+            }
+            if let Some(si) = val.get("SESSION_INDEX") {
+                if let Some(s) = si.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    session_index = Some(s.to_string());
+                } else if let Some(n) = si.as_u64() {
+                    session_index = Some(n.to_string());
+                }
+            }
+        }
+        search_pos += idx + "ytcfg.set".len();
+    }
+
+    if logged_in.is_none() {
+        logged_in = scan_json_bool_field(html, "LOGGED_IN");
+    }
+    if session_index.is_none() {
+        session_index = scan_json_scalar_as_string(html, "SESSION_INDEX");
+    }
+
+    if logged_in.is_none() && session_index.is_none() {
+        return None;
+    }
+
+    Some(YtCfgSession {
+        logged_in: logged_in.unwrap_or(false),
+        session_index,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2146,8 +2703,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_user_library_live() {
-        let cookie = crate::api::auth::load_ytmusic_cookie().expect("Cookie not found in config");
-        let client = YtMusicClient::with_cookie(cookie);
+        let cookie = crate::api::auth::load_ytmusic_cookie()
+            .or_else(|| crate::api::browser_cookies::import_youtube_cookie().map(|c| c.cookie))
+            .expect("Cookie not found in config or browser");
+        let client =
+            YtMusicClient::with_cookie_and_authuser(cookie, crate::api::auth::load_ytmusic_authuser());
 
         let liked = client
             .get_liked_tracks()
@@ -2173,24 +2733,233 @@ mod tests {
         }
         assert!(!playlists.is_empty(), "Playlists should not be empty!");
 
-        // Проверяем получение треков одного из плейлистов
-        let pl_tracks = client
-            .get_album_tracks("VLPLcHCtI7UKhDqwiMLD3A_nTUx7DJxKQt2c")
-            .await
-            .expect("Failed to get playlist tracks");
-        println!(
-            "[test] Loaded {} tracks for playlist TikTok Songs",
-            pl_tracks.len()
-        );
+        // Динамически выбираем доступный пользовательский плейлист из get_playlists()
+        let candidates: Vec<&crate::api::models::Playlist> = playlists
+            .iter()
+            .filter(|p| {
+                !p.uid.is_empty()
+                    && !matches!(
+                        p.uid.as_str(),
+                        "LM" | "VLLM" | "SE" | "VLSE" | "FEmusic_new_playlist"
+                    )
+            })
+            .take(5)
+            .collect();
         assert!(
-            !pl_tracks.is_empty(),
-            "Playlist TikTok Songs should not be empty!"
+            !candidates.is_empty(),
+            "No accessible playlist candidate found in get_playlists()"
         );
-        println!(
-            "[test] First track in TikTok Songs: {} - {}",
-            pl_tracks[0].title,
-            pl_tracks[0].artists_string()
+
+        let mut loaded_any = false;
+        for pl in candidates {
+            if let Ok(pl_tracks) = client.get_album_tracks(&pl.uid).await
+                && !pl_tracks.is_empty()
+            {
+                println!(
+                    "[test] Loaded {} tracks for playlist {} ({})",
+                    pl_tracks.len(),
+                    pl.title,
+                    pl.uid
+                );
+                println!(
+                    "[test] First track in {}: {} - {}",
+                    pl.title,
+                    pl_tracks[0].title,
+                    pl_tracks[0].artists_string()
+                );
+                loaded_any = true;
+                break;
+            }
+        }
+        assert!(
+            loaded_any,
+            "Expected at least one playlist from get_playlists() to return tracks"
         );
+    }
+
+    #[test]
+    fn test_parse_ytcfg_session() {
+        let logged_in_default = r#"<script>ytcfg.set({"CLIENT_NAME":"WEB_REMIX","LOGGED_IN":true,"SESSION_INDEX":"3","HL":"ru"});</script>"#;
+        assert_eq!(
+            parse_ytcfg_session(logged_in_default),
+            Some(YtCfgSession {
+                logged_in: true,
+                session_index: Some("3".to_string()),
+            })
+        );
+
+        let logged_in_profile1_num =
+            r#"<script>ytcfg.set({"LOGGED_IN": true, "SESSION_INDEX": 0});</script>"#;
+        assert_eq!(
+            parse_ytcfg_session(logged_in_profile1_num),
+            Some(YtCfgSession {
+                logged_in: true,
+                session_index: Some("0".to_string()),
+            })
+        );
+
+        let guest_html = r#"<script>ytcfg.set({"DEVICE":"OTHER","LOGGED_IN":false});</script>"#;
+        assert_eq!(
+            parse_ytcfg_session(guest_html),
+            Some(YtCfgSession {
+                logged_in: false,
+                session_index: None,
+            })
+        );
+
+        assert_eq!(parse_ytcfg_session("<html><body>plain</body></html>"), None);
+    }
+
+    #[tokio::test]
+    async fn test_with_cookie_does_not_hardcode_authuser_3() {
+        let guest = YtMusicClient::new();
+        assert_eq!(guest.current_authuser().await, None);
+        assert_eq!(guest.get_authuser().await, "0");
+
+        let no_au = YtMusicClient::with_cookie("SID=abc; SAPISID=xyz".to_string());
+        assert_eq!(no_au.current_authuser().await, None);
+        assert_eq!(no_au.get_authuser().await, "0");
+
+        let with_au = YtMusicClient::with_cookie("SID=abc; authuser=3; SAPISID=xyz".to_string());
+        assert_eq!(with_au.current_authuser().await.as_deref(), Some("3"));
+        assert_eq!(with_au.get_authuser().await, "3");
+
+        let with_saved =
+            YtMusicClient::with_cookie_and_authuser("SID=abc".to_string(), Some("2".to_string()));
+        assert_eq!(with_saved.current_authuser().await.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn test_cooldown_allows_refresh_timing() {
+        let start = tokio::time::Instant::now();
+        let cooldown = std::time::Duration::from_secs(60);
+        assert!(cooldown_allows_refresh(None, start, cooldown));
+        assert!(!cooldown_allows_refresh(
+            Some(start),
+            start + std::time::Duration::from_secs(10),
+            cooldown
+        ));
+        assert!(cooldown_allows_refresh(
+            Some(start),
+            start + std::time::Duration::from_secs(60),
+            cooldown
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cooldown_guarded_reimport_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let client = YtMusicClient::with_cookie("SID=stale".to_string());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cooldown = std::time::Duration::from_secs(60);
+
+        // 1. Первое срабатывание при auth-ошибке импортирует свежую куку и обновляет SESSION_INDEX
+        let c1 = calls.clone();
+        let ok1 = client
+            .refresh_session_with(
+                false,
+                false,
+                cooldown,
+                || async move {
+                    c1.fetch_add(1, Ordering::SeqCst);
+                    Some(crate::api::browser_cookies::ImportedCookie {
+                        cookie: "SID=fresh1; SAPISID=sapi1".to_string(),
+                        source: "mock".to_string(),
+                    })
+                },
+                |_| async {
+                    Some(YtCfgSession {
+                        logged_in: true,
+                        session_index: Some("3".to_string()),
+                    })
+                },
+            )
+            .await;
+        assert!(ok1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.cookie.read().await.as_deref(),
+            Some("SID=fresh1; SAPISID=sapi1")
+        );
+        assert_eq!(client.current_authuser().await.as_deref(), Some("3"));
+
+        // 2. Повторный вызов внутри cooldown блокируется без повторного вызова импортёра
+        let c2 = calls.clone();
+        let ok2 = client
+            .refresh_session_with(
+                false,
+                false,
+                cooldown,
+                || async move {
+                    c2.fetch_add(1, Ordering::SeqCst);
+                    Some(crate::api::browser_cookies::ImportedCookie {
+                        cookie: "SID=should_not_run".to_string(),
+                        source: "mock".to_string(),
+                    })
+                },
+                |_| async { None },
+            )
+            .await;
+        assert!(!ok2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            client.cookie.read().await.as_deref(),
+            Some("SID=fresh1; SAPISID=sapi1")
+        );
+
+        // 3. Принудительный вызов (force=true, например кнопка UI) обходит cooldown
+        let c3 = calls.clone();
+        let ok3 = client
+            .refresh_session_with(
+                true,
+                false,
+                cooldown,
+                || async move {
+                    c3.fetch_add(1, Ordering::SeqCst);
+                    Some(crate::api::browser_cookies::ImportedCookie {
+                        cookie: "SID=fresh2".to_string(),
+                        source: "mock".to_string(),
+                    })
+                },
+                |_| async {
+                    Some(YtCfgSession {
+                        logged_in: true,
+                        session_index: Some("0".to_string()),
+                    })
+                },
+            )
+            .await;
+        assert!(ok3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(client.cookie.read().await.as_deref(), Some("SID=fresh2"));
+        assert_eq!(client.current_authuser().await.as_deref(), Some("0"));
+
+        // 4. Если переимпортированная сессия вернула LOGGED_IN=false, retry не запускается
+        let c4 = calls.clone();
+        let ok4 = client
+            .refresh_session_with(
+                true,
+                false,
+                cooldown,
+                || async move {
+                    c4.fetch_add(1, Ordering::SeqCst);
+                    Some(crate::api::browser_cookies::ImportedCookie {
+                        cookie: "SID=guest".to_string(),
+                        source: "mock".to_string(),
+                    })
+                },
+                |_| async {
+                    Some(YtCfgSession {
+                        logged_in: false,
+                        session_index: None,
+                    })
+                },
+            )
+            .await;
+        assert!(!ok4);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(client.current_authuser().await, None);
     }
 
     #[test]

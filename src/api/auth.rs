@@ -89,6 +89,9 @@ pub struct AppConfig {
     /// Browser Cookie для YouTube Music
     #[serde(default)]
     pub ytmusic_cookie: Option<String>,
+    /// Индекс Google-аккаунта (`SESSION_INDEX` / `X-Goog-AuthUser`) для YouTube Music
+    #[serde(default)]
+    pub ytmusic_authuser: Option<String>,
     /// История поиска YouTube Music
     #[serde(default)]
     pub ytmusic_history_items: Vec<serde_json::Value>,
@@ -134,6 +137,7 @@ impl Default for AppConfig {
             active_provider: None,
             ytmusic_refresh_token: None,
             ytmusic_cookie: None,
+            ytmusic_authuser: None,
             vk_user_id: None,
             recent_played: Vec::new(),
             volume: None,
@@ -666,10 +670,39 @@ pub fn save_ytmusic_cookie(cookie: &str) -> Result<(), Box<dyn std::error::Error
     })
 }
 
-/// Удаляет куку YouTube Music
+/// Удаляет куку YouTube Music и привязанный authuser
 pub fn clear_ytmusic_cookie() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     update_config(|config| {
         config.ytmusic_cookie = None;
+        config.ytmusic_authuser = None;
+    })
+}
+
+/// Загружает сохранённый индекс профиля Google (`SESSION_INDEX`) для YouTube Music
+pub fn load_ytmusic_authuser() -> Option<String> {
+    load_config()
+        .ok()
+        .and_then(|c| c.ytmusic_authuser)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Сохраняет индекс профиля Google (`SESSION_INDEX`) для YouTube Music (пустая строка очищает)
+pub fn save_ytmusic_authuser(authuser: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let clean = authuser.trim();
+    update_config(|config| {
+        config.ytmusic_authuser = if clean.is_empty() {
+            None
+        } else {
+            Some(clean.to_string())
+        };
+    })
+}
+
+/// Очищает сохранённый индекс профиля Google (`SESSION_INDEX`) для YouTube Music
+pub fn clear_ytmusic_authuser() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    update_config(|config| {
+        config.ytmusic_authuser = None;
     })
 }
 
@@ -782,6 +815,33 @@ mod tests {
 
         let default_cfg = AppConfig::default();
         assert_eq!(default_cfg.ytmusic_cookie, None);
+        assert_eq!(default_cfg.ytmusic_authuser, None);
+    }
+
+    #[test]
+    fn test_ytmusic_authuser_persistence() {
+        let json = r#"{"ytmusic_authuser": "3"}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ytmusic_authuser.as_deref(), Some("3"));
+
+        let missing_json = r#"{"ytmusic_cookie": "SID=1"}"#;
+        let parsed_missing: AppConfig = serde_json::from_str(missing_json).unwrap();
+        assert_eq!(parsed_missing.ytmusic_authuser, None);
+
+        // Проверяем save / load / clear через изолированный тестовый конфиг
+        save_ytmusic_authuser(" 3 ").unwrap();
+        assert_eq!(load_ytmusic_authuser().as_deref(), Some("3"));
+
+        save_ytmusic_authuser("0").unwrap();
+        assert_eq!(load_ytmusic_authuser().as_deref(), Some("0"));
+
+        save_ytmusic_authuser("   ").unwrap();
+        assert_eq!(load_ytmusic_authuser(), None);
+
+        save_ytmusic_authuser("2").unwrap();
+        assert_eq!(load_ytmusic_authuser().as_deref(), Some("2"));
+        clear_ytmusic_authuser().unwrap();
+        assert_eq!(load_ytmusic_authuser(), None);
     }
 
     #[test]

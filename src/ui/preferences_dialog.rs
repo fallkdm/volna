@@ -560,15 +560,24 @@ pub fn show_preferences_dialog(
         yt_logout_btn.connect_clicked(move |_| {
             let _ = crate::api::auth::clear_ytmusic_cookie();
             let _ = crate::api::auth::clear_ytmusic_refresh_token();
-            let guest = std::sync::Arc::new(crate::api::ytmusic::YtMusicClient::new()) as std::sync::Arc<dyn crate::api::provider::MusicProvider>;
-            p.providers.register(guest);
             status_row_clone.set_subtitle("Не авторизован (гостевой режим)");
             in_btn_clone.set_visible(true);
             out_btn_clone.set_visible(false);
-            p.emit(crate::player::PlayerUiEvent::StatusMessage("Вы вышли из аккаунта YouTube Music".to_string()));
-            if p.providers.active_id() == crate::api::provider::ProviderId::YouTubeMusic {
-                p.emit(crate::player::PlayerUiEvent::ProviderChanged(crate::api::provider::ProviderId::YouTubeMusic));
-            }
+            let p_async = p.clone();
+            gtk4::glib::spawn_future_local(async move {
+                p_async.yt_client.clear_session().await;
+                p_async.providers.register(
+                    p_async.yt_client.clone() as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                );
+                p_async.emit(crate::player::PlayerUiEvent::StatusMessage(
+                    "Вы вышли из аккаунта YouTube Music".to_string(),
+                ));
+                if p_async.providers.active_id() == crate::api::provider::ProviderId::YouTubeMusic {
+                    p_async.emit(crate::player::PlayerUiEvent::ProviderChanged(
+                        crate::api::provider::ProviderId::YouTubeMusic,
+                    ));
+                }
+            });
         });
     }
 
@@ -738,10 +747,9 @@ pub fn show_ytmusic_auth_dialog(
                             }
                             // протухшая кука больше не нужна
                             let _ = crate::api::auth::clear_ytmusic_cookie();
-                            let yt_client =
-                                crate::api::ytmusic::YtMusicClient::with_refresh_token(refresh);
+                            player.yt_client.apply_refresh_token(refresh).await;
                             player.providers.register(
-                                std::sync::Arc::new(yt_client)
+                                player.yt_client.clone()
                                     as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
                             );
                             on_success();
@@ -827,6 +835,7 @@ pub fn show_ytmusic_auth_dialog(
         let browser_row_weak = browser_row.downgrade();
         browser_btn.connect_clicked(move |btn| {
             btn.set_sensitive(false);
+            let btn_weak = btn.downgrade();
             let player = player.clone();
             let dialog_weak = dialog_weak.clone();
             let on_success = on_success.clone();
@@ -842,15 +851,17 @@ pub fn show_ytmusic_auth_dialog(
                     if let Some(row) = browser_row_weak.upgrade() {
                         row.set_subtitle("Сессия не найдена: залогиньтесь в music.youtube.com в Firefox или Chrome и повторите");
                     }
+                    if let Some(b) = btn_weak.upgrade() {
+                        b.set_sensitive(true);
+                    }
                     return;
                 };
-                if let Err(e) = crate::api::auth::save_ytmusic_cookie(&imported.cookie) {
-                    eprintln!("[ytmusic] не удалось сохранить импортированную куку: {e}");
-                }
-                let yt_client =
-                    crate::api::ytmusic::YtMusicClient::with_cookie(imported.cookie.clone());
+                let _session = player
+                    .yt_client
+                    .apply_cookie_and_resolve_authuser(imported.cookie.clone(), true)
+                    .await;
                 player.providers.register(
-                    std::sync::Arc::new(yt_client)
+                    player.yt_client.clone()
                         as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
                 );
                 on_success();
@@ -918,29 +929,38 @@ pub fn show_ytmusic_auth_dialog(
     let dialog_weak = dialog.downgrade();
     let cookie_row_clone = cookie_row.clone();
 
-    login_btn.connect_clicked(move |_| {
+    login_btn.connect_clicked(move |btn| {
         let cookie_text = cookie_row_clone.text().to_string();
-        let cookie_trimmed = cookie_text.trim();
+        let cookie_trimmed = cookie_text.trim().to_string();
         if !cookie_trimmed.is_empty() {
-            if let Err(e) = crate::api::auth::save_ytmusic_cookie(cookie_trimmed) {
-                eprintln!("[ytmusic] Ошибка сохранения cookie: {e}");
-            }
-            let yt_client = crate::api::ytmusic::YtMusicClient::with_cookie(cookie_trimmed.to_string());
-            player_clone.providers.register(
-                std::sync::Arc::new(yt_client) as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
-            );
-            on_success();
-            player_clone.emit(crate::player::PlayerUiEvent::StatusMessage(
-                "Успешный вход в YouTube Music! 🔴".to_string(),
-            ));
-            if player_clone.providers.active_id() == crate::api::provider::ProviderId::YouTubeMusic {
-                player_clone.emit(crate::player::PlayerUiEvent::ProviderChanged(
-                    crate::api::provider::ProviderId::YouTubeMusic,
+            btn.set_sensitive(false);
+            let player_clone = player_clone.clone();
+            let dialog_weak = dialog_weak.clone();
+            let on_success = on_success.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let _ = player_clone
+                    .yt_client
+                    .apply_cookie_and_resolve_authuser(cookie_trimmed, true)
+                    .await;
+                player_clone.providers.register(
+                    player_clone.yt_client.clone()
+                        as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                );
+                on_success();
+                player_clone.emit(crate::player::PlayerUiEvent::StatusMessage(
+                    "Успешный вход в YouTube Music! 🔴".to_string(),
                 ));
-            }
-            if let Some(d) = dialog_weak.upgrade() {
-                d.close();
-            }
+                if player_clone.providers.active_id()
+                    == crate::api::provider::ProviderId::YouTubeMusic
+                {
+                    player_clone.emit(crate::player::PlayerUiEvent::ProviderChanged(
+                        crate::api::provider::ProviderId::YouTubeMusic,
+                    ));
+                }
+                if let Some(d) = dialog_weak.upgrade() {
+                    d.close();
+                }
+            });
         }
     });
     action_row.add_suffix(&login_btn);

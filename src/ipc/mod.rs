@@ -1,7 +1,6 @@
 pub mod mcp;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -275,11 +274,11 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
         "set_cookie" => {
             if let Some(cookie) = cmd_json.get("cookie").and_then(|v| v.as_str()) {
                 let sanitized = crate::api::ytmusic::sanitize_cookie(cookie);
-                if let Err(e) = crate::api::auth::save_ytmusic_cookie(&sanitized) {
-                    eprintln!("[ipc] Ошибка сохранения cookie: {e}");
-                }
-                let client = Arc::new(crate::api::ytmusic::YtMusicClient::with_cookie(sanitized));
-                player.providers.register(client);
+                let _ = player
+                    .yt_client
+                    .apply_cookie_and_resolve_authuser(sanitized, true)
+                    .await;
+                player.providers.register(player.yt_client.clone());
                 player.emit(crate::player::PlayerUiEvent::ProviderChanged(
                     crate::api::provider::ProviderId::YouTubeMusic,
                 ));

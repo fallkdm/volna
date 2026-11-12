@@ -1277,15 +1277,20 @@ impl VolnaWindow {
                                 if response == "logout" {
                                     let _ = crate::api::auth::clear_ytmusic_refresh_token();
                                     let _ = crate::api::auth::clear_ytmusic_cookie();
-                                    let guest = std::sync::Arc::new(crate::api::ytmusic::YtMusicClient::new())
-                                        as std::sync::Arc<dyn crate::api::provider::MusicProvider>;
-                                    p_inner.providers.register(guest);
-                                    p_inner.emit(crate::player::PlayerUiEvent::StatusMessage(
-                                        "Вы вышли из аккаунта Google (YouTube Music)".to_string(),
-                                    ));
-                                    if p_inner.providers.active_id() == ProviderId::YouTubeMusic {
-                                        p_inner.emit(crate::player::PlayerUiEvent::ProviderChanged(ProviderId::YouTubeMusic));
-                                    }
+                                    let p_async = p_inner.clone();
+                                    gtk4::glib::spawn_future_local(async move {
+                                        p_async.yt_client.clear_session().await;
+                                        p_async.providers.register(
+                                            p_async.yt_client.clone()
+                                                as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                                        );
+                                        p_async.emit(crate::player::PlayerUiEvent::StatusMessage(
+                                            "Вы вышли из аккаунта Google (YouTube Music)".to_string(),
+                                        ));
+                                        if p_async.providers.active_id() == ProviderId::YouTubeMusic {
+                                            p_async.emit(crate::player::PlayerUiEvent::ProviderChanged(ProviderId::YouTubeMusic));
+                                        }
+                                    });
                                 }
                             });
                         } else {
@@ -1902,10 +1907,17 @@ fn update_auth_ui(
             let config_cookie = crate::api::auth::load_ytmusic_cookie();
             let is_auth = if !prov_is_auth {
                 if let Some(cookie) = config_cookie {
-                    let yt_client = crate::api::ytmusic::YtMusicClient::with_cookie(cookie);
-                    player.providers.register(
-                        std::sync::Arc::new(yt_client) as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
-                    );
+                    let p_async = player.clone();
+                    gtk4::glib::spawn_future_local(async move {
+                        let _ = p_async
+                            .yt_client
+                            .apply_cookie_and_resolve_authuser(cookie, true)
+                            .await;
+                        p_async.providers.register(
+                            p_async.yt_client.clone()
+                                as std::sync::Arc<dyn crate::api::provider::MusicProvider>,
+                        );
+                    });
                     true
                 } else {
                     false
