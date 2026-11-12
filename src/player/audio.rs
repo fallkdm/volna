@@ -110,17 +110,99 @@ fn attach_bass_analyzer(
     Ok(())
 }
 
+/// Сбрасывает громкость системного sink (pulsesink / pipewiresink) в 100% (unmuted),
+/// чтобы PipeWire/WirePlumber stream-restore никогда не запоминал 0% для `volna`.
+fn reset_system_sink_volume(element: &gstreamer::Element) {
+    use gtk4::glib::prelude::ObjectExt;
+    if let Some(prop) = element.find_property("volume") {
+        if prop.value_type() == f64::static_type() {
+            element.set_property("volume", 1.0f64);
+        }
+    }
+    if let Some(prop) = element.find_property("mute") {
+        if prop.value_type() == bool::static_type() {
+            element.set_property("mute", false);
+        }
+    }
+}
+
+/// Устанавливает программную громкость (0.0..=1.0) на GStreamer-элементе `volume`.
+fn set_element_volume(volume_el: &gstreamer::Element, vol: f64) {
+    use gtk4::glib::prelude::ObjectExt;
+    volume_el.set_property("volume", vol.clamp(0.0, 1.0));
+}
+
+/// Читает текущую программную громкость (0.0..=1.0) с GStreamer-элемента `volume`.
+fn element_volume(volume_el: &gstreamer::Element) -> f64 {
+    use gtk4::glib::prelude::ObjectExt;
+    volume_el.property::<f64>("volume").clamp(0.0, 1.0)
+}
+
+/// Собирает изолированный `audio-sink` bin (`volume ! autoaudiosink`) для слота.
+/// Вся регулировка громкости, преролл (0.0) и кроссфейд происходят внутри `volume`,
+/// а реальный системный sink всегда остаётся на 1.0 (100%).
+fn build_slot_audio_sink(
+    index: usize,
+    initial_volume: f64,
+) -> Result<(gstreamer::Bin, gstreamer::Element), Box<dyn std::error::Error + Send + Sync>> {
+    let volume = gstreamer::ElementFactory::make("volume")
+        .name(format!("slot-{}-volume", index))
+        .build()?;
+    set_element_volume(&volume, initial_volume);
+
+    let auto_sink = gstreamer::ElementFactory::make("autoaudiosink")
+        .name(format!("slot-{}-autosink", index))
+        .build()?;
+
+    if let Some(bin) = auto_sink.downcast_ref::<gstreamer::Bin>() {
+        bin.connect_element_added(|_, child| {
+            reset_system_sink_volume(child);
+            if let Some(inner_bin) = child.downcast_ref::<gstreamer::Bin>() {
+                inner_bin.connect_element_added(|_, grandchild| {
+                    reset_system_sink_volume(grandchild);
+                });
+            }
+        });
+    }
+
+    let sink_bin = gstreamer::Bin::with_name(&format!("slot-{}-sink-bin", index));
+    sink_bin.add_many([&volume, &auto_sink])?;
+    volume.link(&auto_sink)?;
+
+    let volume_sink_pad = volume
+        .static_pad("sink")
+        .ok_or("у элемента volume отсутствует sink pad")?;
+    let ghost_pad = gstreamer::GhostPad::with_target(&volume_sink_pad)?;
+    sink_bin.add_pad(&ghost_pad)?;
+
+    Ok((sink_bin, volume))
+}
+
 /// Слот плеера GStreamer для двухканального воспроизведения и бесшовного кроссфейда
 struct PlayerSlot {
     play: Play,
+    volume: gstreamer::Element,
     _adapter: PlaySignalAdapter,
     is_playing: Arc<Mutex<bool>>,
     bass: BassQueue,
     pub current_uri: Arc<Mutex<Option<String>>>,
     pub is_prerolled: Arc<AtomicBool>,
+    pub slot_gen: Arc<AtomicU64>,
 }
 
 impl PlayerSlot {
+    fn set_slot_volume(&self, vol: f64) {
+        set_element_volume(&self.volume, vol);
+    }
+
+    fn slot_volume(&self) -> f64 {
+        element_volume(&self.volume)
+    }
+
+    fn bump_gen(&self) -> u64 {
+        self.slot_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     fn new(index: usize) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let play = Play::new(None::<gstreamer_play::PlayVideoRenderer>);
         let adapter = PlaySignalAdapter::new(&play);
@@ -147,7 +229,8 @@ impl PlayerSlot {
             // buffer-duration секунд (это давало провалы на 4-7 секунде трека). Так же было до
             // коммита с предзагрузкой, и так же работает преролл: в PAUSED буфер заполняется
             // заранее, поэтому старт следующего трека остаётся мгновенным.
-            pipeline.set_property_from_str("flags", "audio+soft-volume+download");
+            // soft-volume не указываем: громкость контролируется нашим элементом `volume` в audio-sink.
+            pipeline.set_property_from_str("flags", "audio+download");
         }
         if pipeline.find_property("buffer-duration").is_some() {
             let _ = pipeline.set_property("buffer-duration", 10_000_000_000i64); // 10 секунд буфера
@@ -158,6 +241,9 @@ impl PlayerSlot {
         if pipeline.find_property("ring-buffer-max-size").is_some() {
             let _ = pipeline.set_property("ring-buffer-max-size", 8 * 1024 * 1024u64); // 8 МБ
         }
+
+        let (sink_bin, volume) = build_slot_audio_sink(index, 1.0)?;
+        pipeline.set_property("audio-sink", &sink_bin);
 
         pipeline.connect("element-setup", false, |values| {
             if let Some(element) = values.get(1).and_then(|v| v.get::<gstreamer::Element>().ok()) {
@@ -226,14 +312,17 @@ impl PlayerSlot {
         let is_playing = Arc::new(Mutex::new(false));
         let current_uri = Arc::new(Mutex::new(None));
         let is_prerolled = Arc::new(AtomicBool::new(false));
+        let slot_gen = Arc::new(AtomicU64::new(0));
 
         Ok(Self {
             play,
+            volume,
             _adapter: adapter,
             is_playing,
             bass,
             current_uri,
             is_prerolled,
+            slot_gen,
         })
     }
 }
@@ -244,8 +333,10 @@ struct PendingPreroll<'a> {
     /// URI слота, который сейчас звучит: его повторно прогревать не нужно.
     playing_uri: &'a Arc<Mutex<Option<String>>>,
     slot_play: &'a Play,
+    slot_volume: &'a gstreamer::Element,
     slot_uri: &'a Arc<Mutex<Option<String>>>,
     slot_prerolled: &'a Arc<AtomicBool>,
+    slot_gen: &'a Arc<AtomicU64>,
     slot_idx: usize,
 }
 
@@ -255,7 +346,15 @@ impl PendingPreroll<'_> {
         if self.playing_uri.lock().map(|c| c.as_deref() == Some(url.as_str())).unwrap_or(false) {
             return;
         }
-        preroll_slot(self.slot_play, self.slot_uri, self.slot_prerolled, self.slot_idx, &url);
+        preroll_slot(
+            self.slot_play,
+            self.slot_volume,
+            self.slot_uri,
+            self.slot_prerolled,
+            self.slot_gen,
+            self.slot_idx,
+            &url,
+        );
     }
 }
 
@@ -270,7 +369,7 @@ fn configure_pipeline_for_url(pipeline: &gstreamer::Element, url: &str) {
         // Для HLS плейлистов флаги без buffering и без download, чтобы playbin3
         // не создавал паразитный queue2 с жестким ожиданием 10 секунд
         if pipeline.find_property("flags").is_some() {
-            pipeline.set_property_from_str("flags", "audio+soft-volume");
+            pipeline.set_property_from_str("flags", "audio");
         }
         if pipeline.find_property("buffer-duration").is_some() {
             let _ = pipeline.set_property("buffer-duration", -1i64);
@@ -281,7 +380,7 @@ fn configure_pipeline_for_url(pipeline: &gstreamer::Element, url: &str) {
     } else {
         // Для прогрессивных MP3/FLAC/Opus/AAC используем download и 10s буфер
         if pipeline.find_property("flags").is_some() {
-            pipeline.set_property_from_str("flags", "audio+soft-volume+download");
+            pipeline.set_property_from_str("flags", "audio+download");
         }
         if pipeline.find_property("buffer-duration").is_some() {
             let _ = pipeline.set_property("buffer-duration", 10_000_000_000i64);
@@ -293,17 +392,27 @@ fn configure_pipeline_for_url(pipeline: &gstreamer::Element, url: &str) {
 }
 
 /// Переводит слот в состояние «прогретого» преролла: поток открыт, начало декодировано,
-/// громкость 0.0. Повторный вызов для того же URL ничего не делает, чтобы не рвать уже
-/// установленное соединение и не сбрасывать буфер.
-fn preroll_slot(play: &Play, current_uri: &Arc<Mutex<Option<String>>>, is_prerolled: &Arc<AtomicBool>, idx: usize, url: &str) {
+/// программная громкость 0.0 (внутри GStreamer-элемента `volume`, не затрагивая системный микшер).
+/// Повторный вызов для того же URL ничего не делает, чтобы не рвать уже установленное соединение
+/// и не сбрасывать буфер.
+fn preroll_slot(
+    play: &Play,
+    volume: &gstreamer::Element,
+    current_uri: &Arc<Mutex<Option<String>>>,
+    is_prerolled: &Arc<AtomicBool>,
+    slot_gen: &Arc<AtomicU64>,
+    idx: usize,
+    url: &str,
+) {
     if let Ok(cur) = current_uri.lock() {
         if cur.as_deref() == Some(url) && is_prerolled.load(Ordering::SeqCst) {
             return;
         }
     }
+    slot_gen.fetch_add(1, Ordering::SeqCst);
     configure_pipeline_for_url(&play.pipeline(), url);
     play.stop();
-    play.set_volume(0.0);
+    set_element_volume(volume, 0.0);
     play.set_uri(Some(url));
     play.pause(); // Начинает сетевую буферизацию до 100% без воспроизведения звука
     is_prerolled.store(true, Ordering::SeqCst);
@@ -334,8 +443,8 @@ impl AudioBackend {
         let slot1 = PlayerSlot::new(1)?;
 
         let initial_vol = crate::api::auth::load_volume();
-        slot0.play.set_volume(initial_vol);
-        slot1.play.set_volume(0.0);
+        slot0.set_slot_volume(initial_vol);
+        slot1.set_slot_volume(0.0);
         let user_volume = Arc::new(Mutex::new(initial_vol));
         let fade_gen = Arc::new(AtomicU64::new(0));
         let fading_gen = Arc::new(AtomicU64::new(0));
@@ -409,7 +518,15 @@ impl AudioBackend {
             return;
         }
 
-        preroll_slot(&slot.play, &slot.current_uri, &slot.is_prerolled, inactive_idx, url);
+        preroll_slot(
+            &slot.play,
+            &slot.volume,
+            &slot.current_uri,
+            &slot.is_prerolled,
+            &slot.slot_gen,
+            inactive_idx,
+            url,
+        );
     }
 
     /// Готовит отложенный преролл (если он есть) в освободившийся неактивный слот.
@@ -421,8 +538,10 @@ impl AudioBackend {
             pending: &self.pending_preroll,
             playing_uri: &self.active().current_uri,
             slot_play: &slot.play,
+            slot_volume: &slot.volume,
             slot_uri: &slot.current_uri,
             slot_prerolled: &slot.is_prerolled,
+            slot_gen: &slot.slot_gen,
             slot_idx: inactive_idx,
         };
         uris.flush();
@@ -445,13 +564,16 @@ impl AudioBackend {
 
         if is_match {
             let old_idx = self.active_slot.swap(inactive_idx, Ordering::SeqCst);
+            self.slots[old_idx].bump_gen();
             self.slots[old_idx].play.stop();
             self.slots[old_idx].is_prerolled.store(false, Ordering::SeqCst);
             if let Ok(mut lock) = self.slots[old_idx].is_playing.lock() {
                 *lock = false;
             }
-            let vol = *self.user_volume.lock().unwrap();
-            self.slots[inactive_idx].play.set_volume(vol);
+            let vol = self.user_volume();
+            self.slots[inactive_idx].bump_gen();
+            self.slots[inactive_idx].is_prerolled.store(false, Ordering::SeqCst);
+            self.slots[inactive_idx].set_slot_volume(vol);
             configure_pipeline_for_url(&self.slots[inactive_idx].play.pipeline(), url);
             self.slots[inactive_idx].play.play();
             if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
@@ -462,6 +584,7 @@ impl AudioBackend {
             return;
         }
 
+        self.slots[inactive_idx].bump_gen();
         self.slots[inactive_idx].play.stop();
         slot.is_prerolled.store(false, Ordering::SeqCst);
         if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
@@ -469,9 +592,10 @@ impl AudioBackend {
         }
 
         let current = &self.slots[curr_idx];
+        current.bump_gen();
         current.is_prerolled.store(false, Ordering::SeqCst);
-        let vol = *self.user_volume.lock().unwrap();
-        current.play.set_volume(vol);
+        let vol = self.user_volume();
+        current.set_slot_volume(vol);
         current.play.set_uri(Some(url));
         configure_pipeline_for_url(&current.play.pipeline(), url);
         current.play.play();
@@ -500,13 +624,15 @@ impl AudioBackend {
 
         if is_match {
             let old_idx = self.active_slot.swap(inactive_idx, Ordering::SeqCst);
+            self.slots[old_idx].bump_gen();
             self.slots[old_idx].play.stop();
             self.slots[old_idx].is_prerolled.store(false, Ordering::SeqCst);
             if let Ok(mut lock) = self.slots[old_idx].is_playing.lock() {
                 *lock = false;
             }
+            self.slots[inactive_idx].bump_gen();
             self.slots[inactive_idx].is_prerolled.store(false, Ordering::SeqCst);
-            self.slots[inactive_idx].play.set_volume(0.0);
+            self.slots[inactive_idx].set_slot_volume(0.0);
             configure_pipeline_for_url(&self.slots[inactive_idx].play.pipeline(), url);
             self.slots[inactive_idx].play.play();
             if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
@@ -518,6 +644,7 @@ impl AudioBackend {
             return;
         }
 
+        self.slots[inactive_idx].bump_gen();
         self.slots[inactive_idx].play.stop();
         slot.is_prerolled.store(false, Ordering::SeqCst);
         if let Ok(mut lock) = self.slots[inactive_idx].is_playing.lock() {
@@ -525,8 +652,9 @@ impl AudioBackend {
         }
 
         let current = &self.slots[curr_idx];
+        current.bump_gen();
         current.is_prerolled.store(false, Ordering::SeqCst);
-        current.play.set_volume(0.0);
+        current.set_slot_volume(0.0);
         current.play.set_uri(Some(url));
         configure_pipeline_for_url(&current.play.pipeline(), url);
         current.play.play();
@@ -565,6 +693,8 @@ impl AudioBackend {
 
         let current_slot = &self.slots[current_idx];
         let next_slot = &self.slots[next_idx];
+        let outgoing_slot_gen = current_slot.slot_gen.load(Ordering::SeqCst);
+        next_slot.bump_gen();
 
         configure_pipeline_for_url(&next_slot.play.pipeline(), url);
 
@@ -575,11 +705,11 @@ impl AudioBackend {
 
         if is_already_prerolled {
             eprintln!("[audio] мгновенный старт предзагруженного трека из слота {} (0 мс задержки)!", next_idx);
-            next_slot.play.set_volume(0.0);
+            next_slot.set_slot_volume(0.0);
             next_slot.play.play();
         } else {
             next_slot.play.stop();
-            next_slot.play.set_volume(0.0);
+            next_slot.set_slot_volume(0.0);
             next_slot.play.set_uri(Some(url));
             next_slot.play.play();
             if let Ok(mut cur) = next_slot.current_uri.lock() {
@@ -595,20 +725,23 @@ impl AudioBackend {
         let user_vol = self.user_volume();
 
         let current_play = current_slot.play.clone();
+        let current_volume = current_slot.volume.clone();
         let next_play = next_slot.play.clone();
+        let next_volume = next_slot.volume.clone();
         let current_is_playing = current_slot.is_playing.clone();
+        let current_slot_gen = current_slot.slot_gen.clone();
 
         if duration_ms == 0 {
             current_play.stop();
             if let Ok(mut lock) = current_is_playing.lock() {
                 *lock = false;
             }
-            next_play.set_volume(user_vol);
+            set_element_volume(&next_volume, user_vol);
             self.flush_pending_preroll();
             return;
         }
 
-        let start_current_vol = current_play.volume().min(user_vol);
+        let start_current_vol = current_slot.slot_volume().min(user_vol);
         let fading_gen = self.fading_gen.clone();
         let pending_preroll = self.pending_preroll.clone();
         let current_uri = current_slot.current_uri.clone();
@@ -616,15 +749,22 @@ impl AudioBackend {
         let next_uri = next_slot.current_uri.clone();
 
         tokio::spawn(async move {
+            let stop_outgoing_if_unclaimed = || {
+                // Если слот уже перехватило следующее переключение или преролл, не останавливаем чужой запуск.
+                if current_slot_gen.load(Ordering::SeqCst) == outgoing_slot_gen {
+                    current_play.stop();
+                    if let Ok(mut lock) = current_is_playing.lock() {
+                        *lock = false;
+                    }
+                }
+            };
+
             // Ждем, пока новый поток сбуферизируется и физически перейдет в Playing
             let wait_start = tokio::time::Instant::now();
             let mut started = false;
             loop {
                 if fade_gen.load(Ordering::SeqCst) != generation_id {
-                    current_play.stop();
-                    if let Ok(mut lock) = current_is_playing.lock() {
-                        *lock = false;
-                    }
+                    stop_outgoing_if_unclaimed();
                     return;
                 }
                 if next_play.pipeline().current_state() == gstreamer::State::Playing {
@@ -641,14 +781,11 @@ impl AudioBackend {
             if !started {
                 // Новый поток так и не заиграл: вместо тишины отдаём трек без сводки, иначе
                 // active_slot уже указывает на молчащий слот, а UI считает, что играет он.
-                current_play.stop();
-                if let Ok(mut lock) = current_is_playing.lock() {
-                    *lock = false;
-                }
+                stop_outgoing_if_unclaimed();
                 if fade_gen.load(Ordering::SeqCst) == generation_id {
                     eprintln!("[audio] новый поток не перешел в Playing за 15 с — переключаем без сводки");
                     let vol = user_volume_arc.lock().map(|l| *l).unwrap_or(1.0);
-                    next_play.set_volume(vol);
+                    set_element_volume(&next_volume, vol);
                     if fading_gen.load(Ordering::SeqCst) == generation_id {
                         fading_gen.store(0, Ordering::SeqCst);
                     }
@@ -656,8 +793,10 @@ impl AudioBackend {
                         pending: &pending_preroll,
                         playing_uri: &next_uri,
                         slot_play: &current_play,
+                        slot_volume: &current_volume,
                         slot_uri: &current_uri,
                         slot_prerolled: &current_prerolled,
+                        slot_gen: &current_slot_gen,
                         slot_idx: current_idx,
                     }
                     .flush();
@@ -673,10 +812,7 @@ impl AudioBackend {
                 interval.tick().await;
                 if fade_gen.load(Ordering::SeqCst) != generation_id {
                     // Фейд был перехвачен новым переключением или остановкой
-                    current_play.stop();
-                    if let Ok(mut lock) = current_is_playing.lock() {
-                        *lock = false;
-                    }
+                    stop_outgoing_if_unclaimed();
                     return;
                 }
                 let t = step as f64 / steps as f64;
@@ -688,17 +824,16 @@ impl AudioBackend {
                 let current_v = (start_current_vol * out_factor).min(cur_user_vol);
                 let next_v = cur_user_vol * in_factor;
 
-                current_play.set_volume(current_v.clamp(0.0, 1.0));
-                next_play.set_volume(next_v.clamp(0.0, 1.0));
+                if current_slot_gen.load(Ordering::SeqCst) == outgoing_slot_gen {
+                    set_element_volume(&current_volume, current_v);
+                }
+                set_element_volume(&next_volume, next_v);
             }
 
-            current_play.stop();
-            if let Ok(mut lock) = current_is_playing.lock() {
-                *lock = false;
-            }
+            stop_outgoing_if_unclaimed();
             if fade_gen.load(Ordering::SeqCst) == generation_id {
                 let cur_user_vol = user_volume_arc.lock().map(|l| *l).unwrap_or(1.0);
-                next_play.set_volume(cur_user_vol);
+                set_element_volume(&next_volume, cur_user_vol);
                 if fading_gen.load(Ordering::SeqCst) == generation_id {
                     fading_gen.store(0, Ordering::SeqCst);
                 }
@@ -707,8 +842,10 @@ impl AudioBackend {
                     pending: &pending_preroll,
                     playing_uri: &next_uri,
                     slot_play: &current_play,
+                    slot_volume: &current_volume,
                     slot_uri: &current_uri,
                     slot_prerolled: &current_prerolled,
+                    slot_gen: &current_slot_gen,
                     slot_idx: current_idx,
                 }
                 .flush();
@@ -726,6 +863,7 @@ impl AudioBackend {
             *pending = None;
         }
         for slot in &self.slots {
+            slot.bump_gen();
             slot.play.stop();
             slot.is_prerolled.store(false, Ordering::SeqCst);
             if let Ok(mut cur) = slot.current_uri.lock() {
@@ -742,7 +880,7 @@ impl AudioBackend {
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
         self.fading_gen.store(0, Ordering::SeqCst);
         let active = self.active();
-        active.play.set_volume(self.user_volume());
+        active.set_slot_volume(self.user_volume());
         active.play.play();
         if let Ok(mut lock) = active.is_playing.lock() {
             *lock = true;
@@ -756,7 +894,7 @@ impl AudioBackend {
         if let Ok(mut lock) = active.is_playing.lock() {
             *lock = true;
         }
-        active.play.set_volume(0.0);
+        active.set_slot_volume(0.0);
         active.play.play();
         self.fade_in(duration_ms);
     }
@@ -765,6 +903,7 @@ impl AudioBackend {
     pub fn pause(&self) {
         self.fade_gen.fetch_add(1, Ordering::SeqCst);
         for slot in &self.slots {
+            slot.bump_gen();
             slot.play.pause();
             if let Ok(mut lock) = slot.is_playing.lock() {
                 *lock = false;
@@ -875,11 +1014,11 @@ impl AudioBackend {
         let target = target.clamp(0.0, 1.0);
         let generation_id = self.fade_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let fade_gen = self.fade_gen.clone();
-        let play = self.active().play.clone();
-        let start_vol = play.volume();
+        let volume_el = self.active().volume.clone();
+        let start_vol = element_volume(&volume_el);
 
         if duration_ms == 0 || (start_vol - target).abs() < 1e-4 {
-            play.set_volume(target);
+            set_element_volume(&volume_el, target);
             if let Some(done) = on_done {
                 done();
             }
@@ -898,11 +1037,11 @@ impl AudioBackend {
                 }
                 let progress = step as f64 / steps as f64;
                 let current = start_vol + (target - start_vol) * progress;
-                play.set_volume(current.clamp(0.0, 1.0));
+                set_element_volume(&volume_el, current);
             }
 
             if fade_gen.load(Ordering::SeqCst) == generation_id {
-                play.set_volume(target);
+                set_element_volume(&volume_el, target);
                 if let Some(done) = on_done {
                     done();
                 }
@@ -912,7 +1051,7 @@ impl AudioBackend {
 
     /// Плавный старт: стартует с громкости 0.0 и плавно наращивает до user_volume
     pub fn fade_in(&self, duration_ms: u64) {
-        self.active().play.set_volume(0.0);
+        self.active().set_slot_volume(0.0);
         let target = self.user_volume();
         self.fade_volume(target, duration_ms);
     }
@@ -929,7 +1068,7 @@ impl AudioBackend {
 
     /// Асинхронное нарастание громкости от 0.0 до user_volume с ожиданием завершения
     pub async fn fade_in_async(&self, duration_ms: u64) {
-        self.active().play.set_volume(0.0);
+        self.active().set_slot_volume(0.0);
         let target = self.user_volume();
         self.fade_volume_async(target, duration_ms).await;
     }
@@ -939,11 +1078,11 @@ impl AudioBackend {
         let target = target.clamp(0.0, 1.0);
         let generation_id = self.fade_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let fade_gen = self.fade_gen.clone();
-        let play = self.active().play.clone();
-        let start_vol = play.volume();
+        let volume_el = self.active().volume.clone();
+        let start_vol = element_volume(&volume_el);
 
         if duration_ms == 0 || (start_vol - target).abs() < 1e-4 {
-            play.set_volume(target);
+            set_element_volume(&volume_el, target);
             return;
         }
 
@@ -958,11 +1097,11 @@ impl AudioBackend {
             }
             let progress = step as f64 / steps as f64;
             let current = start_vol + (target - start_vol) * progress;
-            play.set_volume(current.clamp(0.0, 1.0));
+            set_element_volume(&volume_el, current);
         }
 
         if fade_gen.load(Ordering::SeqCst) == generation_id {
-            play.set_volume(target);
+            set_element_volume(&volume_el, target);
         }
     }
 
@@ -972,7 +1111,7 @@ impl AudioBackend {
         if let Ok(mut lock) = self.user_volume.lock() {
             *lock = v;
         }
-        self.active().play.set_volume(v);
+        self.active().set_slot_volume(v);
     }
 
     /// Целевая пользовательская громкость (по умолчанию 1.0 или заданная пользователем)
@@ -985,9 +1124,9 @@ impl AudioBackend {
         self.user_volume()
     }
 
-    /// Фактическая громкость движка GStreamer активного слота
+    /// Фактическая громкость программного элемента `volume` активного слота
     pub fn raw_volume(&self) -> f64 {
-        self.active().play.volume()
+        self.active().slot_volume()
     }
 }
 
@@ -1048,6 +1187,113 @@ mod tests {
         // Следующий crossfade_to_url переключает обратно (1 -> 0)
         backend.crossfade_to_url("file:///tmp/dummy2.mp3", 0);
         assert_eq!(backend.active_slot.load(Ordering::SeqCst), 0);
+
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    fn test_slot_volume_isolated_from_play_mixer() {
+        let backend = match AudioBackend::new() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        // У каждого слота свой audio-sink и audio-filter (bass_probe), а флаг soft-volume снят
+        for slot in &backend.slots {
+            let pipe = slot.play.pipeline();
+            assert!(pipe.property::<Option<gstreamer::Element>>("audio-sink").is_some());
+            assert!(pipe.property::<Option<gstreamer::Element>>("audio-filter").is_some());
+            let flags = format!("{:?}", pipe.property_value("flags"));
+            assert!(!flags.contains("soft-volume"), "не должно быть soft-volume: {flags}");
+            assert!((slot.play.volume() - 1.0).abs() < 1e-6, "системный Play::volume должен оставаться 1.0");
+        }
+
+        // Регулировка громкости меняет программный volume-элемент, не трогая Play::volume
+        backend.set_volume(0.35);
+        assert!((backend.volume() - 0.35).abs() < 1e-6);
+        assert!((backend.raw_volume() - 0.35).abs() < 1e-6);
+        assert!((backend.active().play.volume() - 1.0).abs() < 1e-6);
+
+        // Преролл в неактивный слот выставляет 0.0 только на программный volume-элемент неактивного слота
+        let next_url = "file:///tmp/preroll_test.mp3";
+        backend.preroll_next_url(next_url);
+        assert!((backend.slots[1].slot_volume() - 0.0).abs() < 1e-6);
+        assert!((backend.slots[1].play.volume() - 1.0).abs() < 1e-6);
+        assert!((backend.slots[0].slot_volume() - 0.35).abs() < 1e-6);
+
+        // Мгновенный старт преролленного трека восстанавливает user_volume (0.35), не 0.0
+        backend.play_url(next_url);
+        assert_eq!(backend.active_slot.load(Ordering::SeqCst), 1);
+        assert!((backend.raw_volume() - 0.35).abs() < 1e-6);
+        assert!((backend.active().play.volume() - 1.0).abs() < 1e-6);
+
+        // Выход за границы 0..1 корректно ограничивается
+        backend.set_volume(1.5);
+        assert!((backend.raw_volume() - 1.0).abs() < 1e-6);
+        backend.set_volume(-0.4);
+        assert!((backend.raw_volume() - 0.0).abs() < 1e-6);
+        assert!((backend.active().play.volume() - 1.0).abs() < 1e-6);
+
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    fn test_configure_pipeline_flags_have_no_soft_volume() {
+        let backend = match AudioBackend::new() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let pipe = backend.slots[0].play.pipeline();
+
+        configure_pipeline_for_url(&pipe, "https://example.com/track/index.m3u8");
+        let hls_flags = format!("{:?}", pipe.property_value("flags"));
+        assert!(!hls_flags.contains("soft-volume"), "HLS flags: {hls_flags}");
+
+        configure_pipeline_for_url(&pipe, "https://example.com/track/audio.flac");
+        let prog_flags = format!("{:?}", pipe.property_value("flags"));
+        assert!(!prog_flags.contains("soft-volume"), "progressive flags: {prog_flags}");
+
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    fn test_reset_system_sink_volume_heals_muted_sink() {
+        if gstreamer::init().is_err() {
+            return;
+        }
+        let Ok(vol_el) = gstreamer::ElementFactory::make("volume").build() else {
+            return;
+        };
+        vol_el.set_property("volume", 0.0f64);
+        vol_el.set_property("mute", true);
+
+        reset_system_sink_volume(&vol_el);
+        assert!((vol_el.property::<f64>("volume") - 1.0).abs() < 1e-6);
+        assert!(!vol_el.property::<bool>("mute"));
+
+        // Элемент без свойств volume/mute не должен вызывать панику
+        if let Ok(fake) = gstreamer::ElementFactory::make("fakesink").build() {
+            reset_system_sink_volume(&fake);
+        }
+    }
+
+    #[test]
+    fn test_fade_in_and_crossfade_zero_duration_keep_play_volume_unity() {
+        let backend = match AudioBackend::new() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        backend.set_volume(0.6);
+
+        backend.play_url_fade_in("file:///tmp/fade_in_dummy.mp3", 0);
+        assert!((backend.raw_volume() - 0.6).abs() < 1e-6);
+        assert!((backend.active().play.volume() - 1.0).abs() < 1e-6);
+
+        backend.crossfade_to_url("file:///tmp/crossfade_dummy.mp3", 0);
+        assert_eq!(backend.active_slot.load(Ordering::SeqCst), 1);
+        assert!((backend.raw_volume() - 0.6).abs() < 1e-6);
+        assert!((backend.slots[0].play.volume() - 1.0).abs() < 1e-6);
+        assert!((backend.slots[1].play.volume() - 1.0).abs() < 1e-6);
 
         std::mem::forget(backend);
     }
