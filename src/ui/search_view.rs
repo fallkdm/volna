@@ -25,6 +25,7 @@ pub struct SearchViewWidgets {
     pub show_album: Rc<dyn Fn(Album)>,
     pub show_playlist: Rc<dyn Fn(crate::api::models::Playlist)>,
     pub reload_history: Rc<dyn Fn()>,
+    pub set_layout_margins: Rc<dyn Fn(i32, i32)>,
 }
 
 // Порядок совпадает с секциями: Треки, Исполнители, Альбомы, Плейлисты
@@ -110,16 +111,18 @@ fn grid() -> FlowBox {
 
 pub fn create_search_view(player: &PlayerManager) -> SearchViewWidgets {
     let container = GtkBox::new(Orientation::Vertical, 0);
-    container.set_margin_top(24);
-    // отступ под плавающий плеер даёт само содержимое прокрутки: оно уезжает под плеер и докручивается выше него
-    container.set_margin_start(32);
-    container.set_margin_end(32);
 
     let stack = Stack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
     stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     container.append(&stack);
 
     let main = GtkBox::new(Orientation::Vertical, 14);
+    // отступ под плавающий плеер даёт само содержимое прокрутки: оно уезжает под плеер и докручивается выше него
+    main.set_margin_top(24);
+    main.set_margin_start(32);
+    main.set_margin_end(32);
     stack.add_named(&main, Some("main"));
 
     let page = {
@@ -460,5 +463,16 @@ fn search_placeholder(id: ProviderId) -> &'static str {
         Rc::new(move |pl| open_playlist(&p, &stack, &page, &pl))
     };
 
-    SearchViewWidgets { container, show_artist, show_track, show_album, show_playlist, reload_history: rebuild_history }
+    let set_layout_margins: Rc<dyn Fn(i32, i32)> = {
+        let (container, main, page) = (container.clone(), main.clone(), page.clone());
+        Rc::new(move |sidebar_w, gutter| {
+            container.set_margin_start(sidebar_w);
+            container.set_margin_end(0);
+            main.set_margin_start(gutter);
+            main.set_margin_end(gutter);
+            page.set_side_margins(gutter);
+        })
+    };
+
+    SearchViewWidgets { container, show_artist, show_track, show_album, show_playlist, reload_history: rebuild_history, set_layout_margins }
 }

@@ -713,6 +713,19 @@ toast {
     opacity: 0.94;
 }
 
+/* кнопка «Назад» поверх баннера детальной страницы */
+button.flat.circular.detail-back-btn {
+    background-color: rgba(18, 18, 22, 0.48);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+button.flat.circular.detail-back-btn:hover {
+    background-color: rgba(28, 28, 34, 0.75);
+    border-color: rgba(255, 255, 255, 0.28);
+}
+
 /* ================= Сайдбар навигации (Spotify-Style) ================= */
 .sidebar,
 .spotify-sidebar {

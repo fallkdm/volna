@@ -368,6 +368,7 @@ pub struct DetailPage {
     about: GtkBox,
     about_for: Rc<RefCell<String>>,
     back: Button,
+    scrolled: ScrolledWindow,
     /// Стек экрана и сама страница: для переходов «к альбому/исполнителю» из меню треков
     nav: NavCell,
     /// Плейлист, открытый на странице, если он свой: (uid, kind)
@@ -416,15 +417,20 @@ pub fn format_listeners_label(count: u64, metric: ListenersMetric) -> String {
 
 impl DetailPage {
     pub fn new(player: &PlayerManager, on_back: impl Fn() + 'static) -> Rc<Self> {
-        let widget = GtkBox::new(Orientation::Vertical, 12);
+        let widget = GtkBox::new(Orientation::Vertical, 0);
+        widget.set_hexpand(true);
+        widget.set_vexpand(true);
 
         let back = Button::from_icon_name("go-previous-symbolic");
         back.add_css_class("flat");
         back.add_css_class("circular");
+        back.add_css_class("detail-back-btn");
         back.set_halign(Align::Start);
+        back.set_valign(Align::Start);
+        back.set_margin_top(24);
+        back.set_margin_start(32);
         back.set_tooltip_text(Some("Назад"));
         back.connect_clicked(move |_| on_back());
-        widget.append(&back);
         let heart_btn = Button::with_label(heart_glyph(false));
         heart_btn.add_css_class("pill");
         heart_btn.set_tooltip_text(Some("Мне нравится"));
@@ -736,16 +742,23 @@ impl DetailPage {
         content.append(&extra);
 
         let scrolled = ScrolledWindow::new();
+        scrolled.set_hexpand(true);
         scrolled.set_vexpand(true);
+        scrolled.set_margin_top(68);
+        scrolled.set_margin_start(32);
+        scrolled.set_margin_end(32);
         content.set_margin_bottom(130);
         content.set_margin_end(14);
         scrolled.set_child(Some(&content));
         let page_overlay = gtk4::Overlay::new();
+        page_overlay.set_hexpand(true);
         page_overlay.set_vexpand(true);
         page_overlay.set_child(Some(&gtk4::Box::new(Orientation::Vertical, 0)));
         page_overlay.add_overlay(&ambient_pic);
         page_overlay.add_overlay(&banner_wrap);
         page_overlay.add_overlay(&scrolled);
+        page_overlay.add_overlay(&back);
+        page_overlay.set_measure_overlay(&back, false);
         // видео и баннер занимают верх страницы на всю ширину и уезжают вверх вместе с прокруткой
         {
             let (bg, banner, adj) = (ambient_pic.clone(), banner_wrap.clone(), scrolled.vadjustment());
@@ -811,7 +824,14 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, banner_wrap, banner_pic, banner_src, banner_rendered_w, banner_resize_pending, video, video_shared, video_gen, listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), link_artists: RefCell::default(), about, about_for: Rc::default(), back, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, banner_wrap, banner_pic, banner_src, banner_rendered_w, banner_resize_pending, video, video_shared, video_gen, listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), link_artists: RefCell::default(), about, about_for: Rc::default(), back, scrolled, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+    }
+
+    /// Синхронизирует боковые отступы содержимого и кнопки «Назад», сохраняя фон на всю ширину
+    pub fn set_side_margins(&self, gutter: i32) {
+        self.back.set_margin_start(gutter);
+        self.scrolled.set_margin_start(gutter);
+        self.scrolled.set_margin_end(gutter);
     }
 
     /// Кнопка-описание у своего плейлиста: клик открывает редактирование
@@ -2792,11 +2812,11 @@ mod video_url_tests {
 }
 
 /// Высота видео за шапкой артиста, px
-const AMBIENT_HEIGHT: i32 = 580;
+const AMBIENT_HEIGHT: i32 = 650;
 /// На сколько видео поднято выше верха страницы: верх кадра обычно тёмный пустой, его уводим за край
 const AMBIENT_LIFT: i32 = 40;
-/// Высота чёткого верхнего слоя баннера YouTube Music, px
-const BANNER_HEIGHT: i32 = 420;
+/// Высота чёткого верхнего слоя баннера YouTube Music, px (начинается от самого верха под HeaderBar)
+const BANNER_HEIGHT: i32 = 490;
 /// Верхне-смещённый Y-фокус (~22%), чтобы не обрезать головы артистов
 const BANNER_FOCUS_Y: f32 = 0.22;
 
@@ -2852,12 +2872,12 @@ fn banner_fade_rgba(
     let ch = crop.height() as f32;
     let tw = target_w as f32;
     let th = target_h as f32;
-    let fade_bottom_start = th * 0.45;
-    let fade_bottom_end = th * 0.96;
+    let fade_bottom_start = th * 0.50;
+    let fade_bottom_end = th * 0.95;
     let fade_bottom_span = (fade_bottom_end - fade_bottom_start).max(1.0);
     for sy in 0..sh {
         let screen_y = cy + (sy as f32 + 0.5) / sh as f32 * ch;
-        let fy_top = smoothstep(screen_y / 32.0);
+        let fy_top = smoothstep(screen_y / 14.0);
         let fy_bottom = smoothstep((fade_bottom_end - screen_y) / fade_bottom_span);
         let fy = fy_top * fy_bottom;
         if fy <= 0.001 {
@@ -2865,7 +2885,7 @@ fn banner_fade_rgba(
             continue;
         }
         let v = (screen_y / th).clamp(0.0, 1.0);
-        let bottom_t = smoothstep(((v - 0.35) / 0.45).clamp(0.0, 1.0));
+        let bottom_t = smoothstep(((v - 0.44) / 0.40).clamp(0.0, 1.0));
         let dim_y = 1.0 - 0.20 * bottom_t;
         let row_off = sy * sw * 4;
         for sx in 0..sw {
@@ -2999,19 +3019,20 @@ mod ambient_tests {
         };
 
         assert!(px(600, 0)[3] < 5, "верхний край у y=0 плавно растворяется");
+        assert_eq!(px(600, 24)[3], 255, "в верхней полосе под кнопкой Назад (y=24) баннер уже полностью непрозрачен");
         assert_eq!(px(600, h - 1), [0, 0, 0, 0], "нижний край полностью прозрачен без остатков цвета");
-        assert!(px(0, 120)[3] < 5, "левый край плавно затухает");
-        assert!(px(w - 1, 120)[3] < 5, "правый край у скроллбара плавно затухает");
+        assert!(px(0, 140)[3] < 5, "левый край плавно затухает");
+        assert!(px(w - 1, 140)[3] < 5, "правый край у скроллбара плавно затухает");
 
-        let face = px(760, 110);
+        let face = px(760, 150);
         assert_eq!(face[3], 255, "верхне-центральная зона лиц полностью непрозрачна");
         assert!(face[0] >= 210, "зона лиц остаётся яркой: {}", face[0]);
 
-        let left_header = px(120, 110);
+        let left_header = px(120, 150);
         assert_eq!(left_header[3], 255, "левая зона заголовка непрозрачна");
         assert!(left_header[0] < face[0], "левая зона затемнена для читаемости текста");
 
-        let lower_left = px(240, 270);
+        let lower_left = px(240, 320);
         assert!(lower_left[3] > 0 && lower_left[3] < 255, "нижняя зона плавно затухает");
         let lower_brightness = lower_left[0] as f32 / lower_left[3] as f32;
         let face_brightness = face[0] as f32 / face[3] as f32;
@@ -3030,11 +3051,11 @@ mod ambient_tests {
             let i = (y * w + x) * 4;
             [faded_narrow[i], faded_narrow[i + 1], faded_narrow[i + 2], faded_narrow[i + 3]]
         };
-        assert_eq!(px_narrow(10, 120), [0, 0, 0, 0], "обрезанный левый край строго прозрачен");
-        assert_eq!(px_narrow(1190, 120), [0, 0, 0, 0], "обрезанный правый край строго прозрачен");
-        assert!(px_narrow(300, 120)[3] < 5, "левая видимая граница плавно затухает");
-        assert!(px_narrow(899, 120)[3] < 5, "правая видимая граница плавно затухает");
-        assert_eq!(px_narrow(600, 120)[3], 255, "центр видимой области непрозрачен");
+        assert_eq!(px_narrow(10, 150), [0, 0, 0, 0], "обрезанный левый край строго прозрачен");
+        assert_eq!(px_narrow(1190, 150), [0, 0, 0, 0], "обрезанный правый край строго прозрачен");
+        assert!(px_narrow(300, 150)[3] < 5, "левая видимая граница плавно затухает");
+        assert!(px_narrow(899, 150)[3] < 5, "правая видимая граница плавно затухает");
+        assert_eq!(px_narrow(600, 150)[3], 255, "центр видимой области непрозрачен");
 
         let (sw, sh) = (1080usize, 450usize);
         let rgba_tall = [200u8, 200, 200, 255].repeat(sw * sh);
@@ -3046,7 +3067,7 @@ mod ambient_tests {
             [faded_wide[i], faded_wide[i + 1], faded_wide[i + 2], faded_wide[i + 3]]
         };
         assert_eq!(px_wide(540, 0), [0, 0, 0, 0], "обрезанный верх строго прозрачен");
-        assert_eq!(px_wide(540, sh - 1), [0, 0, 0, 0], "низ за 96% BANNER_HEIGHT строго прозрачен");
+        assert_eq!(px_wide(540, sh - 1), [0, 0, 0, 0], "низ за 95% BANNER_HEIGHT строго прозрачен");
     }
 }
 

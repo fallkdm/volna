@@ -15,6 +15,7 @@ use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 pub struct LibraryViewWidgets {
     pub container: GtkBox,
     pub open_liked: Rc<dyn Fn()>,
+    pub set_layout_margins: Rc<dyn Fn(i32, i32)>,
 }
 
 const TILE_SIZE: i32 = 160;
@@ -22,12 +23,10 @@ const LIKED_PREVIEW: usize = 6;
 
 pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     let container = GtkBox::new(Orientation::Vertical, 0);
-    container.set_margin_top(24);
-    // отступ под плавающий плеер даёт само содержимое прокрутки: оно уезжает под плеер и докручивается выше него
-    container.set_margin_start(32);
-    container.set_margin_end(32);
 
     let stack = Stack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
     stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     container.append(&stack);
 
@@ -144,11 +143,26 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
+    // отступ под плавающий плеер даёт само содержимое прокрутки: оно уезжает под плеер и докручивается выше него
+    scrolled.set_margin_top(24);
+    scrolled.set_margin_start(32);
+    scrolled.set_margin_end(32);
     main.set_margin_bottom(130);
     main.set_margin_end(14); // полоса прокрутки не наезжает на строки
     scrolled.set_child(Some(&main));
     stack.add_named(&scrolled, Some("main"));
     stack.set_visible_child_name("main");
+
+    let set_layout_margins: Rc<dyn Fn(i32, i32)> = {
+        let (container, scrolled, page) = (container.clone(), scrolled.clone(), page.clone());
+        Rc::new(move |sidebar_w, gutter| {
+            container.set_margin_start(sidebar_w);
+            container.set_margin_end(0);
+            scrolled.set_margin_start(gutter);
+            scrolled.set_margin_end(gutter);
+            page.set_side_margins(gutter);
+        })
+    };
 
     let reload_library: Rc<dyn Fn()> = {
         let (p, stack, page, status, yt_login_btn) = (player.clone(), stack.clone(), page.clone(), status.clone(), yt_login_btn.clone());
@@ -456,6 +470,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     LibraryViewWidgets {
         container,
         open_liked: open_liked_fn,
+        set_layout_margins,
     }
 }
 

@@ -27,6 +27,17 @@ const CONTENT_GUTTER_EXPANDED: i32 = 24;
 const CONTENT_GUTTER_COLLAPSED: i32 = 36;
 const CONTENT_GUTTER_DEFAULT: i32 = 32;
 
+/// Возвращает `(sidebar_width, content_gutter)` для текущего режима навигации.
+fn nav_layout_margins(is_spotify: bool, collapsed: bool) -> (i32, i32) {
+    if !is_spotify {
+        (0, CONTENT_GUTTER_DEFAULT)
+    } else if collapsed {
+        (SIDEBAR_COLLAPSED_WIDTH, CONTENT_GUTTER_COLLAPSED)
+    } else {
+        (SIDEBAR_EXPANDED_WIDTH, CONTENT_GUTTER_EXPANDED)
+    }
+}
+
 pub struct VolnaWindow {
     pub window: ApplicationWindow,
 }
@@ -141,22 +152,12 @@ impl VolnaWindow {
         let is_spotify_nav = nav_style == "spotify";
         let is_spotify_nav_state = Rc::new(RefCell::new(is_spotify_nav));
 
-        let (initial_margin_start, initial_margin_end) = if is_spotify_nav {
-            if initial_collapsed {
-                (SIDEBAR_COLLAPSED_WIDTH + CONTENT_GUTTER_COLLAPSED, CONTENT_GUTTER_COLLAPSED)
-            } else {
-                (SIDEBAR_EXPANDED_WIDTH + CONTENT_GUTTER_EXPANDED, CONTENT_GUTTER_EXPANDED)
-            }
-        } else {
-            (CONTENT_GUTTER_DEFAULT, CONTENT_GUTTER_DEFAULT)
-        };
-        search_view.container.set_margin_start(initial_margin_start);
-        search_view.container.set_margin_end(initial_margin_end);
-        library_view.container.set_margin_start(initial_margin_start);
-        library_view.container.set_margin_end(initial_margin_end);
+        let (initial_sidebar_w, initial_gutter) = nav_layout_margins(is_spotify_nav, initial_collapsed);
+        (search_view.set_layout_margins)(initial_sidebar_w, initial_gutter);
+        (library_view.set_layout_margins)(initial_sidebar_w, initial_gutter);
 
-        let search_container = search_view.container.clone();
-        let library_container = library_view.container.clone();
+        let search_set_margins = search_view.set_layout_margins.clone();
+        let library_set_margins = library_view.set_layout_margins.clone();
 
         // Внешняя обёртка: на каждом кадре анимируется ТОЛЬКО её ширина (клипп).
         // Внутренности сайдбара всегда имеют постоянный размер и не перекладываются —
@@ -514,8 +515,8 @@ impl VolnaWindow {
             let source_label_box = source_label_box.clone();
             let auth_name_box = auth_name_box.clone();
             let settings_label_box = settings_label_box.clone();
-            let search_container = search_container.clone();
-            let library_container = library_container.clone();
+            let search_set_margins = search_set_margins.clone();
+            let library_set_margins = library_set_margins.clone();
             let is_spotify_nav_state = is_spotify_nav_state.clone();
             let nav_items = vec![nav_wave.clone(), nav_search.clone(), nav_liked.clone()];
             let anim_holder: Rc<RefCell<Option<libadwaita::TimedAnimation>>> = Rc::default();
@@ -575,8 +576,8 @@ impl VolnaWindow {
                 let ab = auth_name_box.clone();
                 let sb = settings_label_box.clone();
                 let items = nav_items.clone();
-                let sc = search_container.clone();
-                let lc = library_container.clone();
+                let sc = search_set_margins.clone();
+                let lc = library_set_margins.clone();
                 let is_sp = is_spotify_nav_state.clone();
 
                 let target = libadwaita::CallbackAnimationTarget::new(move |val| {
@@ -586,10 +587,8 @@ impl VolnaWindow {
                     let is_sp_val = *is_sp.borrow();
                     if is_sp_val {
                         let gutter = (CONTENT_GUTTER_COLLAPSED as f64 + (CONTENT_GUTTER_EXPANDED as f64 - CONTENT_GUTTER_COLLAPSED as f64) * t).round() as i32;
-                        sc.set_margin_start(w + gutter);
-                        lc.set_margin_start(w + gutter);
-                        sc.set_margin_end(gutter);
-                        lc.set_margin_end(gutter);
+                        sc(w, gutter);
+                        lc(w, gutter);
                     }
                     if !next_collapsed {
                         bb.set_opacity(t);
@@ -611,27 +610,16 @@ impl VolnaWindow {
                 let sb_done = settings_label_box.clone();
                 let items_done = nav_items.clone();
                 let c_btn_done = c_btn.clone();
-                let sc_done = search_container.clone();
-                let lc_done = library_container.clone();
+                let sc_done = search_set_margins.clone();
+                let lc_done = library_set_margins.clone();
                 let is_sp_done = is_spotify_nav_state.clone();
 
                 anim.connect_done(move |_| {
                     let is_sp_val = *is_sp_done.borrow();
-                    let w = if next_collapsed {
-                        SIDEBAR_COLLAPSED_WIDTH
-                    } else {
-                        SIDEBAR_EXPANDED_WIDTH
-                    };
                     if is_sp_val {
-                        let gutter = if next_collapsed {
-                            CONTENT_GUTTER_COLLAPSED
-                        } else {
-                            CONTENT_GUTTER_EXPANDED
-                        };
-                        sc_done.set_margin_start(w + gutter);
-                        lc_done.set_margin_start(w + gutter);
-                        sc_done.set_margin_end(gutter);
-                        lc_done.set_margin_end(gutter);
+                        let (w, gutter) = nav_layout_margins(true, next_collapsed);
+                        sc_done(w, gutter);
+                        lc_done(w, gutter);
                     }
                     if next_collapsed {
                         s_done.set_width_request(SIDEBAR_COLLAPSED_WIDTH);
@@ -1677,8 +1665,8 @@ impl VolnaWindow {
             dynamic_provider,
             is_spotify_nav_state,
             main_content_box.clone(),
-            search_view.container.clone(),
-            library_view.container.clone(),
+            search_set_margins,
+            library_set_margins,
             is_collapsed.clone(),
         );
 
@@ -2063,8 +2051,8 @@ fn setup_event_listener(
     dynamic_provider: gtk4::CssProvider,
     is_spotify_nav_state: Rc<RefCell<bool>>,
     main_content_box: GtkBox,
-    search_container: GtkBox,
-    library_container: GtkBox,
+    search_set_margins: Rc<dyn Fn(i32, i32)>,
+    library_set_margins: Rc<dyn Fn(i32, i32)>,
     is_collapsed: Rc<RefCell<bool>>,
 ) {
     let yandex_login_state: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -2433,19 +2421,9 @@ fn setup_event_listener(
                     header_brand_box.set_visible(!is_spotify);
                     header_right_box.set_visible(!is_spotify);
                     let collapsed = *is_collapsed.borrow();
-                    let (start, end) = if is_spotify {
-                        if collapsed {
-                            (SIDEBAR_COLLAPSED_WIDTH + CONTENT_GUTTER_COLLAPSED, CONTENT_GUTTER_COLLAPSED)
-                        } else {
-                            (SIDEBAR_EXPANDED_WIDTH + CONTENT_GUTTER_EXPANDED, CONTENT_GUTTER_EXPANDED)
-                        }
-                    } else {
-                        (CONTENT_GUTTER_DEFAULT, CONTENT_GUTTER_DEFAULT)
-                    };
-                    search_container.set_margin_start(start);
-                    library_container.set_margin_start(start);
-                    search_container.set_margin_end(end);
-                    library_container.set_margin_end(end);
+                    let (sidebar_w, gutter) = nav_layout_margins(is_spotify, collapsed);
+                    search_set_margins(sidebar_w, gutter);
+                    library_set_margins(sidebar_w, gutter);
                 }
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
