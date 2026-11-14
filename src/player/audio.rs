@@ -233,13 +233,16 @@ impl PlayerSlot {
             pipeline.set_property_from_str("flags", "audio+download");
         }
         if pipeline.find_property("buffer-duration").is_some() {
-            let _ = pipeline.set_property("buffer-duration", 10_000_000_000i64); // 10 секунд буфера
+            let _ = pipeline.set_property("buffer-duration", 2_000_000_000i64); // 2 секунды буфера
         }
         if pipeline.find_property("buffer-size").is_some() {
-            let _ = pipeline.set_property("buffer-size", 4 * 1024 * 1024i32); // 4 МБ
+            let _ = pipeline.set_property("buffer-size", 512 * 1024i32); // 512 КБ
         }
         if pipeline.find_property("ring-buffer-max-size").is_some() {
-            let _ = pipeline.set_property("ring-buffer-max-size", 8 * 1024 * 1024u64); // 8 МБ
+            // 0 = отключено: в режиме audio+download playbin скачивает поток целиком во временный
+            // файл без 8-мегабайтного потолка в ОЗУ (иначе после 8 МБ чтение из souphttpsrc
+            // блокируется и HTTP-сокет закрывается сервером по таймауту).
+            let _ = pipeline.set_property("ring-buffer-max-size", 0u64);
         }
 
         let (sink_bin, volume) = build_slot_audio_sink(index, 1.0)?;
@@ -263,22 +266,6 @@ impl PlayerSlot {
             }
             None
         });
-
-        if let Some(bus) = pipeline.bus() {
-            let pipe_weak = pipeline.downgrade();
-            bus.set_sync_handler(move |_, msg| {
-                if let gstreamer::MessageView::Buffering(b) = msg.view() {
-                    if b.percent() < 100 {
-                        if let Some(pipe) = pipe_weak.upgrade() {
-                            if pipe.current_state() == gstreamer::State::Playing {
-                                return gstreamer::BusSyncReply::Drop;
-                            }
-                        }
-                    }
-                }
-                gstreamer::BusSyncReply::Pass
-            });
-        }
 
         pipeline.connect("source-setup", false, |values| {
             if let Some(source) = values.get(1).and_then(|v| v.get::<gstreamer::Element>().ok()) {
@@ -364,30 +351,33 @@ pub fn is_hls_url(url: &str) -> bool {
         || (url.contains("vkuseraudio.net") && !url.contains(".mp3") && !url.contains("type=2"))
 }
 
-fn configure_pipeline_for_url(pipeline: &gstreamer::Element, url: &str) {
-    if is_hls_url(url) {
-        // Для HLS плейлистов флаги без buffering и без download, чтобы playbin3
-        // не создавал паразитный queue2 с жестким ожиданием 10 секунд
-        if pipeline.find_property("flags").is_some() {
-            pipeline.set_property_from_str("flags", "audio");
-        }
-        if pipeline.find_property("buffer-duration").is_some() {
-            let _ = pipeline.set_property("buffer-duration", -1i64);
-        }
-        if pipeline.find_property("buffer-size").is_some() {
-            let _ = pipeline.set_property("buffer-size", -1i32);
-        }
+fn pipeline_buffering_config(url: &str) -> (&'static str, i64, i32) {
+    if url.starts_with("file://") || is_hls_url(url) {
+        // Для локальных файлов и HLS плейлистов флаги без buffering и без download,
+        // чтобы playbin3 не создавал паразитный queue2 с сетевым ожиданием
+        ("audio", -1i64, -1i32)
+    } else if url.contains("googlevideo.com") {
+        // Для YouTube Music (Opus ~160k, весь трек 3–4 МБ): 512 КБ / 2 с хватает для
+        // мгновенного старта (~26 секунд звука) без долгого зависания в Buffering
+        ("audio+download", 2_000_000_000i64, 512 * 1024i32)
     } else {
-        // Для прогрессивных MP3/FLAC/Opus/AAC используем download и 10s буфер
-        if pipeline.find_property("flags").is_some() {
-            pipeline.set_property_from_str("flags", "audio+download");
-        }
-        if pipeline.find_property("buffer-duration").is_some() {
-            let _ = pipeline.set_property("buffer-duration", 10_000_000_000i64);
-        }
-        if pipeline.find_property("buffer-size").is_some() {
-            let _ = pipeline.set_property("buffer-size", 4 * 1024 * 1024i32);
-        }
+        // Для остальных прогрессивных HTTP-потоков (Яндекс MP3/FLAC и др.):
+        // с ring-buffer-max-size = 0 и audio+download queue2 сразу начинает играть после первых
+        // 512 КБ и беспрерывно докачивает весь файл до конца во временное хранилище без пауз чтения сокета
+        ("audio+download", 2_000_000_000i64, 512 * 1024i32)
+    }
+}
+
+fn configure_pipeline_for_url(pipeline: &gstreamer::Element, url: &str) {
+    let (flags, buffer_duration, buffer_size) = pipeline_buffering_config(url);
+    if pipeline.find_property("flags").is_some() {
+        pipeline.set_property_from_str("flags", flags);
+    }
+    if pipeline.find_property("buffer-duration").is_some() {
+        let _ = pipeline.set_property("buffer-duration", buffer_duration);
+    }
+    if pipeline.find_property("buffer-size").is_some() {
+        let _ = pipeline.set_property("buffer-size", buffer_size);
     }
 }
 
@@ -1252,6 +1242,26 @@ mod tests {
         configure_pipeline_for_url(&pipe, "https://example.com/track/audio.flac");
         let prog_flags = format!("{:?}", pipe.property_value("flags"));
         assert!(!prog_flags.contains("soft-volume"), "progressive flags: {prog_flags}");
+
+        assert_eq!(
+            pipeline_buffering_config("file:///home/user/.cache/volna/audio/test.opus"),
+            ("audio", -1i64, -1i32)
+        );
+        assert_eq!(
+            pipeline_buffering_config("https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251"),
+            ("audio+download", 2_000_000_000i64, 512 * 1024i32)
+        );
+        assert_eq!(
+            pipeline_buffering_config("https://example.com/track/audio.flac"),
+            ("audio+download", 2_000_000_000i64, 512 * 1024i32)
+        );
+        if pipe.find_property("ring-buffer-max-size").is_some() {
+            assert_eq!(
+                pipe.property::<u64>("ring-buffer-max-size"),
+                0u64,
+                "ring-buffer-max-size должен быть 0 (отключен), чтобы не обрывать потоки >8 МБ"
+            );
+        }
 
         std::mem::forget(backend);
     }

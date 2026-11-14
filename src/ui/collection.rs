@@ -1873,6 +1873,7 @@ pub fn open_artist(
                 if source == TrackSource::Yandex {
                     ensure_liked(&p).await;
                 }
+                let backdrop_plan = plan_artist_header_backdrop(source, &brief);
                 let a = &brief.artist;
                 page.show("Исполнитель", &a.name, "", None, brief.popular_tracks);
                 page.set_round_cover(true);
@@ -1943,26 +1944,49 @@ pub fn open_artist(
                     });
                 }
 
-                // видео шапки (Яндекс) или фоновый баннер (только YouTube Music)
-                if source == TrackSource::YouTubeMusic {
-                    if let Some(url) = brief
-                        .background_image_url
-                        .as_deref()
-                        .map(crate::api::models::reachable_image_url)
-                        .filter(|u| u.starts_with("https://"))
-                    {
+                // видео шапки (Яндекс) или фоновый баннер (YouTube Music / фолбэк для Яндекс и ВК)
+                match backdrop_plan {
+                    ArtistHeaderBackdropPlan::DirectBanner(url) => {
                         page.load_background_banner(url);
                     }
-                } else if let Some(url) = brief.background_video_url.clone().filter(|u| trusted_video_url(u)) {
-                    let (page, token) = (page.clone(), page.video_token());
-                    glib::spawn_future_local(async move {
-                        if let Some(path) = crate::cache::fetch_clip_cached(&url).await {
-                            // пока качалось, страницу могли сменить
-                            if page.video_token() == token {
-                                page.play_background_video(&path.to_string_lossy());
+                    ArtistHeaderBackdropPlan::YandexVideoWithYtFallback {
+                        video_url,
+                        artist_name,
+                    } => {
+                        let (page, token, yt_client) =
+                            (page.clone(), page.video_token(), p.yt_client.clone());
+                        glib::spawn_future_local(async move {
+                            if let Some(path) = crate::cache::fetch_clip_cached(&video_url).await {
+                                // пока качалось, страницу могли сменить
+                                if page.video_token() == token {
+                                    page.play_background_video(&path.to_string_lossy());
+                                }
+                            } else if page.video_token() == token && !artist_name.trim().is_empty()
+                            {
+                                if let Some(banner_url) =
+                                    yt_client.resolve_artist_banner(&artist_name).await
+                                {
+                                    if page.video_token() == token {
+                                        page.load_background_banner(banner_url);
+                                    }
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
+                    ArtistHeaderBackdropPlan::FetchYtBannerByName(artist_name) => {
+                        let (page, token, yt_client) =
+                            (page.clone(), page.video_token(), p.yt_client.clone());
+                        glib::spawn_future_local(async move {
+                            if let Some(banner_url) =
+                                yt_client.resolve_artist_banner(&artist_name).await
+                            {
+                                if page.video_token() == token {
+                                    page.load_background_banner(banner_url);
+                                }
+                            }
+                        });
+                    }
+                    ArtistHeaderBackdropPlan::None => {}
                 }
                 page.load_about(a.name.clone());
 
@@ -2797,6 +2821,69 @@ fn trusted_video_url(url: &str) -> bool {
     host.ends_with(".yandex.net") || host.ends_with(".yandex.ru")
 }
 
+/// Стратегия выбора фона шапки профиля артиста.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtistHeaderBackdropPlan {
+    /// Живая видео-обложка Яндекса (приоритет №1 в Яндексе, с фолбэком на YT баннер при ошибке скачивания видео)
+    YandexVideoWithYtFallback {
+        video_url: String,
+        artist_name: String,
+    },
+    /// Прямой фоновый баннер из текущего `ArtistBrief` (YouTube Music или собственная картинка)
+    DirectBanner(String),
+    /// Поиск фонового баннера в YouTube Music по имени артиста (для VK и для артистов Яндекса без своей обложки)
+    FetchYtBannerByName(String),
+    /// Нет фона
+    None,
+}
+
+/// Определяет план загрузки фона шапки профиля артиста с учётом источника и приоритета собственных обложек Яндекса.
+pub fn plan_artist_header_backdrop(
+    source: TrackSource,
+    brief: &crate::api::models::ArtistBrief,
+) -> ArtistHeaderBackdropPlan {
+    let direct_banner = brief
+        .background_image_url
+        .as_deref()
+        .map(crate::api::models::reachable_image_url)
+        .filter(|u| u.starts_with("https://"));
+    let artist_name = brief.artist.name.trim().to_string();
+
+    match source {
+        TrackSource::Yandex => {
+            if let Some(video_url) = brief
+                .background_video_url
+                .as_deref()
+                .filter(|u| trusted_video_url(u))
+            {
+                ArtistHeaderBackdropPlan::YandexVideoWithYtFallback {
+                    video_url: video_url.to_string(),
+                    artist_name,
+                }
+            } else if let Some(url) = direct_banner {
+                ArtistHeaderBackdropPlan::DirectBanner(url)
+            } else if !artist_name.is_empty() {
+                ArtistHeaderBackdropPlan::FetchYtBannerByName(artist_name)
+            } else {
+                ArtistHeaderBackdropPlan::None
+            }
+        }
+        TrackSource::YouTubeMusic => match direct_banner {
+            Some(url) => ArtistHeaderBackdropPlan::DirectBanner(url),
+            None => ArtistHeaderBackdropPlan::None,
+        },
+        TrackSource::Vk => {
+            if let Some(url) = direct_banner {
+                ArtistHeaderBackdropPlan::DirectBanner(url)
+            } else if !artist_name.is_empty() {
+                ArtistHeaderBackdropPlan::FetchYtBannerByName(artist_name)
+            } else {
+                ArtistHeaderBackdropPlan::None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod video_url_tests {
     use super::*;
@@ -2808,6 +2895,82 @@ mod video_url_tests {
         assert!(!trusted_video_url("http://runtime.strm.yandex.ru/x.mp4"));
         assert!(!trusted_video_url("https://evil.example.com/yandex.ru/x.mp4"));
         assert!(!trusted_video_url("https://yandex.ru.evil.com/x.mp4"));
+    }
+
+    fn make_brief(
+        name: &str,
+        video_url: Option<&str>,
+        image_url: Option<&str>,
+    ) -> crate::api::models::ArtistBrief {
+        crate::api::models::ArtistBrief {
+            artist: crate::api::models::Artist {
+                id: "1".to_string(),
+                name: name.to_string(),
+                cover: None,
+            },
+            popular_tracks: Vec::new(),
+            albums: Vec::new(),
+            playlists: Vec::new(),
+            all_covers: Vec::new(),
+            stats: None,
+            background_video_url: video_url.map(str::to_string),
+            background_image_url: image_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn yandex_video_always_has_top_priority_in_yandex() {
+        let brief = make_brief(
+            "Три дня дождя",
+            Some("https://runtime.strm.yandex.ru/videos/a/b.mp4"),
+            Some("https://lh3.googleusercontent.com/yt-banner=w1920"),
+        );
+        assert_eq!(
+            plan_artist_header_backdrop(TrackSource::Yandex, &brief),
+            ArtistHeaderBackdropPlan::YandexVideoWithYtFallback {
+                video_url: "https://runtime.strm.yandex.ru/videos/a/b.mp4".to_string(),
+                artist_name: "Три дня дождя".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn yandex_without_video_falls_back_to_yt_banner_by_name() {
+        let brief = make_brief("Кино", None, None);
+        assert_eq!(
+            plan_artist_header_backdrop(TrackSource::Yandex, &brief),
+            ArtistHeaderBackdropPlan::FetchYtBannerByName("Кино".to_string())
+        );
+    }
+
+    #[test]
+    fn vk_fetches_yt_banner_by_name() {
+        let brief = make_brief("Баста", None, None);
+        assert_eq!(
+            plan_artist_header_backdrop(TrackSource::Vk, &brief),
+            ArtistHeaderBackdropPlan::FetchYtBannerByName("Баста".to_string())
+        );
+    }
+
+    #[test]
+    fn ytmusic_uses_direct_banner_when_present() {
+        let brief = make_brief(
+            "Linkin Park",
+            None,
+            Some("https://lh3.googleusercontent.com/banner=w1920-h1080"),
+        );
+        assert_eq!(
+            plan_artist_header_backdrop(TrackSource::YouTubeMusic, &brief),
+            ArtistHeaderBackdropPlan::DirectBanner(
+                "https://lh3.googleusercontent.com/banner=w1920-h1080".to_string()
+            )
+        );
+
+        let brief_no_banner = make_brief("Linkin Park", None, None);
+        assert_eq!(
+            plan_artist_header_backdrop(TrackSource::YouTubeMusic, &brief_no_banner),
+            ArtistHeaderBackdropPlan::None
+        );
     }
 }
 

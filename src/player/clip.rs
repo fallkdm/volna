@@ -285,6 +285,12 @@ impl ClipBackground {
             return;
         }
 
+        // Не конкурируем с аудиопотоком за сокеты и полосу в первую секунду старта трека
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        if self.attempt.load(Ordering::SeqCst) != attempt_id {
+            return;
+        }
+
         let resolved = match self.yt.resolve_video_clip(&track_id).await {
             Ok(resolved) => resolved,
             Err(error) => {

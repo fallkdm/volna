@@ -1423,6 +1423,7 @@ impl PlayerManager {
         }
 
         let prefetch_arc = self.prefetch.clone();
+        let state_arc = self.state.clone();
         let audio = self.audio.clone();
         let client = self.client.lock().unwrap().clone();
         let providers = self.providers.clone();
@@ -1432,6 +1433,19 @@ impl PlayerManager {
         let track_title = next.title.clone();
 
         tokio::spawn(async move {
+            let is_still_next = || {
+                state_arc
+                    .lock()
+                    .ok()
+                    .and_then(|state| {
+                        state
+                            .queue
+                            .get(state.current_index + 1)
+                            .map(|t| t.id.as_str() == track_id.as_str())
+                    })
+                    .unwrap_or(false)
+            };
+
             let started = std::time::Instant::now();
             let stream_res = resolve_stream_for_source(&providers, &client, &track_id, track_source).await;
 
@@ -1453,15 +1467,11 @@ impl PlayerManager {
             });
 
             let is_hls = (track_source == TrackSource::Vk && crate::player::audio::is_hls_url(&stream_url)) || stream_url.contains(".m3u8");
-            let ext = if is_hls {
-                "mka"
-            } else if is_yt {
-                "opus"
-            } else if stream_url.contains(".flac") || stream_url.contains("type=flac") || stream_url.contains("type=3") {
-                "flac"
-            } else {
-                "mp3"
-            };
+            if !is_hls && is_still_next() {
+                audio.preroll_next_url(&stream_url);
+            }
+
+            let ext = audio_cache_ext_for_url(&stream_url, is_hls, is_yt);
 
             // Скачиваем трек на диск (для HLS — ffmpeg remux в .mka, для остальных — прямой download)
             if let Some(path) = download_audio_to_cache(&stream_url, &track_id, ext).await {
@@ -1472,9 +1482,11 @@ impl PlayerManager {
                         p.at = std::time::Instant::now();
                     }
                 }
-                audio.preroll_next_url(&local_uri);
-                eprintln!("[prefetch] «{}» сохранен на диск и переведен в локальный preroll: {}", track_title, local_uri);
-            } else {
+                if is_still_next() {
+                    audio.preroll_next_url(&local_uri);
+                    eprintln!("[prefetch] «{}» сохранен на диск и переведен в локальный preroll: {}", track_title, local_uri);
+                }
+            } else if is_hls && is_still_next() {
                 audio.preroll_next_url(&stream_url);
             }
             clear_inflight();
@@ -2640,14 +2652,8 @@ impl PlayerManager {
                         // Фоновое сохранение играющего трека в audio_cache
                         let cache_tid = track_id.clone();
                         let cache_url = url.clone();
-                        let cache_ext = if is_yt {
-                            "opus"
-                        } else if cache_url.contains(".flac") || cache_url.contains("type=flac") || cache_url.contains("type=3") {
-                            "flac"
-                        } else {
-                            "mp3"
-                        };
                         let is_hls = (track_source == TrackSource::Vk && crate::player::audio::is_hls_url(&cache_url)) || cache_url.contains(".m3u8");
+                        let cache_ext = audio_cache_ext_for_url(&cache_url, is_hls, is_yt);
                         if !cache_url.starts_with("file://") && !is_hls {
                             tokio::spawn(async move {
                                 // Даем 4 секунды конвейеру GStreamer спокойно наполнить буфер звука без конкуренции за сеть
@@ -3441,6 +3447,19 @@ impl PlayerManager {
     }
 }
 
+/// Определяет расширение файла для дискового кэша (`~/.cache/volna/audio/`) по URL потока.
+pub(crate) fn audio_cache_ext_for_url(stream_url: &str, is_hls: bool, is_yt: bool) -> &'static str {
+    if is_hls {
+        "mka"
+    } else if is_yt {
+        "opus"
+    } else if stream_url.contains("flac") || stream_url.contains("type=3") {
+        "flac"
+    } else {
+        "mp3"
+    }
+}
+
 /// Скачивает аудиопоток в дисковый кэш (~/.cache/volna/audio/) и очищает старые треки по LRU
 async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option<std::path::PathBuf> {
     if url.starts_with("file://") {
@@ -3527,11 +3546,26 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
         return None;
     }
 
+    if url.contains("googlevideo.com") || ext == "opus" {
+        if download_audio_range_segmented(url, &tmp).await.is_some() {
+            std::fs::rename(&tmp, &final_path).ok()?;
+            crate::cache::clean_audio_cache_lru(600 * 1024 * 1024);
+            return Some(final_path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .ok()?;
-    let resp = client.get(url).send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header("User-Agent", crate::api::ytmusic::UA_SAFARI_26)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -3543,6 +3577,158 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
     std::fs::rename(&tmp, &final_path).ok()?;
     crate::cache::clean_audio_cache_lru(600 * 1024 * 1024);
     Some(final_path)
+}
+
+/// Размер одного Range-сегмента при скачивании аудио с googlevideo.com (2 МБ)
+const AUDIO_RANGE_SEGMENT_BYTES: u64 = 2 * 1024 * 1024;
+/// Таймаут одного Range-сегмента (12 секунд)
+const AUDIO_RANGE_SEGMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+/// Максимальный допустимый размер аудиофайла в кэше (64 МБ)
+const AUDIO_RANGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Извлекает полный размер ресурса из заголовка `Content-Range: bytes start-end/total`
+fn parse_content_range_total(header_val: &str) -> Option<u64> {
+    let total_str = header_val.rsplit('/').next()?.trim();
+    if total_str == "*" {
+        return None;
+    }
+    total_str.parse::<u64>().ok().filter(|&n| n > 0)
+}
+
+/// Извлекает параметр `clen=<bytes>` из query-строки URL googlevideo.com
+fn parse_clen_from_url(url: &str) -> Option<u64> {
+    let (_, query) = url.split_once('?')?;
+    for pair in query.split('&') {
+        if let Some(val) = pair.strip_prefix("clen=") {
+            if let Ok(n) = val.trim().parse::<u64>()
+                && n > 0
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Быстрая сегментированная докачка аудиопотока по `Range: bytes={start}-{end}` чанками по 2 МБ.
+/// На `googlevideo.com` (`c=VISIONOS`) поток без `Range` троттлится до ~20 КБ/с, а короткие
+/// `Range`-сегменты отдаются на полной скорости CDN.
+async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -> Option<u64> {
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .timeout(AUDIO_RANGE_SEGMENT_TIMEOUT)
+        .build()
+        .ok()?;
+
+    let mut total: Option<u64> = parse_clen_from_url(url);
+    if total.is_some_and(|t| t > AUDIO_RANGE_MAX_BYTES) {
+        return None;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(
+        total
+            .map(|t| t.min(8 * 1024 * 1024) as usize)
+            .unwrap_or(4 * 1024 * 1024),
+    );
+
+    loop {
+        let start = out.len() as u64;
+        if let Some(t) = total
+            && start >= t
+        {
+            break;
+        }
+        if start > AUDIO_RANGE_MAX_BYTES {
+            return None;
+        }
+
+        let end = match total {
+            Some(t) if t > 0 => (start + AUDIO_RANGE_SEGMENT_BYTES - 1).min(t - 1),
+            _ => start + AUDIO_RANGE_SEGMENT_BYTES - 1,
+        };
+        let requested_len = end.saturating_sub(start) + 1;
+
+        let mut segment_bytes = None;
+        let mut got_full_ok = false;
+        for _attempt in 0..2 {
+            let req = client
+                .get(url)
+                .header("User-Agent", crate::api::ytmusic::UA_SAFARI_26)
+                .header("Referer", "https://www.youtube.com/")
+                .header("Origin", "https://www.youtube.com")
+                .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+
+            let Ok(resp) = tokio::time::timeout(AUDIO_RANGE_SEGMENT_TIMEOUT, req.send()).await else {
+                continue;
+            };
+            let Ok(resp) = resp else {
+                continue;
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                continue;
+            }
+            if total.is_none() {
+                total = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_content_range_total);
+                if total.is_some_and(|t| t > AUDIO_RANGE_MAX_BYTES) {
+                    return None;
+                }
+            }
+            let Ok(bytes) = tokio::time::timeout(AUDIO_RANGE_SEGMENT_TIMEOUT, resp.bytes()).await
+            else {
+                continue;
+            };
+            let Ok(bytes) = bytes else {
+                continue;
+            };
+            if status == reqwest::StatusCode::OK {
+                got_full_ok = true;
+            }
+            segment_bytes = Some(bytes);
+            break;
+        }
+
+        let chunk = segment_bytes?;
+        if chunk.is_empty() {
+            break;
+        }
+
+        if got_full_ok {
+            // Сервер проигнорировал Range и вернул весь файл со статусом 200 OK
+            if start == 0 {
+                out.extend_from_slice(&chunk);
+            } else {
+                out = chunk.to_vec();
+            }
+            break;
+        }
+
+        out.extend_from_slice(&chunk);
+
+        if let Some(t) = total {
+            if (out.len() as u64) >= t {
+                break;
+            }
+        } else if (chunk.len() as u64) < requested_len {
+            break;
+        }
+    }
+
+    if let Some(t) = total
+        && (out.len() as u64) < t
+    {
+        return None;
+    }
+    if out.len() <= 128 * 1024 {
+        return None;
+    }
+
+    std::fs::write(tmp_path, &out).ok()?;
+    Some(out.len() as u64)
 }
 
 /// Обложка и текст песни грузятся отдельными задачами, чтобы не задерживать воспроизведение.
@@ -5228,5 +5414,166 @@ mod filter_pipeline_tests {
         let accepted = apply_filters(&yt, candidates, None, Some("favorite"), &liked, &HashSet::new(), 0).await;
         let ids: Vec<_> = accepted.into_iter().map(|t| t.id).collect();
         assert_eq!(ids, ["1"]);
+    }
+}
+
+#[cfg(test)]
+mod audio_range_download_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_audio_cache_ext_for_url() {
+        assert_eq!(
+            audio_cache_ext_for_url("https://vkuseraudio.net/s/v1/ac/index.m3u8", true, false),
+            "mka"
+        );
+        assert_eq!(
+            audio_cache_ext_for_url(
+                "https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251",
+                false,
+                true
+            ),
+            "opus"
+        );
+        assert_eq!(
+            audio_cache_ext_for_url(
+                "https://s547sas.storage.yandex.net/get-mp3/abc123/00063b963d7ca2ac/rmusic/U2FsdGVkX1/d98d66/flac-mp4?track-id=133282800",
+                false,
+                false
+            ),
+            "flac"
+        );
+        assert_eq!(
+            audio_cache_ext_for_url("https://example.com/audio/track.flac", false, false),
+            "flac"
+        );
+        assert_eq!(
+            audio_cache_ext_for_url("https://example.com/audio?type=flac", false, false),
+            "flac"
+        );
+        assert_eq!(
+            audio_cache_ext_for_url("https://example.com/audio?type=3", false, false),
+            "flac"
+        );
+        assert_eq!(
+            audio_cache_ext_for_url(
+                "https://s222vla.storage.yandex.net/get-mp3/abc123/00063b963d7c/rmusic/U2FsdGVkX1/track?track-id=35302834",
+                false,
+                false
+            ),
+            "mp3"
+        );
+    }
+
+    #[test]
+    fn test_parse_content_range_and_clen() {
+        assert_eq!(
+            parse_content_range_total("bytes 0-2097151/3845120"),
+            Some(3845120)
+        );
+        assert_eq!(
+            parse_content_range_total("bytes 2097152-3845119/3845120"),
+            Some(3845120)
+        );
+        assert_eq!(parse_content_range_total("bytes 0-1023/*"), None);
+        assert_eq!(parse_content_range_total("invalid"), None);
+
+        assert_eq!(
+            parse_clen_from_url(
+                "https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251&clen=3456789&mime=audio%2Fwebm"
+            ),
+            Some(3456789)
+        );
+        assert_eq!(
+            parse_clen_from_url("https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_audio_range_segmented_chunks_and_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        // Создаём тестовый payload размером 2.5 МБ (> 2 МБ, чтобы гарантировать 2 Range-запроса)
+        let total_size: usize = 2 * 1024 * 1024 + 512 * 1024;
+        let payload: Vec<u8> = (0..total_size).map(|i| (i % 251) as u8).collect();
+        let payload_server = payload.clone();
+        let seen_ranges = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_ranges_srv = seen_ranges.clone();
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let Ok(n) = socket.read(&mut buf).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let req_lower = req_str.to_lowercase();
+                assert!(
+                    req_lower.contains("safari/605.1.15"),
+                    "запрос должен содержать User-Agent UA_SAFARI_26: {req_str}"
+                );
+
+                let range_line = req_str
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                seen_ranges_srv.lock().unwrap().push(range_line.clone());
+
+                let (start, end) = range_line
+                    .split_once("bytes=")
+                    .and_then(|(_, r)| r.split_once('-'))
+                    .map(|(s, e)| {
+                        (
+                            s.trim().parse::<usize>().unwrap_or(0),
+                            e.trim().parse::<usize>().unwrap_or(total_size - 1),
+                        )
+                    })
+                    .unwrap_or((0, total_size - 1));
+
+                let actual_end = end.min(total_size - 1);
+                let slice = &payload_server[start..=actual_end];
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/webm\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                    slice.len(),
+                    start,
+                    actual_end,
+                    total_size
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(slice).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "volna_range_test_{}.opus.part",
+            std::process::id()
+        ));
+        let url = format!("http://{addr}/videoplayback?itag=251");
+        let downloaded = download_audio_range_segmented(&url, &tmp_path)
+            .await
+            .expect("segmented download should succeed");
+
+        assert_eq!(downloaded as usize, total_size);
+        let written = std::fs::read(&tmp_path).expect("read tmp file");
+        assert_eq!(written.len(), total_size);
+        assert_eq!(written, payload);
+
+        let ranges = seen_ranges.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 2, "ожидалось ровно 2 сегмента для 2.5 МБ");
+        assert!(ranges[0].contains("bytes=0-2097151"));
+        assert!(ranges[1].contains("bytes=2097152-"));
+
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }

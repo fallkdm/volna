@@ -25,15 +25,49 @@ pub(crate) const UA_SAFARI_26: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15
 const UA_CHROME_124: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /// Таймаут пре-флайта основной ноды GGC.
-const PROBE_TIMEOUT_PRIMARY_MS: u64 = 1200;
+const PROBE_TIMEOUT_PRIMARY_MS: u64 = 650;
 /// Таймаут пре-флайта резервной ноды: ей даём больше времени.
-const PROBE_TIMEOUT_FALLBACK_MS: u64 = 2000;
+const PROBE_TIMEOUT_FALLBACK_MS: u64 = 1000;
 
 /// Длительности треков по `videoId`: их отдаёт только `/player`, а нужны они и тексту песни,
 /// и повторным открытиям трека — держим в памяти, чтобы не дёргать сеть дважды.
 static TRACK_DURATIONS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, u64>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Кэш фоновых баннеров профилей артистов YouTube Music по `artist_name.trim().to_lowercase()`.
+/// Хранит как найденный `Some(url)`, так и `None` после успешного ответа без баннера.
+static YT_ARTIST_BANNER_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Выбирает лучший `UC...` browseId артиста из секции артистов поиска YouTube Music:
+/// 1) Точное совпадение имени (без учёта регистра);
+/// 2) Совпадение через `matches_artist_name`;
+/// 3) Первый артист с `UC...` (на случай транслитерации/локализации имени, например `Кино` / `Kino`).
+pub fn pick_matching_yt_artist_id(
+    artists: &[crate::api::models::Artist],
+    target_name: &str,
+) -> Option<String> {
+    let target_clean = target_name.trim();
+    let target_lower = target_clean.to_lowercase();
+    let uc_artists: Vec<&crate::api::models::Artist> =
+        artists.iter().filter(|a| a.id.starts_with("UC")).collect();
+
+    if let Some(exact) = uc_artists
+        .iter()
+        .find(|a| a.name.trim().to_lowercase() == target_lower)
+    {
+        return Some(exact.id.clone());
+    }
+    if let Some(matched) = uc_artists
+        .iter()
+        .find(|a| crate::api::vk::provider::matches_artist_name(&a.name, target_clean))
+    {
+        return Some(matched.id.clone());
+    }
+    uc_artists.first().map(|a| a.id.clone())
+}
 
 fn track_duration_cached(track_id: &str) -> Option<u64> {
     TRACK_DURATIONS.lock().ok()?.get(track_id).copied()
@@ -124,8 +158,15 @@ pub const ART_TRACK_BITRATE_BPS: u64 = 80_000;
 
 /// Маркеры имён заблокированных в РФ кэшей GGC (`sn-...googlevideo.com`).
 /// Сравнение по подстроке — намеренно: имя ноды может содержать префикс региона.
-const BLOCKED_GGC_NODE_MARKERS: [&str; 7] =
-    ["vo-", "238s", "hxb", "5hne", "4g5edn", "4g5e6n", "5g0z"];
+const BLOCKED_GGC_NODE_MARKERS: [&str; 11] = [
+    "vo-", "238s", "hxb", "5hne", "4g5edn", "4g5e6n", "5g0z", "gxuo", "3c2z", "n8v", "p5q",
+];
+
+/// Динамический список первичных нод GGC, которые не ответили в пределах `PROBE_TIMEOUT_PRIMARY_MS`
+/// за текущую сессию: следующие треки сразу переключаются на резервную ноду без повторного ожидания.
+static DYNAMIC_BLOCKED_GGC_NODES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
 /// Статус официального текста YouTube Music.
 ///
@@ -1051,11 +1092,12 @@ impl YtMusicClient {
             query_or_id.to_string()
         } else {
             let search_res = self.search_all(query_or_id).await?;
-            let artist_opt = search_res
+            let artist_id = search_res
                 .artists
-                .and_then(|sec| sec.results.into_iter().find(|a| a.id.starts_with("UC")));
-            match artist_opt {
-                Some(a) => a.id,
+                .as_ref()
+                .and_then(|sec| pick_matching_yt_artist_id(&sec.results, query_or_id));
+            match artist_id {
+                Some(id) => id,
                 None => {
                     return Err(
                         format!("Исполнитель «{}» не найден в YouTube Music", query_or_id).into(),
@@ -1070,12 +1112,151 @@ impl YtMusicClient {
         let json = self
             .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
             .await?;
-        parser::parse_artist_browse(&json, &browse_id)
+        let brief = parser::parse_artist_browse(&json, &browse_id)?;
+        let artist_key = brief.artist.name.trim().to_lowercase();
+        if !artist_key.is_empty() {
+            let banner = brief
+                .background_image_url
+                .as_deref()
+                .map(crate::api::models::reachable_image_url)
+                .filter(|u| u.starts_with("https://"));
+            if let Ok(mut cache) = YT_ARTIST_BANNER_CACHE.lock() {
+                cache.insert(artist_key, banner);
+            }
+        }
+        Ok(brief)
+    }
+
+    /// Ищет фоновый баннер профиля артиста в YouTube Music по имени исполнителя
+    /// (с in-memory кэшированием на время сессии).
+    pub async fn resolve_artist_banner(&self, artist_name: &str) -> Option<String> {
+        let name = artist_name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let key = name.to_lowercase();
+        if let Ok(cache) = YT_ARTIST_BANNER_CACHE.lock()
+            && let Some(cached) = cache.get(&key)
+        {
+            return cached.clone();
+        }
+
+        let search_res = self.search_all(name).await.ok()?;
+        let Some(browse_id) = search_res
+            .artists
+            .as_ref()
+            .and_then(|sec| pick_matching_yt_artist_id(&sec.results, name))
+        else {
+            if let Ok(mut cache) = YT_ARTIST_BANNER_CACHE.lock() {
+                cache.insert(key, None);
+            }
+            return None;
+        };
+
+        let body = serde_json::json!({
+            "browseId": browse_id
+        });
+        let json = self
+            .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+            .await
+            .ok()?;
+        let brief = parser::parse_artist_browse(&json, &browse_id).ok()?;
+        let banner = brief
+            .background_image_url
+            .as_deref()
+            .map(crate::api::models::reachable_image_url)
+            .filter(|u| u.starts_with("https://"));
+
+        if let Ok(mut cache) = YT_ARTIST_BANNER_CACHE.lock() {
+            cache.insert(key, banner.clone());
+            let canonical_key = brief.artist.name.trim().to_lowercase();
+            if !canonical_key.is_empty() {
+                cache.insert(canonical_key, banner.clone());
+            }
+        }
+        banner
     }
 
     /// Возвращает общее количество треков из заголовка плейлиста "Мне нравится" (например, 325)
     pub async fn get_liked_total_count(&self) -> Option<u32> {
         *self.liked_total_count.read().await
+    }
+
+    /// Быстрое получение ID первого трека из «Мне нравится» для выбора стартового сида Волны
+    /// (только первая страница, без многостраничного цикла continuation).
+    pub async fn get_first_liked_track_id(&self) -> Option<String> {
+        if self.refresh_token.read().await.is_some() {
+            if let Some(access_token) = self.get_valid_access_token().await {
+                let url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails&playlistId=LM&maxResults=5";
+                if let Ok(resp) = self
+                    .http
+                    .get(url)
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    .send()
+                    .await
+                    && resp.status().is_success()
+                    && let Ok(json) = resp.json::<serde_json::Value>().await
+                    && let Some(first_id) = json
+                        .get("items")
+                        .and_then(|items| items.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(track_from_data_api_item)
+                        .find(|t| !t.id.is_empty())
+                        .map(|t| t.id)
+                {
+                    return Some(first_id);
+                }
+            }
+            let body = serde_json::json!({ "browseId": "FEmusic_liked_videos" });
+            if let Ok(json) = self
+                .post_innertube("browse", "TVHTML5", "7.20250101.10.00", body)
+                .await
+                && let Some(first_id) = parser::parse_tv_tile_tracks(&json)
+                    .into_iter()
+                    .find(|t| !t.id.is_empty())
+                    .map(|t| t.id)
+            {
+                return Some(first_id);
+            }
+        }
+
+        if let Ok(html) = self
+            .fetch_ytmusic_html("https://music.youtube.com/playlist?list=LM")
+            .await
+        {
+            if let Some(cnt) = parser::parse_header_track_count_from_html(&html) {
+                *self.liked_total_count.write().await = Some(cnt);
+            }
+            if let Some(first_id) = parser::parse_tracks_from_html(&html)
+                .into_iter()
+                .find(|t| !t.id.is_empty())
+                .map(|t| t.id)
+            {
+                return Some(first_id);
+            }
+        }
+
+        for browse_id in &["VLLM", "VLSE", "FEmusic_liked_videos"] {
+            let body = serde_json::json!({ "browseId": browse_id });
+            if let Ok(json) = self
+                .post_innertube("browse", "WEB_REMIX", "1.20240101.01.00", body)
+                .await
+            {
+                if let Some(cnt) = parser::parse_header_track_count(&json) {
+                    *self.liked_total_count.write().await = Some(cnt);
+                }
+                if let Some(first_id) = parser::parse_liked_tracks(&json)
+                    .into_iter()
+                    .find(|t| !t.id.is_empty())
+                    .map(|t| t.id)
+                {
+                    return Some(first_id);
+                }
+            }
+        }
+
+        None
     }
 
     /// Загрузка понравившихся треков пользователя (через HTML LM или browse fallback)
@@ -1373,7 +1554,7 @@ impl YtMusicClient {
             return fallback_url.clone();
         }
 
-        // Если первичная нода не из черного списка блокировок, проверяем её доступность за 1200 мс
+        // Если первичная нода не из черного списка блокировок, проверяем её доступность за PROBE_TIMEOUT_PRIMARY_MS
         if let Some(verified) =
             check_stream_connectivity(&self.http, raw_url, user_agent, PROBE_TIMEOUT_PRIMARY_MS)
                 .await
@@ -1381,10 +1562,11 @@ impl YtMusicClient {
             return verified;
         }
 
-        // Если первичная нода зависла или не ответила вовремя, но есть fallback — немедленно переключаемся на него!
+        // Если первичная нода зависла или не ответила вовремя, но есть fallback — запоминаем её и немедленно переключаемся на резервную!
         if let Some((fallback_url, primary, fallback)) = fallback_info {
+            remember_blocked_ggc_node(&primary);
             println!(
-                "[ytmusic] Первичная нода ({primary}) не ответила вовремя. Переключаем на резервную ноду ({fallback})..."
+                "[ytmusic] Первичная нода ({primary}) не ответила вовремя (добавлена в динамический фильтр). Переключаем на резервную ноду ({fallback})..."
             );
             if let Some(verified) = check_stream_connectivity(
                 &self.http,
@@ -1608,6 +1790,9 @@ impl YtMusicClient {
         let bytes = self
             .http
             .get(&stream_url)
+            .header("User-Agent", UA_SAFARI_26)
+            .header("Referer", "https://www.youtube.com/")
+            .header("Origin", "https://www.youtube.com")
             .send()
             .await?
             .error_for_status()?
@@ -1641,6 +1826,9 @@ impl YtMusicClient {
         let bytes = self
             .http
             .get(&stream_url)
+            .header("User-Agent", UA_SAFARI_26)
+            .header("Referer", "https://www.youtube.com/")
+            .header("Origin", "https://www.youtube.com")
             .send()
             .await?
             .error_for_status()?
@@ -1958,12 +2146,30 @@ fn build_fallback_stream_url(raw_url: &str) -> Option<(String, String, String)> 
     Some((new_url, primary.to_string(), fallback.to_string()))
 }
 
+/// Запоминает не ответившую вовремя первичную ноду GGC на время сессии
+fn remember_blocked_ggc_node(node: &str) {
+    let n = node.trim().to_lowercase();
+    if !n.is_empty()
+        && let Ok(mut set) = DYNAMIC_BLOCKED_GGC_NODES.lock()
+    {
+        set.insert(n);
+    }
+}
+
 /// Проверяет, принадлежит ли нода к известным блокируемым в РФ российским кэшам GGC
+/// или уже не ответила вовремя в текущей сессии
 fn is_known_blocked_ggc_node(node: &str) -> bool {
-    let n = node.to_lowercase();
-    BLOCKED_GGC_NODE_MARKERS
+    let n = node.trim().to_lowercase();
+    if BLOCKED_GGC_NODE_MARKERS
         .iter()
         .any(|marker| n.contains(marker))
+    {
+        return true;
+    }
+    DYNAMIC_BLOCKED_GGC_NODES
+        .lock()
+        .map(|set| set.contains(&n))
+        .unwrap_or(false)
 }
 
 /// Проверяет доступность стрима и возвращает финальный рабочий URL после редиректов
@@ -2390,11 +2596,9 @@ impl MusicProvider for YtMusicClient {
             if let Some(seed) = cached {
                 seed
             } else {
-                let liked_first = match self.get_liked_tracks().await {
-                    Ok(tracks) => tracks.into_iter().find(|t| !t.id.is_empty()).map(|t| t.id),
-                    Err(_) => None,
-                };
-                liked_first.unwrap_or_else(|| "bgKxYnTEN5Y".to_string())
+                self.get_first_liked_track_id()
+                    .await
+                    .unwrap_or_else(|| "bgKxYnTEN5Y".to_string())
             }
         };
 
@@ -3008,5 +3212,67 @@ mod tests {
         let url = "https://rr.googlevideo.com/videoplayback?id=123&mn=sn-hxb54vo-238s%2Csn-oj5hn5-5g&other=xyz";
         let mn = extract_query_param(url, "mn");
         assert_eq!(mn, Some("sn-hxb54vo-238s%2Csn-oj5hn5-5g".to_string()));
+    }
+
+    #[test]
+    fn test_new_blocked_ggc_node_markers_and_dynamic_remembering() {
+        // Маркеры из живого лога (sn-gxuo03g-3c2z7s, sn-gxuo03g-3c2z7z и др.)
+        assert!(is_known_blocked_ggc_node("sn-gxuo03g-3c2z7s"));
+        assert!(is_known_blocked_ggc_node("sn-gxuo03g-3c2z7z"));
+        assert!(is_known_blocked_ggc_node("sn-n8v7kn7z"));
+        assert!(is_known_blocked_ggc_node("sn-p5qlsn76"));
+        assert!(!is_known_blocked_ggc_node("sn-u15hn5-cc"));
+
+        // Проверка динамического запоминания зависшей первичной ноды
+        let custom_node = "sn-custom-slow-primary-node-99";
+        assert!(!is_known_blocked_ggc_node(custom_node));
+        remember_blocked_ggc_node(custom_node);
+        assert!(is_known_blocked_ggc_node(custom_node));
+        assert!(is_known_blocked_ggc_node("SN-CUSTOM-SLOW-PRIMARY-NODE-99"));
+    }
+
+    #[test]
+    fn test_pick_matching_yt_artist_id_priorities() {
+        let mk = |id: &str, name: &str| crate::api::models::Artist {
+            id: id.to_string(),
+            name: name.to_string(),
+            cover: None,
+        };
+
+        // 1. Игнорирует не-UC идентификаторы и выбирает точное совпадение имени перед первым UC
+        let artists = vec![
+            mk("MPAD_NOT_UC", "Кино"),
+            mk("UC_FIRST_OTHER", "Кинофильм"),
+            mk("UC_EXACT", "  кино "),
+        ];
+        assert_eq!(
+            pick_matching_yt_artist_id(&artists, "Кино"),
+            Some("UC_EXACT".to_string())
+        );
+
+        // 2. Если точного совпадения нет, выбирает совпадение через matches_artist_name
+        let collab_artists = vec![
+            mk("UC_OTHER", "Другой Артист"),
+            mk("UC_COLLAB", "Баста & Гуф"),
+        ];
+        assert_eq!(
+            pick_matching_yt_artist_id(&collab_artists, "Гуф"),
+            Some("UC_COLLAB".to_string())
+        );
+
+        // 3. При транслитерации/локализации имени (например Кино -> Kino) берёт первый UC...
+        let translit_artists = vec![
+            mk("VLPL123", "Kino"),
+            mk("UC_KINO_TRANSLIT", "Kino"),
+            mk("UC_SECOND", "Another"),
+        ];
+        assert_eq!(
+            pick_matching_yt_artist_id(&translit_artists, "Кино"),
+            Some("UC_KINO_TRANSLIT".to_string())
+        );
+
+        // 4. Если ни одного UC... нет — возвращает None
+        let non_uc = vec![mk("MPAD123", "Кино")];
+        assert_eq!(pick_matching_yt_artist_id(&non_uc, "Кино"), None);
     }
 }
