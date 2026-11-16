@@ -89,6 +89,66 @@ fn main() {
     if args.len() > 1 && args[1] == "cmd" {
         // Простой CLI-клиент для вызова команд из терминала
         let cmd_name = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+        if cmd_name == "logs" {
+            let mut lines = 80usize;
+            let mut errors_only = false;
+            let mut current_session_only = true;
+            let mut grep: Option<String> = None;
+            for arg in args.iter().skip(3) {
+                let trimmed = arg.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(n) = trimmed.parse::<usize>() {
+                    lines = n;
+                } else if matches!(trimmed, "errors" | "err" | "--errors") {
+                    errors_only = true;
+                } else if matches!(trimmed, "all" | "--all") {
+                    current_session_only = false;
+                } else if let Some(pattern) = trimmed.strip_prefix("grep=") {
+                    if !pattern.is_empty() {
+                        grep = Some(pattern.to_string());
+                    }
+                } else if grep.is_none() {
+                    grep = Some(trimmed.to_string());
+                }
+            }
+            let snap = volna::log::read_recent_logs(
+                lines,
+                errors_only,
+                grep.as_deref(),
+                current_session_only,
+            );
+            println!(
+                "Файл лога: {} ({}, {} байт)",
+                snap.log_file,
+                if snap.file_exists {
+                    "существует"
+                } else {
+                    "не найден"
+                },
+                snap.file_size_bytes
+            );
+            if let Some(ref hdr) = snap.session_header {
+                println!("Сессия: {}", hdr);
+            }
+            println!(
+                "Показано строк: {} (прочитано: {}, errors_only={}, current_session_only={})",
+                snap.lines.len(),
+                snap.total_lines_read,
+                errors_only,
+                current_session_only
+            );
+            println!("{}", "-".repeat(72));
+            if snap.lines.is_empty() {
+                println!("(нет записей)");
+            } else {
+                for line in &snap.lines {
+                    println!("{}", line);
+                }
+            }
+            return;
+        }
         let cmd_json = match cmd_name {
             "status" | "play" | "pause" | "toggle" | "next" | "prev" | "like" | "dislike" | "mem_info" | "mem_trim" => {
                 serde_json::json!({ "cmd": cmd_name })
@@ -162,6 +222,9 @@ fn main() {
         });
         return;
     }
+
+    // Инициализируем централизованное логирование только для GUI-процесса
+    volna::log::init_gui_logging();
 
     // Создаем приложение Libadwaita
     let app = Application::builder()

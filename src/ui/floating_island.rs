@@ -1,17 +1,23 @@
 use gtk4::prelude::*;
 use gtk4::{
     gdk, Adjustment, Align, Box as GtkBox, Button, CenterBox, Image, Label, Orientation, Overflow,
-    Picture, Scale,
+    Picture, ProgressBar, Scale, Spinner, Stack,
 };
 
 use crate::player::PlayerManager;
 
+#[derive(Clone)]
 pub struct FloatingIslandWidgets {
     pub container: GtkBox,
+    pub dock_loading_bar: ProgressBar,
+    pub floating_loading_bar: ProgressBar,
     pub cover_image: Image,
     pub title_label: Label,
     pub explicit_badge: Label,
     pub artist_label: Label,
+    pub artist_stack: Stack,
+    pub loading_spinner: Spinner,
+    pub loading_status_label: Label,
     pub like_btn: Button,
     pub dislike_btn: Button,
     pub prev_btn: Button,
@@ -19,6 +25,7 @@ pub struct FloatingIslandWidgets {
     pub play_btn_icon: Image,
     pub next_btn: Button,
     pub seek_scale: Scale,
+    pub seek_stack: Stack,
     pub curr_time_label: Label,
     pub total_time_label: Label,
     pub volume_scale: Scale,
@@ -32,6 +39,20 @@ pub struct FloatingIslandWidgets {
     pub repeat_btn: Button,
     /// Цифра «1» поверх значка повтора: видна в режиме «один трек»
     pub repeat_one: Label,
+}
+
+impl FloatingIslandWidgets {
+    /// Устанавливает мини-обложку трека (масштабированную до `128px` для 56px виджета) или очищает её.
+    pub fn set_cover_path(&self, path: Option<&str>) {
+        match path {
+            Some(p) => super::collection::load_cover_file_sized(
+                &self.cover_image,
+                std::path::Path::new(p),
+                64,
+            ),
+            None => super::collection::clear_image_cover(&self.cover_image),
+        }
+    }
 }
 
 /// Обёртка с гибкой шириной: минимум — как у содержимого, натуральная ширина — `nat` px.
@@ -53,6 +74,7 @@ fn flex_width(child: &impl IsA<gtk4::Widget>, nat: i32) -> GtkBox {
 pub fn apply_player_layout(island: &FloatingIslandWidgets, layout: &str) {
     if layout == "dock" {
         island.container.add_css_class("dock-player");
+        island.container.add_css_class("is-dock-layout");
         island.container.set_valign(Align::End);
         island.container.set_halign(Align::Fill);
         island.container.set_hexpand(true);
@@ -61,6 +83,8 @@ pub fn apply_player_layout(island: &FloatingIslandWidgets, layout: &str) {
         island.container.set_margin_end(0);
     } else {
         island.container.remove_css_class("dock-player");
+        island.container.remove_css_class("is-dock-layout");
+        island.dock_loading_bar.set_visible(false);
         island.container.set_valign(Align::End);
         island.container.set_halign(Align::Center);
         island.container.set_hexpand(false);
@@ -80,6 +104,15 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     container.set_margin_start(16);
     container.set_margin_end(16);
     container.set_hexpand(false);
+
+    // Полоса прогрузки на самом верху док-режима (скрыта в floating-режиме и в покое)
+    let dock_loading_bar = ProgressBar::new();
+    dock_loading_bar.add_css_class("island-loading-bar");
+    dock_loading_bar.set_hexpand(true);
+    dock_loading_bar.set_valign(Align::Start);
+    dock_loading_bar.set_pulse_step(0.18);
+    dock_loading_bar.set_visible(false);
+    container.append(&dock_loading_bar);
 
     // CenterBox держит транспорт строго по центру острова (под кнопкой Play экрана волны).
     // Натуральная ширина боковых зон ≈ минимальной, иначе CenterBox сдвигает центр;
@@ -150,7 +183,31 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     artist_label.set_width_chars(1);
     artist_label.set_max_width_chars(1);
-    meta_box.append(&artist_label);
+
+    let artist_stack = Stack::new();
+    artist_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    artist_stack.set_transition_duration(120);
+    artist_stack.set_valign(Align::Center);
+    artist_stack.add_named(&artist_label, Some("artist"));
+
+    let loading_row = GtkBox::new(Orientation::Horizontal, 6);
+    loading_row.set_valign(Align::Center);
+    let loading_spinner = Spinner::new();
+    loading_spinner.set_size_request(12, 12);
+    loading_spinner.add_css_class("island-loading-spinner");
+    loading_spinner.set_valign(Align::Center);
+    let loading_status_label = Label::new(Some("Подключение…"));
+    loading_status_label.add_css_class("island-loading-status");
+    loading_status_label.set_xalign(0.0);
+    loading_status_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    loading_status_label.set_width_chars(1);
+    loading_status_label.set_max_width_chars(1);
+    loading_status_label.set_hexpand(true);
+    loading_row.append(&loading_spinner);
+    loading_row.append(&loading_status_label);
+    artist_stack.add_named(&loading_row, Some("loading"));
+    artist_stack.set_visible_child_name("artist");
+    meta_box.append(&artist_stack);
 
     left_box.append(&meta_box);
 
@@ -344,7 +401,24 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
     seek_scale.set_draw_value(false);
     let seek_flex = flex_width(&seek_scale, 750);
     seek_flex.set_hexpand(true);
-    progress_box.append(&seek_flex);
+
+    let floating_loading_bar = ProgressBar::new();
+    floating_loading_bar.add_css_class("island-seek-pulse");
+    floating_loading_bar.set_valign(Align::Center);
+    floating_loading_bar.set_hexpand(true);
+    floating_loading_bar.set_pulse_step(0.18);
+    let loading_bar_flex = flex_width(&floating_loading_bar, 750);
+    loading_bar_flex.set_hexpand(true);
+
+    let seek_stack = Stack::new();
+    seek_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    seek_stack.set_transition_duration(140);
+    seek_stack.set_hexpand(true);
+    seek_stack.set_valign(Align::Center);
+    seek_stack.add_named(&seek_flex, Some("seek"));
+    seek_stack.add_named(&loading_bar_flex, Some("loading"));
+    seek_stack.set_visible_child_name("seek");
+    progress_box.append(&seek_stack);
 
     let total_time_label = Label::new(Some("00:00"));
     total_time_label.add_css_class("time-label");
@@ -404,10 +478,15 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
 
     FloatingIslandWidgets {
         container,
+        dock_loading_bar,
+        floating_loading_bar,
         cover_image,
         title_label,
         explicit_badge,
         artist_label,
+        artist_stack,
+        loading_spinner,
+        loading_status_label,
         like_btn,
         dislike_btn,
         prev_btn,
@@ -415,6 +494,7 @@ pub fn create_floating_island(player: &PlayerManager) -> FloatingIslandWidgets {
         play_btn_icon,
         next_btn,
         seek_scale,
+        seek_stack,
         curr_time_label,
         total_time_label,
         volume_scale,

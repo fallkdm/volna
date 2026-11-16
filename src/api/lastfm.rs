@@ -17,17 +17,18 @@ fn strip_html(html: &str) -> String {
 /// Ищет справку об исполнителе в Last.fm; без ключа ничего не делает
 pub async fn artist_summary(name: &str) -> Option<ArtistSummary> {
     let key = super::auth::load_lastfm_key()?;
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
     let url = format!(
         "https://ws.audioscrobbler.com/2.0/?method=artist.getinfo&autocorrect=0&lang=ru&format=json&api_key={}&artist={}",
         urlencoding_encode(&key),
         urlencoding_encode(name)
     );
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = crate::shared_http_client()
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -51,18 +52,19 @@ pub async fn artist_summary(name: &str) -> Option<ArtistSummary> {
 /// Справка об альбоме из Last.fm (`wiki` у альбома часто пустой); без ключа ничего не делает
 pub async fn album_summary(title: &str, artist: &str) -> Option<ArtistSummary> {
     let key = super::auth::load_lastfm_key()?;
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
     let url = format!(
         "https://ws.audioscrobbler.com/2.0/?method=album.getinfo&autocorrect=0&lang=ru&format=json&api_key={}&artist={}&album={}",
         urlencoding_encode(&key),
         urlencoding_encode(artist),
         urlencoding_encode(title)
     );
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = crate::shared_http_client()
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }

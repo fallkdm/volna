@@ -1018,7 +1018,7 @@ impl YtMusicClient {
             }
             Err(parser::VideoStreamError::NoH264) => {
                 let (raw_url, format) = video_stream_url_ytdlp(track_id).await?;
-                let url = self.resolve_live_stream_url(&raw_url).await;
+                let url = self.resolve_live_stream_url(&raw_url).await.unwrap_or(raw_url);
                 return Ok(VideoClipResolution::MusicVideo {
                     url,
                     duration_secs,
@@ -1036,11 +1036,20 @@ impl YtMusicClient {
         }
 
         let (raw_url, format) = match selection.url {
-            Some(url) => (url, selection.format),
+            Some(url) => match self.resolve_live_stream_url(&url).await {
+                Ok(resolved) => {
+                    return Ok(VideoClipResolution::MusicVideo {
+                        url: resolved,
+                        duration_secs,
+                        format: selection.format,
+                    });
+                }
+                Err(_) => video_stream_url_ytdlp(track_id).await?,
+            },
             None => video_stream_url_ytdlp(track_id).await?,
         };
         // Любой видео-URL проходит через обход заблокированных GGC-нод
-        let url = self.resolve_live_stream_url(&raw_url).await;
+        let url = self.resolve_live_stream_url(&raw_url).await.unwrap_or(raw_url);
         Ok(VideoClipResolution::MusicVideo {
             url,
             duration_secs,
@@ -1524,81 +1533,162 @@ impl YtMusicClient {
     }
 
     /// Проверяет и при необходимости заменяет заблокированные РКН российские GGC-ноды (Google Global Cache)
-    /// на рабочую резервную ноду из параметра `mn` с проверкой доступности
-    pub async fn resolve_live_stream_url(&self, raw_url: &str) -> String {
-        let fallback_info = build_fallback_stream_url(raw_url);
-        let user_agent = UA_SAFARI_26;
+    /// на рабочую резервную ноду из параметра `mn` (с перебором `rr1..rr5` и обновлением `mvi`).
+    /// Если ни fallback-ноды, ни исходный URL не прошли проверку доступности — возвращает `Err`,
+    /// чтобы `get_stream_url` переключился на `yt-dlp`.
+    pub async fn resolve_live_stream_url(&self, raw_url: &str) -> Result<String, YtMusicError> {
+        self.resolve_live_stream_url_with_timeouts(
+            raw_url,
+            PROBE_TIMEOUT_PRIMARY_MS,
+            PROBE_TIMEOUT_FALLBACK_MS,
+        )
+        .await
+    }
 
-        if let Some((fallback_url, primary, fallback)) = &fallback_info
-            && is_known_blocked_ggc_node(primary)
-        {
+    async fn resolve_live_stream_url_with_timeouts(
+        &self,
+        raw_url: &str,
+        timeout_primary_ms: u64,
+        timeout_fallback_ms: u64,
+    ) -> Result<String, YtMusicError> {
+        let user_agent = UA_SAFARI_26;
+        let nodes = extract_mn_nodes(raw_url);
+        let primary_node = parse_url_host_and_path(raw_url).and_then(|(host, _)| {
+            nodes
+                .first()
+                .filter(|p| !p.is_empty() && host.contains(p.as_str()))
+                .cloned()
+        });
+        let (direct_candidates, rr_candidates) = build_fallback_candidates(raw_url);
+        let (direct_unblocked, direct_blocked): (Vec<_>, Vec<_>) = direct_candidates
+            .into_iter()
+            .partition(|c| !is_known_blocked_ggc_node(&c.fallback));
+        let (rr_unblocked, rr_blocked): (Vec<_>, Vec<_>) = rr_candidates
+            .into_iter()
+            .partition(|c| !is_known_blocked_ggc_node(&c.fallback));
+
+        let primary_is_blocked = primary_node
+            .as_deref()
+            .is_some_and(is_known_blocked_ggc_node);
+
+        if primary_is_blocked {
+            let primary = primary_node.as_deref().unwrap_or_default();
             println!(
-                "[ytmusic] Обнаружена заблокированная РКН нода GGC ({primary}). Переключаем поток на резервную европейскую ноду Google ({fallback})..."
+                "[ytmusic] Обнаружена заблокированная нода GGC ({primary}); пробуем fallback ({} прямых незаблок., {} rr незаблок., {} прямых заблок., {} rr заблок.)...",
+                direct_unblocked.len(),
+                rr_unblocked.len(),
+                direct_blocked.len(),
+                rr_blocked.len()
             );
+        } else {
+            // Если первичная нода не в списке блокировок — сначала проверяем сам raw_url
+            if let Some(verified) =
+                check_stream_connectivity(&self.http, raw_url, user_agent, timeout_primary_ms).await
+            {
+                println!(
+                    "[ytmusic] stream resolved: selected_host={} mode=raw",
+                    extract_host_for_log(&verified)
+                );
+                return Ok(verified);
+            }
+
+            // Первичная нода не ответила вовремя — запоминаем её и перебираем fallback-ноды + rr1..rr5
+            if let Some(ref primary) = primary_node {
+                remember_blocked_ggc_node(primary);
+                println!(
+                    "[ytmusic] Первичная нода ({primary}) не ответила вовремя — пробуем fallback ({} прямых незаблок., {} rr незаблок., {} прямых заблок., {} rr заблок.)...",
+                    direct_unblocked.len(),
+                    rr_unblocked.len(),
+                    direct_blocked.len(),
+                    rr_blocked.len()
+                );
+            }
+        }
+
+        // Приоритет: незаблокированные direct -> незаблокированные rr -> заблокированные direct -> заблокированные rr
+        for group in [
+            &direct_unblocked,
+            &rr_unblocked,
+            &direct_blocked,
+            &rr_blocked,
+        ] {
+            if let Some((verified, fb)) =
+                probe_first_reachable(&self.http, group, user_agent, timeout_fallback_ms).await
+            {
+                println!(
+                    "[ytmusic] stream resolved: selected_host={} fallback_node={} mode=fallback",
+                    extract_host_for_log(&verified),
+                    fb
+                );
+                return Ok(verified);
+            }
+        }
+
+        if primary_is_blocked {
+            // Бывает, что помеченная нода на самом деле отвечает
             if let Some(verified) = check_stream_connectivity(
                 &self.http,
-                fallback_url,
+                raw_url,
                 user_agent,
-                PROBE_TIMEOUT_FALLBACK_MS,
+                timeout_primary_ms,
             )
             .await
             {
                 println!(
-                    "[ytmusic] Резервный поток подтвержден и готов к мгновенному воспроизведению"
+                    "[ytmusic] stream resolved: selected_host={} mode=raw",
+                    extract_host_for_log(&verified)
                 );
-                return verified;
+                return Ok(verified);
             }
-            println!(
-                "[ytmusic] Резервный поток не ответил на предварительный пинг, используем fallback URL напрямую"
-            );
-            return fallback_url.clone();
+
+            let primary = primary_node.as_deref().unwrap_or_default();
+            return Err(YtMusicError::Message(format!(
+                "Ни одна GGC-нода VisionOS не ответила для primary={primary}"
+            )));
         }
 
-        // Если первичная нода не из черного списка блокировок, проверяем её доступность за PROBE_TIMEOUT_PRIMARY_MS
-        if let Some(verified) =
-            check_stream_connectivity(&self.http, raw_url, user_agent, PROBE_TIMEOUT_PRIMARY_MS)
-                .await
-        {
-            return verified;
-        }
-
-        // Если первичная нода зависла или не ответила вовремя, но есть fallback — запоминаем её и немедленно переключаемся на резервную!
-        if let Some((fallback_url, primary, fallback)) = fallback_info {
-            remember_blocked_ggc_node(&primary);
-            println!(
-                "[ytmusic] Первичная нода ({primary}) не ответила вовремя (добавлена в динамический фильтр). Переключаем на резервную ноду ({fallback})..."
-            );
-            if let Some(verified) = check_stream_connectivity(
-                &self.http,
-                &fallback_url,
-                user_agent,
-                PROBE_TIMEOUT_FALLBACK_MS,
-            )
-            .await
-            {
-                return verified;
-            }
-            return fallback_url;
-        }
-
-        raw_url.to_string()
+        Err(YtMusicError::Message(
+            "Ни raw_url, ни fallback-ноды GGC не ответили на проверку доступности".to_string(),
+        ))
     }
 
     /// Получение прямой ссылки на аудиопоток трека через VisionOS API (~100-200 мс) с автоматическим обходом блокировок GGC
+    /// и резервным переключением на `yt-dlp`, если все ноды VisionOS недоступны.
     pub async fn get_stream_url(&self, track_id: &str) -> Result<String, YtMusicError> {
         // Приоритет 1: мгновенный нативный запрос через InnerTube VisionOS API (~100-200 мс)
-        let raw_url = match self.get_stream_url_visionos(track_id).await {
-            Ok(url) => url,
+        match self.get_stream_url_visionos(track_id).await {
+            Ok(raw_url) => match self.resolve_live_stream_url(&raw_url).await {
+                Ok(resolved_url) => return Ok(resolved_url),
+                Err(e) => {
+                    eprintln!(
+                        "[ytmusic] VisionOS поток для {track_id} не прошёл проверку нод ({e}), переключаемся на yt-dlp fallback"
+                    );
+                }
+            },
             Err(e) => {
                 eprintln!(
                     "[ytmusic] VisionOS API вернул ошибку ({e}), переключаемся на резервный yt-dlp fallback"
                 );
-                get_stream_url_ytdlp_fallback(track_id).await?
             }
-        };
+        }
 
-        let resolved_url = self.resolve_live_stream_url(&raw_url).await;
-        Ok(resolved_url)
+        let ytdlp_url = get_stream_url_ytdlp_fallback(track_id).await?;
+        match self.resolve_live_stream_url(&ytdlp_url).await {
+            Ok(resolved) => {
+                println!(
+                    "[ytmusic] stream resolved: selected_host={} mode=ytdlp",
+                    extract_host_for_log(&resolved)
+                );
+                Ok(resolved)
+            }
+            Err(_) => {
+                println!(
+                    "[ytmusic] stream resolved: selected_host={} mode=ytdlp",
+                    extract_host_for_log(&ytdlp_url)
+                );
+                Ok(ytdlp_url)
+            }
+        }
     }
 
     /// Отправляет действие оценки (like/like, like/dislike, like/removelike) в YouTube Music и YouTube Video
@@ -1999,9 +2089,9 @@ impl YtMusicClient {
 
     /// Получение текста песни:
     /// 1. Дисковый кэш (если есть синхронизированный или статический текст)
-    /// 2. LRCLIB (глобальная база караоке с синхронизированными таймкодами)
-    /// 3. YouTube Music InnerTube (официальный текст)
-    /// 4. LRCLIB статический текст fallback
+    /// 2. Параллельный запрос LRCLIB и YouTube Music InnerTube (официальный текст)
+    /// 3. При наличии официального текста YTM — сверка LRCLIB с эталоном (и перепоиск при подмене)
+    /// 4. Fallback на статический текст LRCLIB или очищенный кэш
     pub async fn get_track_lyrics(&self, track: &Track) -> Option<String> {
         let cache_path = crate::cache::lyrics_cache_path(&track.id);
         let duration_secs = track.duration_ms.map(|d| d / 1000);
@@ -2011,10 +2101,15 @@ impl YtMusicClient {
         let mut stale_plain = None;
         if let Ok(cached) = std::fs::read_to_string(&cache_path) {
             let trimmed = cached.trim();
-            if crate::api::lrclib::cached_usable(trimmed, duration_secs) {
+            if crate::api::lrclib::looks_like_foreign_song(trimmed, duration_secs) {
+                println!(
+                    "[lyrics] Кэш {} отброшен: размечен под другой трек",
+                    track.id
+                );
+                let _ = std::fs::remove_file(&cache_path);
+            } else if crate::api::lrclib::cached_usable(trimmed, duration_secs) {
                 return Some(trimmed.to_string());
-            }
-            if !trimmed.is_empty() {
+            } else if !trimmed.is_empty() {
                 stale_plain = Some(crate::api::lrclib::strip_lrc_tags(trimmed));
             }
         }
@@ -2022,13 +2117,45 @@ impl YtMusicClient {
         let artist = track.artists_string();
         let title = track.title.clone();
 
-        let mut lrclib_plain = None;
+        let (lrclib_res, yt_res) = tokio::join!(
+            crate::api::lrclib::fetch_lrclib_lyrics(&self.http, &artist, &title, duration_secs),
+            self.get_yt_lyrics(&track.id),
+        );
 
-        // 1. Пробуем LRCLIB для получения синхронизированного караоке
-        if let Some(lrclib_text) =
-            crate::api::lrclib::fetch_lrclib_lyrics(&self.http, &artist, &title, duration_secs)
-                .await
+        // Если есть официальный текст YouTube Music — проверяем по нему ответ LRCLIB
+        if let Some(yt_text) = yt_res
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
         {
+            let verified_lrclib = crate::api::lrclib::verify_or_refetch_lrclib(
+                &self.http,
+                lrclib_res,
+                &artist,
+                &title,
+                duration_secs,
+                &yt_text,
+                None,
+            )
+            .await;
+
+            if let Some(lrclib_text) = verified_lrclib {
+                let trimmed = lrclib_text.trim();
+                if crate::api::lrclib::usable_synced_at(trimmed, duration_secs) {
+                    let _ = std::fs::write(&cache_path, trimmed);
+                    crate::cache::clear_negative_lyrics_marker(&track.id);
+                    return Some(trimmed.to_string());
+                }
+            }
+
+            // Официальный текст YTM приоритетнее несвежей статики `stale_plain` и перезаписывает кэш
+            let _ = std::fs::write(&cache_path, &yt_text);
+            crate::cache::clear_negative_lyrics_marker(&track.id);
+            return Some(yt_text);
+        }
+
+        // Официального текста YTM нет — прежняя логика с LRCLIB
+        let mut lrclib_plain = None;
+        if let Some(lrclib_text) = lrclib_res {
             let trimmed = lrclib_text.trim();
             if crate::api::lrclib::usable_synced_at(trimmed, duration_secs) {
                 let _ = std::fs::write(&cache_path, trimmed);
@@ -2039,21 +2166,6 @@ impl YtMusicClient {
             }
         }
 
-        // 2. Официальный текст из YouTube Music
-        if let Some(yt_lyrics) = self.get_yt_lyrics(&track.id).await {
-            let trimmed = yt_lyrics.trim();
-            if !trimmed.is_empty() {
-                // Отвергнутую разметку не затираем статикой: вдруг длительность в метаданных врёт,
-                // и в следующий раз проверка пройдёт — а заново размеченный текст уже не найти.
-                if stale_plain.is_none() {
-                    let _ = std::fs::write(&cache_path, trimmed);
-                    crate::cache::clear_negative_lyrics_marker(&track.id);
-                }
-                return Some(trimmed.to_string());
-            }
-        }
-
-        // 3. Fallback на статический текст из LRCLIB
         if let Some(plain) = lrclib_plain {
             if stale_plain.is_none() {
                 let _ = std::fs::write(&cache_path, &plain);
@@ -2062,8 +2174,8 @@ impl YtMusicClient {
             return Some(plain);
         }
 
-        // 4. Ничего лучше не нашлось — отдаём текст из отвергнутой разметки, но без таймкодов,
-        //    чтобы подсветка не уезжала от музыки
+        // Ничего лучше не нашлось — отдаём текст из отвергнутой разметки, но без таймкодов,
+        // чтобы подсветка не уезжала от музыки
         if let Some(plain) = stale_plain {
             return Some(plain);
         }
@@ -2103,15 +2215,33 @@ fn extract_visitor_id(text: &str) -> Option<String> {
     None
 }
 
-/// Извлекает хост и путь с query string из URL вида https://host/path?query
-fn parse_url_host_and_path(url: &str) -> Option<(String, String)> {
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
+/// Извлекает схему, хост и путь с query string из URL вида `http(s)://host/path?query`.
+fn parse_url_scheme_host_path(url: &str) -> Option<(&'static str, String, String)> {
+    let (scheme, without_scheme) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https://", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http://", rest)
+    } else {
+        return None;
+    };
     let slash_pos = without_scheme.find('/')?;
     let host = without_scheme[..slash_pos].to_string();
     let path = without_scheme[slash_pos..].to_string();
+    Some((scheme, host, path))
+}
+
+/// Извлекает хост и путь с query string из URL вида https://host/path?query
+fn parse_url_host_and_path(url: &str) -> Option<(String, String)> {
+    let (_, host, path) = parse_url_scheme_host_path(url)?;
     Some((host, path))
+}
+
+fn extract_host_for_log(url: &str) -> &str {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest)
 }
 
 /// Извлекает значение параметра query string по имени
@@ -2127,12 +2257,132 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
     None
 }
 
+/// Извлекает список GGC-нод из параметра `mn` (с декодированием `%2C` / `%2c`).
+fn extract_mn_nodes(raw_url: &str) -> Vec<String> {
+    let Some(mn_val) = extract_query_param(raw_url, "mn") else {
+        return Vec::new();
+    };
+    let decoded_mn = mn_val.replace("%2C", ",").replace("%2c", ",");
+    decoded_mn
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Заменяет префикс `rr<N>---` в хосте на `rr<rr_num>---`.
+fn replace_rr_prefix(host: &str, rr_num: u8) -> Option<String> {
+    let rest = host.strip_prefix("rr")?;
+    let dash_pos = rest.find("---")?;
+    let digits = &rest[..dash_pos];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("rr{rr_num}---{}", &rest[dash_pos + 3..]))
+}
+
+/// Обновляет query-параметр `mvi=<idx>`, если он присутствует в пути.
+fn replace_mvi_param(path: &str, mvi_idx: usize) -> String {
+    let Some(q_pos) = path.find('?') else {
+        return path.to_string();
+    };
+    let base = &path[..q_pos];
+    let query = &path[q_pos + 1..];
+    let mut changed = false;
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            if let Some(rest) = pair.strip_prefix("mvi=")
+                && !rest.is_empty()
+            {
+                changed = true;
+                format!("mvi={mvi_idx}")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+    if changed {
+        format!("{base}?{}", pairs.join("&"))
+    } else {
+        path.to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FallbackCandidate {
+    url: String,
+    primary: String,
+    fallback: String,
+}
+
+/// Формирует кандидаты обхода GGC в две очереди:
+/// 1) Прямые замены `primary` на каждую из fallback-нод из `mn[1..]` (незаблокированные первыми);
+/// 2) Варианты с подбором префикса `rr1---..rr5---` и обновлением `mvi` (если прямой префикс `rrN` не существует на новой ноде).
+fn build_fallback_candidates(raw_url: &str) -> (Vec<FallbackCandidate>, Vec<FallbackCandidate>) {
+    let Some((scheme, host, path)) = parse_url_scheme_host_path(raw_url) else {
+        return (Vec::new(), Vec::new());
+    };
+    let nodes = extract_mn_nodes(raw_url);
+    if nodes.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+    let primary = &nodes[0];
+    if primary.is_empty() || !host.contains(primary.as_str()) {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut fallback_entries: Vec<(usize, &str, bool)> = Vec::new();
+    let mut seen_nodes = std::collections::HashSet::new();
+    seen_nodes.insert(primary.as_str());
+    for (idx, node) in nodes.iter().enumerate().skip(1) {
+        if !node.is_empty() && seen_nodes.insert(node.as_str()) {
+            fallback_entries.push((idx, node.as_str(), is_known_blocked_ggc_node(node)));
+        }
+    }
+    // Сначала пробуем ноды, не значащиеся в списке блокировок
+    fallback_entries.sort_by_key(|&(_, _, blocked)| blocked);
+
+    let mut seen_urls = std::collections::HashSet::new();
+    seen_urls.insert(raw_url.to_string());
+
+    let mut direct = Vec::new();
+    let mut rr_variants = Vec::new();
+
+    for &(mn_idx, fb_node, _) in &fallback_entries {
+        let new_host = host.replace(primary.as_str(), fb_node);
+        let direct_url = format!("{scheme}{new_host}{path}");
+        if seen_urls.insert(direct_url.clone()) {
+            direct.push(FallbackCandidate {
+                url: direct_url,
+                primary: primary.clone(),
+                fallback: fb_node.to_string(),
+            });
+        }
+
+        let updated_path = replace_mvi_param(&path, mn_idx);
+        for rr_num in 1u8..=5 {
+            if let Some(rr_host) = replace_rr_prefix(&new_host, rr_num) {
+                let candidate_url = format!("{scheme}{rr_host}{updated_path}");
+                if seen_urls.insert(candidate_url.clone()) {
+                    rr_variants.push(FallbackCandidate {
+                        url: candidate_url,
+                        primary: primary.clone(),
+                        fallback: fb_node.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    (direct, rr_variants)
+}
+
 /// Формирует fallback URL, заменяя в хосте primary ноду на fallback ноду из параметра mn
+#[cfg(test)]
 fn build_fallback_stream_url(raw_url: &str) -> Option<(String, String, String)> {
-    let (host, path) = parse_url_host_and_path(raw_url)?;
-    let mn_val = extract_query_param(raw_url, "mn")?;
-    let decoded_mn = mn_val.replace("%2C", ",");
-    let nodes: Vec<&str> = decoded_mn.split(',').collect();
+    let (scheme, host, path) = parse_url_scheme_host_path(raw_url)?;
+    let nodes = extract_mn_nodes(raw_url);
     if nodes.len() < 2 {
         return None;
     }
@@ -2142,8 +2392,81 @@ fn build_fallback_stream_url(raw_url: &str) -> Option<(String, String, String)> 
         return None;
     }
     let new_host = host.replace(primary, fallback);
-    let new_url = format!("https://{new_host}{path}");
+    let new_url = format!("{scheme}{new_host}{path}");
     Some((new_url, primary.to_string(), fallback.to_string()))
+}
+
+async fn probe_first_reachable(
+    http: &reqwest::Client,
+    candidates: &[FallbackCandidate],
+    user_agent: &str,
+    timeout_ms: u64,
+) -> Option<(String, String)> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut probes = FuturesUnordered::new();
+    for cand in candidates {
+        let client = http.clone();
+        let url = cand.url.clone();
+        let fb = cand.fallback.clone();
+        let ua = user_agent.to_string();
+        probes.push(async move {
+            check_stream_connectivity(&client, &url, &ua, timeout_ms)
+                .await
+                .map(|verified| (verified, fb))
+        });
+    }
+    while let Some(res) = probes.next().await {
+        if let Some(hit) = res {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// Извлекает активную ноду GGC из хоста URL (по совпадению со списком `mn` или по сегменту
+/// `sn-...` после `---` перед `.googlevideo.com`) и помечает её как заблокированную на время сессии.
+pub fn remember_blocked_ggc_node_for_url(url: &str) {
+    let Some(after_scheme) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return;
+    };
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = if host_port.starts_with('[') {
+        host_port
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    }
+    .to_ascii_lowercase();
+    if host.is_empty() {
+        return;
+    }
+
+    if let Some(matched) = extract_mn_nodes(url)
+        .into_iter()
+        .filter(|node| !node.is_empty() && host.contains(&node.to_ascii_lowercase()))
+        .max_by_key(|node| node.len())
+    {
+        remember_blocked_ggc_node(&matched);
+        return;
+    }
+
+    if let Some(before_gv) = host.strip_suffix(".googlevideo.com") {
+        let segment = before_gv
+            .rsplit_once("---")
+            .map(|(_, after)| after)
+            .unwrap_or(before_gv);
+        if segment.starts_with("sn-") {
+            remember_blocked_ggc_node(segment);
+        }
+    }
 }
 
 /// Запоминает не ответившую вовремя первичную ноду GGC на время сессии
@@ -2360,28 +2683,58 @@ fn parse_yt_dimension(value: Option<&str>) -> Option<u32> {
         .and_then(|v| v.parse().ok())
 }
 
-/// Ищет `yt-dlp`: сначала явный путь из `VOLNA_YTDLP`, затем `PATH`.
+/// Ищет `yt-dlp`: сначала явный путь из `VOLNA_YTDLP`, затем `PATH`,
+/// а затем стандартные пользовательские и системные пути.
 ///
 /// Явный путь нужен упаковкам (Flatpak/AppImage), где бинарь лежит рядом с
 /// приложением и в `PATH` не попадает.
+/// Стандартные пути нужны при запуске из GUI / systemd, где в `PATH` может
+/// отсутствовать `~/.local/bin`.
 fn resolve_yt_dlp() -> String {
-    if let Some(explicit) = std::env::var_os("VOLNA_YTDLP")
+    resolve_yt_dlp_with(
+        std::env::var_os("VOLNA_YTDLP"),
+        std::env::var_os("PATH"),
+        dirs::home_dir(),
+    )
+}
+
+fn resolve_yt_dlp_with(
+    explicit_var: Option<std::ffi::OsString>,
+    path_var: Option<std::ffi::OsString>,
+    home_dir: Option<std::path::PathBuf>,
+) -> String {
+    if let Some(explicit) = explicit_var
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_file())
     {
         return explicit.to_string_lossy().into_owned();
     }
 
-    let from_path = std::env::var_os("PATH").and_then(|paths| {
+    let from_path = path_var.and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join("yt-dlp"))
             .find(|candidate| candidate.is_file())
     });
 
-    match from_path {
-        Some(path) => path.to_string_lossy().into_owned(),
-        None => "yt-dlp".to_string(),
+    if let Some(path) = from_path {
+        return path.to_string_lossy().into_owned();
     }
+
+    let mut standard_candidates = Vec::new();
+    if let Some(ref home) = home_dir {
+        standard_candidates.push(home.join(".local/bin/yt-dlp"));
+        standard_candidates.push(home.join(".cargo/bin/yt-dlp"));
+        standard_candidates.push(home.join("bin/yt-dlp"));
+    }
+    standard_candidates.push(std::path::PathBuf::from("/usr/local/bin/yt-dlp"));
+    standard_candidates.push(std::path::PathBuf::from("/usr/bin/yt-dlp"));
+    standard_candidates.push(std::path::PathBuf::from("/bin/yt-dlp"));
+
+    if let Some(path) = standard_candidates.into_iter().find(|p| p.is_file()) {
+        return path.to_string_lossy().into_owned();
+    }
+
+    "yt-dlp".to_string()
 }
 
 async fn get_stream_url_ytdlp_fallback(track_id: &str) -> Result<String, YtMusicError> {
@@ -2832,6 +3185,41 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_yt_dlp_standard_user_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("volna_ytdlp_test_{}", std::process::id()));
+        let local_bin = temp_dir.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let fake_local = local_bin.join("yt-dlp");
+        std::fs::write(&fake_local, "#!/bin/sh\nexit 0\n").unwrap();
+
+        // 1. При пустом PATH и отсутствии VOLNA_YTDLP должен находить ~/.local/bin/yt-dlp
+        let resolved = resolve_yt_dlp_with(None, Some("".into()), Some(temp_dir.clone()));
+        assert_eq!(resolved, fake_local.to_string_lossy());
+
+        // 2. Проверяем ~/.cargo/bin/yt-dlp
+        let _ = std::fs::remove_file(&fake_local);
+        let cargo_bin = temp_dir.join(".cargo/bin");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        let fake_cargo = cargo_bin.join("yt-dlp");
+        std::fs::write(&fake_cargo, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let resolved = resolve_yt_dlp_with(None, Some("".into()), Some(temp_dir.clone()));
+        assert_eq!(resolved, fake_cargo.to_string_lossy());
+
+        // 3. Проверяем ~/bin/yt-dlp
+        let _ = std::fs::remove_file(&fake_cargo);
+        let home_bin = temp_dir.join("bin");
+        std::fs::create_dir_all(&home_bin).unwrap();
+        let fake_home = home_bin.join("yt-dlp");
+        std::fs::write(&fake_home, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let resolved = resolve_yt_dlp_with(None, Some("".into()), Some(temp_dir.clone()));
+        assert_eq!(resolved, fake_home.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_extract_visitor_id() {
         let sample_cgs = r#")]}'\n[["yt.sw.adr",null,[[["ru","RU",null,"1.1.1.1",null,null,null,null,null,null,null,"Robot","Bot","CgsSampleVisitorIdLongEnoughToPassTheFiftyCharactersMinimumValidationCheck1234567890%3D"]]]"#;
         let extracted_cgs = extract_visitor_id(sample_cgs);
@@ -3274,5 +3662,186 @@ mod tests {
         // 4. Если ни одного UC... нет — возвращает None
         let non_uc = vec![mk("MPAD123", "Кино")];
         assert_eq!(pick_matching_yt_artist_id(&non_uc, "Кино"), None);
+    }
+
+    #[test]
+    fn test_fallback_candidates_rr_prefix_and_mvi() {
+        let raw_url = "https://rr6---sn-gvnuxaxjvh-axq6.googlevideo.com/videoplayback?expire=1793497812&mvi=0&mn=sn-gvnuxaxjvh-axq6%2Csn-5hne6nsy%2Csn-u15hn5-cc&itag=251";
+        let (direct, rr_variants) = build_fallback_candidates(raw_url);
+
+        // Незаблокированная нода sn-u15hn5-cc (индекс 2) должна идти в direct раньше помеченной sn-5hne6nsy (индекс 1)
+        assert_eq!(direct.len(), 2);
+        assert_eq!(direct[0].fallback, "sn-u15hn5-cc");
+        assert!(direct[0].url.starts_with("https://rr6---sn-u15hn5-cc.googlevideo.com/"));
+        assert_eq!(direct[1].fallback, "sn-5hne6nsy");
+        assert!(direct[1].url.starts_with("https://rr6---sn-5hne6nsy.googlevideo.com/"));
+
+        // В rr_variants присутствуют rr1..rr5 для обеих нод с обновленным mvi
+        assert!(rr_variants.iter().any(|c| {
+            c.url.starts_with("https://rr2---sn-5hne6nsy.googlevideo.com/")
+                && c.url.contains("mvi=1")
+        }));
+        assert!(rr_variants.iter().any(|c| {
+            c.url.starts_with("https://rr1---sn-u15hn5-cc.googlevideo.com/")
+                && c.url.contains("mvi=2")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_live_stream_url_returns_err_when_all_unreachable() {
+        let client = YtMusicClient::new();
+        // Локально заведомо закрытый порт (127.0.0.1:1) — оба (raw и fallback) не ответят
+        let dead = "http://127.0.0.1:1/videoplayback?mn=127.0.0.1:1,127.0.0.1:2&itag=251";
+        let res = client
+            .resolve_live_stream_url_with_timeouts(dead, 150, 150)
+            .await;
+        assert!(res.is_err(), "мертвый URL не должен возвращаться как Ok");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_live_stream_url_picks_working_fallback_or_raw() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_task = tokio::spawn(async move {
+            for _ in 0..4 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 512];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                }
+            }
+        });
+
+        let client = YtMusicClient::new();
+        // Случай 1: primary заблокирован ("sn-hxb54vo-238s"), fallback на наш локальный порт не совпадает по host.replace
+        // Проверим прямое совпадение с raw_url, когда fallback недоступен, а raw_url отвечает 200 OK
+        let raw_live = format!(
+            "http://127.0.0.1:{port}/videoplayback?mn=sn-hxb54vo-238s,dead-node.invalid&id=1"
+        );
+        // Здесь host.contains(primary) == false, поэтому проверяется raw_url и возвращается Ok
+        let ok_raw = client
+            .resolve_live_stream_url_with_timeouts(&raw_live, 500, 500)
+            .await
+            .expect("рабочий raw_url должен возвращаться");
+        assert!(ok_raw.contains(&format!("127.0.0.1:{port}")));
+
+        // Случай 2: primary — заблокированная нода из хоста, fallback — рабочий 127.0.0.1:{port}
+        let blocked_host_url = format!(
+            "http://sn-hxb54vo-238s:{port}/videoplayback?mn=sn-hxb54vo-238s,127.0.0.1&itag=251"
+        );
+        let ok_fb = client
+            .resolve_live_stream_url_with_timeouts(&blocked_host_url, 500, 500)
+            .await
+            .expect("должен выбрать рабочий fallback");
+        assert!(ok_fb.starts_with(&format!("http://127.0.0.1:{port}/videoplayback")));
+
+        server_task.abort();
+    }
+
+    #[test]
+    fn test_remember_blocked_ggc_node_for_url() {
+        // Извлечение активной ноды из хоста по совпадению с параметром mn
+        let node_from_mn = "sn-test-remember-mn-01";
+        let other_mn = "sn-test-remember-mn-other";
+        assert!(!is_known_blocked_ggc_node(node_from_mn));
+        assert!(!is_known_blocked_ggc_node(other_mn));
+
+        let url_with_mn = format!(
+            "https://rr5---{node_from_mn}.googlevideo.com/videoplayback?mn={other_mn}%2C{node_from_mn}&itag=251"
+        );
+        remember_blocked_ggc_node_for_url(&url_with_mn);
+        assert!(is_known_blocked_ggc_node(node_from_mn));
+        assert!(!is_known_blocked_ggc_node(other_mn));
+
+        // Извлечение сегмента sn-... после --- перед .googlevideo.com без параметра mn (редирект)
+        let node_no_mn = "sn-test-remember-host-02";
+        assert!(!is_known_blocked_ggc_node(node_no_mn));
+        let url_no_mn = format!(
+            "https://rr2---{node_no_mn}.googlevideo.com/videoplayback?expire=1793497812&itag=251"
+        );
+        remember_blocked_ggc_node_for_url(&url_no_mn);
+        assert!(is_known_blocked_ggc_node(node_no_mn));
+
+        // redirector.googlevideo.com без sn-... не должен помечаться как заблокированная нода
+        remember_blocked_ggc_node_for_url("https://redirector.googlevideo.com/videoplayback?id=1");
+        assert!(!is_known_blocked_ggc_node("redirector"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_live_stream_url_prioritizes_unblocked_over_blocked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen_hosts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_hosts_srv = seen_hosts.clone();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..8 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if let Some(host_line) = req
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                    {
+                        seen_hosts_srv
+                            .lock()
+                            .unwrap()
+                            .push(host_line.trim().to_string());
+                    }
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                }
+            }
+        });
+
+        let blocked_node = "127.0.0.42";
+        let unblocked_node = "127.0.0.43";
+        remember_blocked_ggc_node(blocked_node);
+
+        let client = YtMusicClient::new();
+        // Обе fallback-ноды отвечают 200 OK на одном и том же порту, но blocked_node указана первой в mn.
+        // Резолвер должен сначала опробовать только незаблокированную 127.0.0.43.
+        let url_with_unblocked = format!(
+            "http://sn-hxb54vo-238s:{port}/videoplayback?mn=sn-hxb54vo-238s,{blocked_node},{unblocked_node}&itag=251"
+        );
+        let chosen = client
+            .resolve_live_stream_url_with_timeouts(&url_with_unblocked, 500, 500)
+            .await
+            .expect("должен выбрать незаблокированную ноду");
+        assert!(
+            chosen.starts_with(&format!("http://{unblocked_node}:{port}/videoplayback")),
+            "ожидалась незаблокированная нода {unblocked_node}, получено: {chosen}"
+        );
+
+        let recorded = seen_hosts.lock().unwrap().clone();
+        assert!(
+            recorded.iter().all(|h| !h.contains(blocked_node)),
+            "заблокированная нода {blocked_node} не должна опрашиваться при наличии живой незаблокированной, запросы: {recorded:?}"
+        );
+
+        // Если все незаблокированные недоступны — откатывается на заблокированную ноду
+        let url_only_blocked_alive = format!(
+            "http://sn-hxb54vo-238s:{port}/videoplayback?mn=sn-hxb54vo-238s,dead-unblocked-node.invalid,{blocked_node}&itag=251"
+        );
+        let fallback_chosen = client
+            .resolve_live_stream_url_with_timeouts(&url_only_blocked_alive, 250, 250)
+            .await
+            .expect("при отказе всех незаблокированных должен откатиться на blocked fallback");
+        assert!(
+            fallback_chosen.starts_with(&format!("http://{blocked_node}:{port}/videoplayback")),
+            "ожидался fallback на {blocked_node}, получено: {fallback_chosen}"
+        );
+
+        server_task.abort();
     }
 }

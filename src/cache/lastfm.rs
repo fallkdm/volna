@@ -4,13 +4,7 @@ use std::sync::{LazyLock, RwLock};
 static LISTENERS_CACHE: LazyLock<RwLock<HashMap<String, u64>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .user_agent("Volna/0.1 (unofficial Yandex Music client; GPL-3.0)")
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default()
-});
+const USER_AGENT: &str = "Volna/0.1 (unofficial Yandex Music client; GPL-3.0)";
 
 /// Получение количества слушателей артиста на Last.fm.
 /// Сначала проверяет in-memory кэш, затем запрашивает Last.fm (если есть ключ).
@@ -38,7 +32,13 @@ pub async fn get_artist_listeners(
             crate::api::client::urlencoding_encode(&api_key),
             crate::api::client::urlencoding_encode(name_trimmed)
         );
-        if let Ok(resp) = HTTP_CLIENT.get(&url).send().await {
+        if let Ok(resp) = crate::shared_http_client()
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
             if resp.status().is_success() {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
                     if let Some(listeners_str) = json["artist"]["stats"]["listeners"].as_str() {

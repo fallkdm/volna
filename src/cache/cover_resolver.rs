@@ -7,13 +7,14 @@ static COVER_CACHE: LazyLock<RwLock<HashMap<String, Option<String>>>> =
 static ARTIST_CACHE: LazyLock<RwLock<HashMap<String, Option<String>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+const COVER_RESOLVER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+fn cover_get(url: &str) -> reqwest::RequestBuilder {
+    crate::shared_http_client()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, COVER_RESOLVER_UA)
         .timeout(std::time::Duration::from_millis(3500))
-        .build()
-        .unwrap_or_default()
-});
+}
 
 /// Очистка названия трека от мусора YouTube: `(Official Video)`, `[Live]`, `(Audio)` и т.д.
 pub fn clean_title_for_search(title: &str) -> String {
@@ -85,11 +86,7 @@ async fn resolve_from_apis(query: &str) -> Option<String> {
 async fn search_deezer(query: &str) -> Option<String> {
     let escaped = glib::Uri::escape_string(query, None, true);
     let url = format!("https://api.deezer.com/search?q={}&limit=1", escaped);
-    let resp = HTTP_CLIENT
-        .get(&url)
-        .send()
-        .await
-        .ok()?;
+    let resp = cover_get(&url).send().await.ok()?;
 
     if !resp.status().is_success() {
         return None;
@@ -110,11 +107,7 @@ async fn search_deezer(query: &str) -> Option<String> {
 async fn search_itunes(query: &str) -> Option<String> {
     let escaped = glib::Uri::escape_string(query, None, true);
     let url = format!("https://itunes.apple.com/search?term={}&entity=song&limit=1", escaped);
-    let resp = HTTP_CLIENT
-        .get(&url)
-        .send()
-        .await
-        .ok()?;
+    let resp = cover_get(&url).send().await.ok()?;
 
     if !resp.status().is_success() {
         return None;
@@ -173,7 +166,7 @@ async fn resolve_artist_from_apis(artist_name: &str) -> Option<String> {
 async fn search_deezer_artist(artist_name: &str) -> Option<String> {
     let escaped = glib::Uri::escape_string(artist_name, None, true);
     let url = format!("https://api.deezer.com/search/artist?q={}&limit=1", escaped);
-    let resp = HTTP_CLIENT.get(&url).send().await.ok()?;
+    let resp = cover_get(&url).send().await.ok()?;
 
     if !resp.status().is_success() {
         return None;
@@ -194,7 +187,7 @@ async fn search_deezer_artist(artist_name: &str) -> Option<String> {
 async fn search_itunes_artist(artist_name: &str) -> Option<String> {
     let escaped = glib::Uri::escape_string(artist_name, None, true);
     let url = format!("https://itunes.apple.com/search?term={}&entity=musicArtist&limit=1", escaped);
-    let resp = HTTP_CLIENT.get(&url).send().await.ok()?;
+    let resp = cover_get(&url).send().await.ok()?;
 
     if !resp.status().is_success() {
         return None;
@@ -208,7 +201,7 @@ async fn search_itunes_artist(artist_name: &str) -> Option<String> {
     }
 
     if let Some(link) = first.get("artistLinkUrl").and_then(|v| v.as_str()) {
-        if let Ok(html_resp) = HTTP_CLIENT.get(link).send().await {
+        if let Ok(html_resp) = cover_get(link).send().await {
             if html_resp.status().is_success() {
                 if let Ok(html) = html_resp.text().await {
                     if let Some(og_image) = extract_meta_og_image(&html) {

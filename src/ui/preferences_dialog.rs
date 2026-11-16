@@ -430,7 +430,7 @@ pub fn show_preferences_dialog(
     let memory_group = PreferencesGroup::new();
     memory_group.set_title("Память");
     memory_group.set_description(Some(
-        "Кэш текстур обложек ограничен 16 МБ: старые картинки вытесняются автоматически",
+        "Кэш миниатюр обложек ограничен 16 МБ; общий объём процесса включает библиотеки GTK/Vulkan/GStreamer, аудиобуферы и открытые списки",
     ));
     let rss_row = ActionRow::builder()
         .title("Оперативная память")
@@ -459,11 +459,23 @@ pub fn show_preferences_dialog(
     );
     {
         let p = player.clone();
+        let covers_row_ref = covers_row.clone();
+        let rss_row_ref = rss_row.clone();
         clear_row.connect_activated(move |row| {
             let freed_disk = clear_covers_cache() + clear_clips_cache();
             let freed_mem = crate::ui::collection::clear_cover_memory_cache();
             crate::trim_allocator();
             row.set_subtitle("Обложки и клипы на диске: 0.0 МБ");
+            let (usage, budget) = crate::ui::collection::cover_cache_usage();
+            covers_row_ref.set_subtitle(&format!(
+                "{} из {} — старые вытесняются автоматически",
+                size_text(usage as u64),
+                size_text(budget as u64)
+            ));
+            rss_row_ref.set_subtitle(&match process_rss_bytes() {
+                Some(bytes) => format!("Сейчас используется: {}", size_text(bytes)),
+                None => "Недоступно".to_string(),
+            });
             p.emit(crate::player::PlayerUiEvent::StatusMessage(format!(
                 "Освобождено {} на диске и {} в памяти",
                 size_text(freed_disk),
@@ -714,8 +726,8 @@ pub fn show_ytmusic_auth_dialog(
             let status = status.clone();
             let on_success = on_success.clone();
             gtk4::glib::spawn_future_local(async move {
-                let http = reqwest::Client::new();
-                let code = match crate::api::ytmusic::request_device_code(&http).await {
+                let http = crate::shared_http_client();
+                let code = match crate::api::ytmusic::request_device_code(http).await {
                     Ok(code) => code,
                     Err(e) => {
                         status.set_text(&format!("Не удалось получить код: {e}"));
@@ -736,7 +748,7 @@ pub fn show_ytmusic_auth_dialog(
                 let interval = code.interval.max(5);
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                    match crate::api::ytmusic::poll_device_token(&http, &code.device_code).await {
+                    match crate::api::ytmusic::poll_device_token(http, &code.device_code).await {
                         Ok(Some(token)) => {
                             let Some(refresh) = token.refresh_token.clone() else {
                                 status.set_text("Google не выдал refresh-токен, попробуйте ещё раз");

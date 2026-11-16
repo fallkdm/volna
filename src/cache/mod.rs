@@ -83,12 +83,12 @@ pub async fn fetch_cover_cached(url: &str) -> Option<PathBuf> {
         return Some(path);
     }
 
-    let client = reqwest::Client::builder()
+    let resp = crate::shared_http_client()
+        .get(url)
         .timeout(std::time::Duration::from_secs(10))
-        .build()
+        .send()
+        .await
         .ok()?;
-
-    let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -137,8 +137,12 @@ pub async fn fetch_clip_cached(url: &str) -> Option<PathBuf> {
     if path.exists() {
         return Some(path);
     }
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().ok()?;
-    let resp = client.get(url).send().await.ok()?;
+    let resp = crate::shared_http_client()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() || resp.content_length().is_some_and(|n| n > 30_000_000) {
         return None;
     }

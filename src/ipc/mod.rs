@@ -139,6 +139,7 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
                 "current_track": current_track,
                 "queue_len": state.queue.len(),
                 "current_index": state.current_index,
+                "log_file": crate::log::log_file_path().display().to_string(),
             })
         }
         "play" => {
@@ -322,6 +323,36 @@ pub async fn handle_command(player: &PlayerManager, cmd_json: &serde_json::Value
                 "after": after,
             })
         }
+        "logs" => {
+            let lines = cmd_json
+                .get("lines")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.min(5000) as usize)
+                .unwrap_or(80);
+            let errors_only = cmd_json
+                .get("errors_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let grep = cmd_json
+                .get("grep")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let current_session_only = cmd_json
+                .get("current_session_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let snap = crate::log::read_recent_logs(lines, errors_only, grep, current_session_only);
+            serde_json::json!({
+                "ok": true,
+                "log_file": snap.log_file,
+                "file_exists": snap.file_exists,
+                "file_size_bytes": snap.file_size_bytes,
+                "total_lines_read": snap.total_lines_read,
+                "session_header": snap.session_header,
+                "lines": snap.lines,
+            })
+        }
         _ => serde_json::json!({ "ok": false, "error": "unknown command" }),
 
     }
@@ -380,6 +411,25 @@ mod tests {
         };
         assert_eq!(resp["queue_len"], expected_queue_len);
         assert_eq!(resp["current_index"], expected_index);
+        assert_eq!(
+            resp["log_file"].as_str(),
+            Some(crate::log::log_file_path().display().to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipc_logs_command() {
+        let Some(player) = setup_test_player() else { return; };
+        let cmd = serde_json::json!({
+            "cmd": "logs",
+            "lines": 10,
+            "errors_only": true,
+            "current_session_only": true
+        });
+        let resp = handle_command(&player, &cmd).await;
+        assert_eq!(resp["ok"], true);
+        assert!(resp.get("log_file").and_then(|v| v.as_str()).is_some());
+        assert!(resp.get("lines").and_then(|v| v.as_array()).is_some());
     }
 
     #[tokio::test]

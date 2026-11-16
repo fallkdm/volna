@@ -1,5 +1,6 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
@@ -20,6 +21,7 @@ pub struct LibraryViewWidgets {
 
 const TILE_SIZE: i32 = 160;
 const LIKED_PREVIEW: usize = 6;
+const LIBRARY_REFRESH_TTL: Duration = Duration::from_secs(300);
 
 pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     let container = GtkBox::new(Orientation::Vertical, 0);
@@ -38,10 +40,19 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
     page.set_nav(&stack);
 
     let main = GtkBox::new(Orientation::Vertical, 26);
+    let header_row = GtkBox::new(Orientation::Horizontal, 8);
     let heading = Label::new(Some("Коллекция"));
     heading.set_halign(Align::Start);
+    heading.set_hexpand(true);
     heading.add_css_class("detail-title");
-    main.append(&heading);
+    let refresh_btn = Button::from_icon_name("view-refresh-symbolic");
+    refresh_btn.add_css_class("flat");
+    refresh_btn.add_css_class("circular");
+    refresh_btn.set_valign(Align::Center);
+    refresh_btn.set_tooltip_text(Some("Обновить медиатеку"));
+    header_row.append(&heading);
+    header_row.append(&refresh_btn);
+    main.append(&header_row);
 
     let status = Label::new(None);
     status.set_halign(Align::Start);
@@ -164,21 +175,61 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
         })
     };
 
-    let reload_library: Rc<dyn Fn()> = {
-        let (p, stack, page, status, yt_login_btn) = (player.clone(), stack.clone(), page.clone(), status.clone(), yt_login_btn.clone());
+    let dirty = Rc::new(Cell::new(true));
+    let last_loaded: Rc<RefCell<Option<Instant>>> = Rc::default();
+    let reload_in_flight = Rc::new(Cell::new(false));
+    let reload_gen = Rc::new(Cell::new(0u64));
+    let pending_reason: Rc<Cell<Option<&'static str>>> = Rc::new(Cell::new(None));
+
+    let reload_library: Rc<dyn Fn(&'static str)> = {
+        let (p, stack, page, status, yt_login_btn, refresh_btn) = (
+            player.clone(),
+            stack.clone(),
+            page.clone(),
+            status.clone(),
+            yt_login_btn.clone(),
+            refresh_btn.clone(),
+        );
         let (liked_box, liked_count, liked_empty_msg, liked_list, liked_all, liked_tracks, liked_total) =
             (liked_box.clone(), liked_count.clone(), liked_empty_msg.clone(), liked_list.clone(), liked_all.clone(), liked_tracks.clone(), liked_total.clone());
         let (playlists_box, playlists_row) = (playlists_box.clone(), playlists_row.clone());
         let (albums_box, albums_row) = (albums_box.clone(), albums_row.clone());
         let (offline_box, offline_list) = (offline_box.clone(), offline_list.clone());
+        let (dirty, last_loaded, reload_in_flight, reload_gen, pending_reason) = (
+            dirty.clone(),
+            last_loaded.clone(),
+            reload_in_flight.clone(),
+            reload_gen.clone(),
+            pending_reason.clone(),
+        );
 
-        Rc::new(move || {
-            let (p, stack, page, status, yt_login_btn) = (p.clone(), stack.clone(), page.clone(), status.clone(), yt_login_btn.clone());
+        Rc::new(move |reason: &'static str| {
+            pending_reason.set(None);
+            eprintln!("[ui] library reload: reason={}", reason);
+            let my_gen = reload_gen.get().wrapping_add(1);
+            reload_gen.set(my_gen);
+            reload_in_flight.set(true);
+            refresh_btn.set_sensitive(false);
+
+            let (p, stack, page, status, yt_login_btn, refresh_btn) = (
+                p.clone(),
+                stack.clone(),
+                page.clone(),
+                status.clone(),
+                yt_login_btn.clone(),
+                refresh_btn.clone(),
+            );
             let (liked_box, liked_count, liked_empty_msg, liked_list, liked_all, liked_tracks, liked_total) =
                 (liked_box.clone(), liked_count.clone(), liked_empty_msg.clone(), liked_list.clone(), liked_all.clone(), liked_tracks.clone(), liked_total.clone());
             let (playlists_box, playlists_row) = (playlists_box.clone(), playlists_row.clone());
             let (albums_box, albums_row) = (albums_box.clone(), albums_row.clone());
             let (offline_box, offline_list) = (offline_box.clone(), offline_list.clone());
+            let (dirty, last_loaded, reload_in_flight, reload_gen) = (
+                dirty.clone(),
+                last_loaded.clone(),
+                reload_in_flight.clone(),
+                reload_gen.clone(),
+            );
 
             // офлайн-треки показываются сразу и без сети, отфильтрованные по активному провайдеру
             offline_list.remove_all();
@@ -197,25 +248,25 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     }
                 })
                 .collect();
-            for (i, track) in saved.iter().enumerate() {
-                let (p, queue) = (p.clone(), saved.clone());
-                let row = track_row(track, {
-                    let (p, queue) = (p.clone(), queue.clone());
-                    move || {
-                        p.set_queue_and_play_from(
-                            queue.clone(),
-                            i,
-                            Some(PlaySource::new(
-                                "Загруженные",
-                                Some(SourceTarget::Library),
-                            )),
-                        )
-                    }
+            let offline_empty = saved.is_empty();
+            // Общий Rc разделяется между всеми строками офлайн-списка без O(N^2) клонирования.
+            let saved_rc = Rc::new(saved);
+            for (i, track) in saved_rc.iter().enumerate() {
+                let (p_cb, queue) = (p.clone(), saved_rc.clone());
+                let row = track_row(track, move || {
+                    p_cb.set_queue_and_play_from(
+                        (*queue).clone(),
+                        i,
+                        Some(PlaySource::new(
+                            "Загруженные",
+                            Some(SourceTarget::Library),
+                        )),
+                    )
                 });
                 row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                 offline_list.append(&row);
             }
-            offline_box.set_visible(!saved.is_empty());
+            offline_box.set_visible(!offline_empty);
 
             glib::spawn_future_local(async move {
                 let provider = p.providers.current();
@@ -223,22 +274,36 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 let is_yt = provider.provider_id() == crate::api::provider::ProviderId::YouTubeMusic;
 
                 if is_yandex && !provider.is_authenticated() {
+                    if reload_gen.get() != my_gen {
+                        return;
+                    }
                     status.set_text("Укажите токен Яндекс Музыки в настройках ⚙ для доступа к коллекции");
                     status.set_visible(true);
                     yt_login_btn.set_visible(false);
                     liked_box.set_visible(false);
                     playlists_box.set_visible(false);
                     albums_box.set_visible(false);
+                    dirty.set(false);
+                    *last_loaded.borrow_mut() = Some(Instant::now());
+                    reload_in_flight.set(false);
+                    refresh_btn.set_sensitive(true);
                     return;
                 }
 
                 if is_yt && !provider.is_authenticated() {
+                    if reload_gen.get() != my_gen {
+                        return;
+                    }
                     status.set_text("Войдите в Google Аккаунт для доступа к вашей медиатеке YouTube Music 🔴");
                     status.set_visible(true);
                     yt_login_btn.set_visible(true);
                     liked_box.set_visible(false);
                     playlists_box.set_visible(false);
                     albums_box.set_visible(false);
+                    dirty.set(false);
+                    *last_loaded.borrow_mut() = Some(Instant::now());
+                    reload_in_flight.set(false);
+                    refresh_btn.set_sensitive(true);
                     return;
                 }
 
@@ -255,6 +320,10 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     provider.get_liked_total_count()
                 );
 
+                if reload_gen.get() != my_gen {
+                    return;
+                }
+
                 *liked_total.borrow_mut() = total_cnt_opt;
 
                 // Пустая медиатека при "авторизованном" аккаунте — почти всегда
@@ -268,7 +337,8 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                         .map(|playlists| playlists.is_empty())
                         .unwrap_or(true)
                     && albums_res.as_ref().map(|albums| albums.is_empty()).unwrap_or(true);
-                if is_yt && provider.is_authenticated() && library_empty {
+                let session_expired = is_yt && provider.is_authenticated() && library_empty;
+                if session_expired {
                     status.set_text(
                         "Не удалось загрузить медиатеку: похоже, сессия Google истекла. Войдите заново через карточку сервиса → «Аккаунт»",
                     );
@@ -276,26 +346,40 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                     yt_login_btn.set_visible(true);
                 }
 
+                let any_ok = liked_res.is_ok() || playlists_res.is_ok() || albums_res.is_ok();
+                let mut liked_cnt = 0usize;
+                let mut playlists_cnt = 0usize;
+                let mut albums_cnt = 0usize;
+
                 if let Ok(tracks) = liked_res {
+                    let tracks_len = tracks.len();
+                    liked_cnt = tracks_len;
                     *liked_tracks.borrow_mut() = tracks.clone();
-                    if !tracks.is_empty() {
+                    if tracks_len > 0 {
                         liked_empty_msg.set_visible(false);
                         let count_str = match total_cnt_opt {
-                            Some(total) if total > tracks.len() as u32 => format!("{} треков ({} доступно)", total, tracks.len()),
+                            Some(total) if total > tracks_len as u32 => format!("{} треков ({} доступно)", total, tracks_len),
                             Some(total) if total > 0 => format!("{} треков", total),
-                            _ => format!("{} треков", tracks.len()),
+                            _ => format!("{} треков", tracks_len),
                         };
                         liked_count.set_text(&count_str);
                         liked_count.set_visible(true);
                         liked_list.remove_all();
-                        for (i, track) in tracks.iter().take(LIKED_PREVIEW).enumerate() {
-                            let (p, queue) = (p.clone(), tracks.clone());
-                            let row = track_row(track, { let (p, queue) = (p.clone(), queue.clone()); move || p.set_queue_and_play_from(queue.clone(), i, Some(PlaySource::new("Мне нравится", Some(SourceTarget::Library)))) });
+                        let queue_rc = Rc::new(tracks);
+                        for (i, track) in queue_rc.iter().take(LIKED_PREVIEW).enumerate() {
+                            let (p_cb, queue) = (p.clone(), queue_rc.clone());
+                            let row = track_row(track, move || {
+                                p_cb.set_queue_and_play_from(
+                                    (*queue).clone(),
+                                    i,
+                                    Some(PlaySource::new("Мне нравится", Some(SourceTarget::Library))),
+                                )
+                            });
                             row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
                             liked_list.append(&row);
                         }
                         liked_list.set_visible(true);
-                        liked_all.set_visible(tracks.len() > LIKED_PREVIEW);
+                        liked_all.set_visible(tracks_len > LIKED_PREVIEW);
                         liked_box.set_visible(true);
                     } else if is_yt && provider.is_authenticated() {
                         liked_empty_msg.set_visible(true);
@@ -314,6 +398,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 }
 
                 if let Ok(playlists) = playlists_res {
+                    playlists_cnt = playlists.len();
                     clear_box(&playlists_row);
 
                     if is_yandex {
@@ -321,6 +406,9 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                             let client = p.client.lock().unwrap().clone();
                             client.get_uid().await.unwrap_or_else(|_| "user".to_string())
                         };
+                        if reload_gen.get() != my_gen {
+                            return;
+                        }
                         let (p2, stack2, page2, row2, uid2) = (p.clone(), stack.clone(), page.clone(), playlists_row.clone(), uid.clone());
                         let new_tile = new_playlist_tile(TILE_SIZE, {
                             let anchor = playlists_row.clone();
@@ -353,6 +441,7 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 }
 
                 if let Ok(albums) = albums_res {
+                    albums_cnt = albums.len();
                     clear_box(&albums_row);
                     for album in &albums {
                         albums_row.append(&album_tile(&p, &stack, &page, album, TILE_SIZE));
@@ -361,28 +450,74 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
                 } else {
                     albums_box.set_visible(false);
                 }
+
+                if any_ok && !session_expired {
+                    dirty.set(false);
+                    *last_loaded.borrow_mut() = Some(Instant::now());
+                } else {
+                    dirty.set(true);
+                }
+                reload_in_flight.set(false);
+                refresh_btn.set_sensitive(true);
+                eprintln!(
+                    "[ui] library ready: liked={} playlists={} albums={} rss_mb={:.1}",
+                    liked_cnt,
+                    playlists_cnt,
+                    albums_cnt,
+                    crate::current_rss_mb()
+                );
             });
         })
     };
 
     {
+        let (dirty, reload) = (dirty.clone(), reload_library.clone());
+        refresh_btn.connect_clicked(move |_| {
+            dirty.set(true);
+            reload("manual");
+        });
+    }
+
+    {
+        let (dirty, last_loaded, container, reload, pending_reason) = (
+            dirty.clone(),
+            last_loaded.clone(),
+            container.clone(),
+            reload_library.clone(),
+            pending_reason.clone(),
+        );
+        page.set_on_removed(move || {
+            dirty.set(true);
+            *last_loaded.borrow_mut() = None;
+            if container.is_mapped() {
+                reload("dirty");
+            } else {
+                pending_reason.set(Some("dirty"));
+            }
+        });
+    }
+
+    {
         let p = player.clone();
         let btn = yt_login_btn.clone();
-        let reload = reload_library.clone();
+        let (reload, dirty, last_loaded) = (reload_library.clone(), dirty.clone(), last_loaded.clone());
         yt_login_btn.connect_clicked(move |_| {
-            let reload = reload.clone();
+            let (reload, dirty, last_loaded) = (reload.clone(), dirty.clone(), last_loaded.clone());
             super::preferences_dialog::show_ytmusic_auth_dialog(&btn, &p, move || {
-                reload();
+                dirty.set(true);
+                *last_loaded.borrow_mut() = None;
+                reload("auth");
             });
         });
     }
 
     let rx = player.subscribe();
     {
-        let (player, page, stack, liked_tracks, liked_count, liked_empty_msg, liked_list, liked_all, liked_box, liked_total, reload) = (
+        let (player, page, stack, container, liked_tracks, liked_count, liked_empty_msg, liked_list, liked_all, liked_box, liked_total, reload, dirty, last_loaded, pending_reason) = (
             player.clone(),
             page.clone(),
             stack.clone(),
+            container.clone(),
             liked_tracks.clone(),
             liked_count.clone(),
             liked_empty_msg.clone(),
@@ -391,14 +526,31 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
             liked_box.clone(),
             liked_total.clone(),
             reload_library.clone(),
+            dirty.clone(),
+            last_loaded.clone(),
+            pending_reason.clone(),
         );
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
-                    PlayerUiEvent::ProviderChanged(_) => {
-                        reload();
+                    PlayerUiEvent::ProviderChanged(_)
+                    | PlayerUiEvent::UserLoggedIn(_)
+                    | PlayerUiEvent::UserLoggedOut => {
+                        let reason = match &event {
+                            PlayerUiEvent::ProviderChanged(_) => "provider",
+                            PlayerUiEvent::UserLoggedIn(_) | PlayerUiEvent::UserLoggedOut => "auth",
+                            _ => unreachable!(),
+                        };
+                        dirty.set(true);
+                        *last_loaded.borrow_mut() = None;
+                        if container.is_mapped() {
+                            reload(reason);
+                        } else {
+                            pending_reason.set(Some(reason));
+                        }
                     }
                     PlayerUiEvent::TrackLiked { track, liked } => {
+                        dirty.set(true);
                         page.handle_track_liked(&track, liked);
 
                         if liked {
@@ -459,11 +611,32 @@ pub fn create_library_view(player: &PlayerManager) -> LibraryViewWidgets {
         });
     }
 
-    // Данные подгружаются при каждом показе вкладки
+    // Данные подгружаются при первом показе, если помечены dirty или устарел 5-минутный TTL
     {
-        let reload = reload_library.clone();
+        let (reload, dirty, last_loaded, in_flight, pending_reason) = (
+            reload_library.clone(),
+            dirty.clone(),
+            last_loaded.clone(),
+            reload_in_flight.clone(),
+            pending_reason.clone(),
+        );
         container.connect_map(move |_| {
-            reload();
+            let had_loaded = last_loaded.borrow().is_some();
+            let expired = last_loaded
+                .borrow()
+                .is_none_or(|t| t.elapsed() >= LIBRARY_REFRESH_TTL);
+            if (dirty.get() || expired) && !in_flight.get() {
+                let reason = pending_reason.take().unwrap_or_else(|| {
+                    if !had_loaded {
+                        "initial"
+                    } else if dirty.get() {
+                        "dirty"
+                    } else {
+                        "ttl"
+                    }
+                });
+                reload(reason);
+            }
         });
     }
 

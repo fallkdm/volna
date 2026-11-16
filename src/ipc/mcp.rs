@@ -253,11 +253,69 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
                 "properties": {}
             }
         }),
+        serde_json::json!({
+            "name": "volna_logs",
+            "description": "Чтение диагностических логов Волны напрямую из файла журнала (работает даже при зависшем или остановленном GUI)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "description": "Максимальное количество последних строк (по умолчанию 80)"
+                    },
+                    "errors_only": {
+                        "type": "boolean",
+                        "description": "Показывать только ошибки, предупреждения и паники (по умолчанию false)"
+                    },
+                    "grep": {
+                        "type": "string",
+                        "description": "Фильтр строк по подстроке без учёта регистра"
+                    },
+                    "current_session_only": {
+                        "type": "boolean",
+                        "description": "Читать только с последнего старта приложения (по умолчанию true)"
+                    }
+                }
+            }
+        }),
     ]
 }
 
-/// Выполнение вызова инструмента через Unix сокет IPC
+/// Выполнение вызова инструмента через Unix сокет IPC (или напрямую для локальных инструментов)
 async fn execute_tool_call(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if tool_name == "volna_logs" {
+        let lines = args
+            .get("lines")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.min(5000) as usize)
+            .unwrap_or(80);
+        let errors_only = args
+            .get("errors_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let grep = args
+            .get("grep")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let current_session_only = args
+            .get("current_session_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let snap = crate::log::read_recent_logs(lines, errors_only, grep, current_session_only);
+        return serde_json::json!({
+            "isError": false,
+            "content": [
+                {
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".to_string())
+                }
+            ]
+        });
+    }
+
     let cmd = match tool_name {
         "volna_status" => serde_json::json!({ "cmd": "status" }),
         "volna_control" => {
@@ -391,7 +449,7 @@ mod tests {
         });
         let resp = handle_json_rpc(req).await.expect("tools/list must respond");
         let tools = resp["result"]["tools"].as_array().expect("tools must be array");
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
 
         let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"volna_status"));
@@ -399,10 +457,36 @@ mod tests {
         assert!(names.contains(&"volna_volume"));
         assert!(names.contains(&"volna_switch_provider"));
         assert!(names.contains(&"volna_start_wave"));
+        assert!(names.contains(&"volna_wave_filter"));
         assert!(names.contains(&"volna_search_and_play"));
         assert!(names.contains(&"volna_set_cookie"));
         assert!(names.contains(&"volna_like"));
         assert!(names.contains(&"volna_dislike"));
+        assert!(names.contains(&"volna_logs"));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_volna_logs_direct_read() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "volna_logs",
+                "arguments": {
+                    "lines": 20,
+                    "errors_only": false,
+                    "current_session_only": true
+                }
+            }
+        });
+        let resp = handle_json_rpc(req).await.expect("volna_logs must respond");
+        assert_eq!(resp["id"], 99);
+        assert_eq!(resp["result"]["isError"], false);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: crate::log::LogSnapshot =
+            serde_json::from_str(text).expect("volna_logs text must be valid LogSnapshot JSON");
+        assert_eq!(parsed.log_file, crate::log::log_file_path().display().to_string());
     }
 
     #[tokio::test]

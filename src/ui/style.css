@@ -1383,3 +1383,185 @@ window.preferences {
     border: none;
     box-shadow: none;
 }
+
+/* ================= Индикация загрузки и буферизации (Вариант 2) ================= */
+progressbar.island-loading-bar {
+    min-height: 3px;
+    margin: -10px -24px 4px -24px;
+}
+progressbar.island-loading-bar > trough {
+    min-height: 3px;
+    border-radius: 0;
+    border: none;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+progressbar.island-loading-bar > trough > progress {
+    min-height: 3px;
+    border-radius: 0;
+    border: none;
+    background-color: #ff6b4a;
+    transition: background-color 150ms ease;
+}
+
+progressbar.island-seek-pulse {
+    min-height: 16px;
+}
+progressbar.island-seek-pulse > trough {
+    min-height: 4px;
+    margin-top: 6px;
+    margin-bottom: 6px;
+    border-radius: 999px;
+    border: none;
+    background-color: rgba(255, 255, 255, 0.14);
+}
+progressbar.island-seek-pulse > trough > progress {
+    min-height: 4px;
+    border-radius: 999px;
+    border: none;
+    background-color: #ff6b4a;
+    transition: background-color 150ms ease;
+}
+
+.island-loading-spinner {
+    color: #ff6b4a;
+}
+.island-loading-status {
+    font-size: 12.5px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.78);
+}
+
+.track-dur-stack {
+    min-width: 36px;
+}
+.track-loading-spinner {
+    color: #ff6b4a;
+}
+
+row.track-loading {
+    box-shadow: inset 3px 0 0 #ff6b4a;
+    background-color: rgba(255, 255, 255, 0.05);
+    transition: box-shadow 150ms ease, background-color 150ms ease;
+}
+row.track-playing {
+    box-shadow: inset 3px 0 0 rgba(255, 107, 74, 0.78);
+}
+row.track-playing .title {
+    color: #ff8a66;
+    font-weight: 600;
+}
+row.track-error {
+    box-shadow: inset 3px 0 0 #ef4444;
+    background-color: rgba(239, 68, 68, 0.14);
+    transition: box-shadow 150ms ease, background-color 150ms ease;
+}
+
+/* Акценты 6 тем для индикаторов прогрузки и строк */
+.accent-spotify progressbar.island-loading-bar > trough > progress,
+.accent-spotify progressbar.island-seek-pulse > trough > progress {
+    background-color: #1db954;
+    background-image: linear-gradient(90deg, #22d362, #1db954);
+}
+.accent-spotify .island-loading-spinner,
+.accent-spotify .track-loading-spinner {
+    color: #22d362;
+}
+.accent-spotify row.track-loading,
+.accent-spotify row.track-playing {
+    box-shadow: inset 3px 0 0 #1db954;
+}
+.accent-spotify row.track-playing .title {
+    color: #22d362;
+}
+
+.accent-ruby progressbar.island-loading-bar > trough > progress,
+.accent-ruby progressbar.island-seek-pulse > trough > progress {
+    background-color: #e11d48;
+    background-image: linear-gradient(90deg, #f43f5e, #e11d48);
+}
+.accent-ruby .island-loading-spinner,
+.accent-ruby .track-loading-spinner {
+    color: #f43f5e;
+}
+.accent-ruby row.track-loading,
+.accent-ruby row.track-playing {
+    box-shadow: inset 3px 0 0 #e11d48;
+}
+.accent-ruby row.track-playing .title {
+    color: #f43f5e;
+}
+
+.accent-sunset progressbar.island-loading-bar > trough > progress,
+.accent-sunset progressbar.island-seek-pulse > trough > progress {
+    background-color: #ff6b4a;
+    background-image: linear-gradient(90deg, #ff8a5c, #ff6b4a);
+}
+.accent-sunset .island-loading-spinner,
+.accent-sunset .track-loading-spinner {
+    color: #ff8a66;
+}
+.accent-sunset row.track-loading,
+.accent-sunset row.track-playing {
+    box-shadow: inset 3px 0 0 #ff6b4a;
+}
+.accent-sunset row.track-playing .title {
+    color: #ff8a66;
+}
+
+.accent-violet progressbar.island-loading-bar > trough > progress,
+.accent-violet progressbar.island-seek-pulse > trough > progress {
+    background-color: #a855f7;
+    background-image: linear-gradient(90deg, #c084fc, #a855f7);
+}
+.accent-violet .island-loading-spinner,
+.accent-violet .track-loading-spinner {
+    color: #c084fc;
+}
+.accent-violet row.track-loading,
+.accent-violet row.track-playing {
+    box-shadow: inset 3px 0 0 #a855f7;
+}
+.accent-violet row.track-playing .title {
+    color: #c084fc;
+}
+
+.accent-ocean progressbar.island-loading-bar > trough > progress,
+.accent-ocean progressbar.island-seek-pulse > trough > progress {
+    background-color: #3b82f6;
+    background-image: linear-gradient(90deg, #60a5fa, #3b82f6);
+}
+.accent-ocean .island-loading-spinner,
+.accent-ocean .track-loading-spinner {
+    color: #60a5fa;
+}
+.accent-ocean row.track-loading,
+.accent-ocean row.track-playing {
+    box-shadow: inset 3px 0 0 #3b82f6;
+}
+.accent-ocean row.track-playing .title {
+    color: #60a5fa;
+}
+
+.accent-monochrome progressbar.island-loading-bar > trough > progress,
+.accent-monochrome progressbar.island-seek-pulse > trough > progress {
+    background-color: #ffffff;
+    background-image: none;
+}
+.accent-monochrome .island-loading-spinner,
+.accent-monochrome .track-loading-spinner {
+    color: #ffffff;
+}
+.accent-monochrome row.track-loading,
+.accent-monochrome row.track-playing {
+    box-shadow: inset 3px 0 0 #ffffff;
+}
+.accent-monochrome row.track-playing .title {
+    color: #ffffff;
+}
+
+/* Вспышка ошибки перекрывает любую тему и динамический акцент */
+.floating-island-player progressbar.island-loading-bar.error > trough > progress,
+.floating-island-player progressbar.island-seek-pulse.error > trough > progress {
+    background-color: #ef4444;
+    background-image: none;
+}

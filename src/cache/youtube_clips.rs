@@ -285,11 +285,8 @@ async fn download_youtube_clip_to(
     }
 
     // Полуживые keep-alive сокеты к googlevideo уже ломали аудио — большой GET
-    // идёт своим клиентом без переиспользования соединений.
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .build()
-        .map_err(|e| ClipDownloadError::Io(e.to_string()))?;
+    // идёт через общий клиент без переиспользования соединений (`pool_max_idle_per_host(0)`).
+    let client = crate::no_keepalive_http_client();
 
     let deadline = tokio::time::Instant::now() + DOWNLOAD_TOTAL_BUDGET;
     let body = async {

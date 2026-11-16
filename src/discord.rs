@@ -40,6 +40,23 @@ enum Msg {
     Clear,
 }
 
+/// Проверяет, совпадает ли активность в пределах микроджиттера таймстампов (±3 с).
+fn same_activity_within_jitter(a: &Presence, b: &Presence) -> bool {
+    let end_close = match (a.end, b.end) {
+        (Some(ea), Some(eb)) => ea.abs_diff(eb) <= 3,
+        (None, None) => true,
+        _ => false,
+    };
+    a.client_id == b.client_id
+        && a.details == b.details
+        && a.state == b.state
+        && a.cover == b.cover
+        && a.album == b.album
+        && a.url == b.url
+        && a.start.abs_diff(b.start) <= 3
+        && end_close
+}
+
 fn presence_for(track: &Track, client_id: &str, position_ms: u64, now_secs: i64) -> Presence {
     let start = now_secs - (position_ms / 1000) as i64;
     let title = match track.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
@@ -96,6 +113,11 @@ pub fn spawn_bridge(player: PlayerManager, events: Receiver<PlayerUiEvent>) {
                         PlayerUiEvent::DiscordSettingsChanged => {
                             debounce_timer = Some(tokio::time::Instant::now());
                         }
+                        PlayerUiEvent::Error(_) => {
+                            track = player.state.lock().ok().and_then(|s| s.current_track.clone());
+                            pos_override = None;
+                            debounce_timer = Some(tokio::time::Instant::now());
+                        }
                         _ => continue,
                     }
                 }
@@ -146,8 +168,12 @@ fn worker(rx: mpsc::Receiver<Msg>) {
                 }
             }
             Msg::Show(p) => {
-                // Тот же статус повторно не отправляем
-                if last.as_ref() == Some(&p) && client.is_some() {
+                // Тот же статус (в пределах микроджиттера ±3 с) повторно не отправляем
+                if client.is_some()
+                    && last
+                        .as_ref()
+                        .is_some_and(|prev| same_activity_within_jitter(prev, &p))
+                {
                     continue;
                 }
                 if client.as_ref().is_some_and(|(id, _)| *id != p.client_id) {
@@ -179,7 +205,6 @@ fn worker(rx: mpsc::Receiver<Msg>) {
                     .timestamps(ts)
                     .buttons(vec![Button::new("Слушать в Яндекс Музыке", &p.url)]);
 
-                eprintln!("[discord] отправка статуса: {} — {}", p.details, p.state);
                 if let Err(e) = c.set_activity(activity.clone()) {
                     eprintln!("[discord] ошибка set_activity ({:?}), выполняем retry...", e);
                     let _ = c.close();
@@ -198,7 +223,7 @@ fn worker(rx: mpsc::Receiver<Msg>) {
                         }
                     }
                 } else {
-                    eprintln!("[discord] статус успешно обновлен: {} — {}", p.details, p.state);
+                    eprintln!("[discord] статус: {} — {}", p.details, p.state);
                     last = Some(p);
                 }
 
@@ -225,5 +250,61 @@ mod tests {
         assert_eq!(p.state, "A, B");
         assert_eq!((p.start, p.end), (970, Some(1170)));
         assert_eq!(p.url, "https://music.yandex.ru/album/9/track/5");
+    }
+
+    #[test]
+    fn same_activity_within_jitter_ignores_small_drift_and_detects_seek_or_track_change() {
+        let base = Presence {
+            client_id: "123".into(),
+            details: "Track A".into(),
+            state: "Artist A".into(),
+            cover: Some("https://example.com/a.jpg".into()),
+            album: "Album A".into(),
+            url: "https://music.yandex.ru/album/1/track/2".into(),
+            start: 1_000,
+            end: Some(1_200),
+        };
+
+        // Сдвиг на 1-3 с при ребуферизации игнорируется
+        let jitter_1s = Presence {
+            start: 1_001,
+            end: Some(1_201),
+            ..base.clone()
+        };
+        let jitter_2s = Presence {
+            start: 998,
+            end: Some(1_198),
+            ..base.clone()
+        };
+        assert!(same_activity_within_jitter(&base, &jitter_1s));
+        assert!(same_activity_within_jitter(&base, &jitter_2s));
+
+        // Оба end == None в пределах ±3 с также игнорируются
+        let no_end_a = Presence {
+            end: None,
+            ..base.clone()
+        };
+        let no_end_b = Presence {
+            start: 1_002,
+            end: None,
+            ..base.clone()
+        };
+        assert!(same_activity_within_jitter(&no_end_a, &no_end_b));
+        assert!(!same_activity_within_jitter(&base, &no_end_a));
+
+        // Перемотка на 10 с обновляет статус
+        let seeked = Presence {
+            start: 990,
+            end: Some(1_190),
+            ..base.clone()
+        };
+        assert!(!same_activity_within_jitter(&base, &seeked));
+
+        // Смена трека обновляет статус
+        let other_track = Presence {
+            details: "Track B".into(),
+            ..base.clone()
+        };
+        assert!(!same_activity_within_jitter(&base, &other_track));
     }
 }

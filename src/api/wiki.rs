@@ -175,7 +175,13 @@ pub(crate) fn trim_extract(text: &str) -> String {
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Option<Value> {
-    let resp = client.get(url).send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -347,20 +353,16 @@ async fn summary_ru_or_en(
     if name.trim().is_empty() {
         return None;
     }
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
+    let client = crate::shared_http_client();
 
-    if let Some(ru) = summary_in(&client, "ru", query, name, accept).await {
+    if let Some(ru) = summary_in(client, "ru", query, name, accept).await {
         return Some(ru);
     }
 
     let (en_summary, canonical_en_title) =
-        summary_in_with_title(&client, "en", query, name, accept).await?;
+        summary_in_with_title(client, "en", query, name, accept).await?;
 
-    if let Some(ru_summary) = fetch_ru_via_en_langlink(&client, &canonical_en_title).await {
+    if let Some(ru_summary) = fetch_ru_via_en_langlink(client, &canonical_en_title).await {
         return Some(ru_summary);
     }
 

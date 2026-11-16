@@ -580,18 +580,12 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let image = captcha_image.clone();
             let status = captcha_status.clone();
             gtk4::glib::spawn_future_local(async move {
-                let client = match reqwest::Client::builder()
+                match crate::shared_http_client()
+                    .get(&img_url)
                     .timeout(std::time::Duration::from_secs(15))
-                    .build()
+                    .send()
+                    .await
                 {
-                    Ok(c) => c,
-                    Err(e) => {
-                        status.set_text(&format!("Ошибка сети: {e}"));
-                        status.set_visible(true);
-                        return;
-                    }
-                };
-                match client.get(&img_url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         if let Ok(bytes) = resp.bytes().await {
                             let bytes = gtk4::glib::Bytes::from(bytes.as_ref());
@@ -681,20 +675,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let otp_sid = otp_sid.clone();
             let otp_code = otp_code.clone();
             gtk4::glib::spawn_future_local(async move {
-                let http = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        login_spinner.stop();
-                        login_spinner.set_visible(false);
-                        submit_login_btn.set_sensitive(true);
-                        login_status.set_text(&format!("Ошибка сети: {e}"));
-                        login_status.set_visible(true);
-                        return;
-                    }
-                };
+                let http = crate::shared_http_client();
 
                 let credentials = crate::api::vk::auth::VkCredentials::new(username, password);
                 // После подтверждения кодом VK ждёт сессию в параметре `sid`,
@@ -704,7 +685,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                     code: otp_code.borrow().clone(),
                     ..Default::default()
                 };
-                let outcome = crate::api::vk::auth::direct_auth(&http, &credentials, &challenge).await;
+                let outcome = crate::api::vk::auth::direct_auth(http, &credentials, &challenge).await;
 
                 login_spinner.stop();
                 login_spinner.set_visible(false);
@@ -833,21 +814,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let fetch_captcha = fetch_captcha_image.clone();
 
             gtk4::glib::spawn_future_local(async move {
-                let http = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        code_spinner.stop();
-                        code_spinner.set_visible(false);
-                        submit_code_btn.set_sensitive(true);
-                        resend_email_btn.set_sensitive(true);
-                        code_status.set_text(&format!("Ошибка сети: {e}"));
-                        code_status.set_visible(true);
-                        return;
-                    }
-                };
+                let http = crate::shared_http_client();
 
                 let credentials = crate::api::vk::auth::VkCredentials {
                     username,
@@ -861,7 +828,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                     captcha_key: None,
                     resend: false,
                 };
-                let outcome = crate::api::vk::auth::direct_auth(&http, &credentials, &challenge).await;
+                let outcome = crate::api::vk::auth::direct_auth(http, &credentials, &challenge).await;
 
                 code_spinner.stop();
                 code_spinner.set_visible(false);
@@ -976,21 +943,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let fetch_captcha = fetch_captcha_image.clone();
 
             gtk4::glib::spawn_future_local(async move {
-                let http = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        code_spinner.stop();
-                        code_spinner.set_visible(false);
-                        resend_email_btn.set_sensitive(true);
-                        submit_code_btn.set_sensitive(true);
-                        code_status.set_text(&format!("Ошибка сети: {e}"));
-                        code_status.set_visible(true);
-                        return;
-                    }
-                };
+                let http = crate::shared_http_client();
 
                 let credentials = crate::api::vk::auth::VkCredentials {
                     username,
@@ -1004,7 +957,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                     captcha_key: None,
                     resend: true,
                 };
-                let outcome = crate::api::vk::auth::direct_auth(&http, &credentials, &challenge).await;
+                let outcome = crate::api::vk::auth::direct_auth(http, &credentials, &challenge).await;
 
                 code_spinner.stop();
                 code_spinner.set_visible(false);
@@ -1125,20 +1078,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let fetch_captcha = fetch_captcha_image.clone();
 
             gtk4::glib::spawn_future_local(async move {
-                let http = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        captcha_spinner.stop();
-                        captcha_spinner.set_visible(false);
-                        submit_captcha_btn.set_sensitive(true);
-                        captcha_status.set_text(&format!("Ошибка сети: {e}"));
-                        captcha_status.set_visible(true);
-                        return;
-                    }
-                };
+                let http = crate::shared_http_client();
 
                 let credentials = crate::api::vk::auth::VkCredentials {
                     username,
@@ -1152,7 +1092,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                     captcha_key: Some(key),
                     resend: false,
                 };
-                let outcome = crate::api::vk::auth::direct_auth(&http, &credentials, &challenge).await;
+                let outcome = crate::api::vk::auth::direct_auth(http, &credentials, &challenge).await;
 
                 captcha_spinner.stop();
                 captcha_spinner.set_visible(false);
@@ -1244,7 +1184,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                 return;
             }
             btn.set_sensitive(false);
-            let http = reqwest::Client::new();
+            let http = crate::shared_http_client();
             let status = status.clone();
             let code_row = code_row.clone();
             let state = state_req.clone();
@@ -1260,7 +1200,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                 let captcha_ref = captcha
                     .as_ref()
                     .map(|(sid, key)| (sid.as_str(), key.as_str()));
-                match crate::api::vk::auth::validate_account(&http, &login, captcha_ref).await {
+                match crate::api::vk::auth::validate_account(http, &login, captcha_ref).await {
                     Ok(crate::api::vk::auth::VkValidateOutcome::CodeRequired {
                         sid,
                         method,
@@ -1277,7 +1217,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                         }
                         // Письмо отправляем явно: без sendOtpEmail VK код не шлёт.
                         match crate::api::vk::auth::send_otp_email(
-                            &http,
+                            http,
                             &sid,
                             tg_flow.as_deref(),
                         )
@@ -1326,7 +1266,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                         );
                         status.set_visible(true);
                         let image = captcha_image.clone();
-                        let http = reqwest::Client::new();
+                        let http = crate::shared_http_client();
                         glib::spawn_future_local(async move {
                             if let Ok(bytes) = http.get(&captcha_img).send().await
                                 && let Ok(bytes) = bytes.bytes().await
@@ -1372,7 +1312,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
                 return;
             }
             btn.set_sensitive(false);
-            let http = reqwest::Client::new();
+            let http = crate::shared_http_client();
             let status_confirm = status_confirm.clone();
             let otp_sid_confirm = otp_sid_confirm.clone();
             let code_row_confirm = code_row_confirm.clone();
@@ -1383,7 +1323,7 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let submit_login_btn_confirm = submit_login_btn_confirm.clone();
             let password_entry_confirm = password_entry_confirm.clone();
             glib::spawn_future_local(async move {
-                match crate::api::vk::auth::check_otp(&http, &sid, &code, "email").await {
+                match crate::api::vk::auth::check_otp(http, &sid, &code, "email").await {
                     Ok(crate::api::vk::auth::VkCheckOtpOutcome::Success {
                         sid: next_sid,
                         ..
@@ -1545,22 +1485,9 @@ pub fn show_vk_auth_dialog(parent: &impl IsA<gtk4::Widget>, player: &PlayerManag
             let submit_token_btn = submit_token_btn.clone();
 
             gtk4::glib::spawn_future_local(async move {
-                let http = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(20))
-                    .build()
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        browser_spinner.stop();
-                        browser_spinner.set_visible(false);
-                        submit_token_btn.set_sensitive(true);
-                        browser_status.set_text(&format!("Ошибка сети: {e}"));
-                        browser_status.set_visible(true);
-                        return;
-                    }
-                };
+                let http = crate::shared_http_client();
 
-                let outcome = crate::api::vk::auth::parse_and_validate_token(&http, &input).await;
+                let outcome = crate::api::vk::auth::parse_and_validate_token(http, &input).await;
                 browser_spinner.stop();
                 browser_spinner.set_visible(false);
                 submit_token_btn.set_sensitive(true);
@@ -1656,7 +1583,7 @@ pub fn show_vk_api_captcha_dialog(
     if let Some(url) = image_url {
         let image = image.clone();
         gtk4::glib::spawn_future_local(async move {
-            let Ok(response) = reqwest::Client::new().get(url).send().await else {
+            let Ok(response) = crate::shared_http_client().get(url).send().await else {
                 return;
             };
             if !response.status().is_success() {

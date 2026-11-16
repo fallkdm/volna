@@ -1,13 +1,13 @@
 //! Общие виджеты коллекций: обложки, плитки, строки треков и страница альбома/плейлиста.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, Align, Box as GtkBox, Button, Image, Label, ListBox, Orientation, Overflow,
-    ScrolledWindow, Stack,
+    ScrolledWindow, Spinner, Stack,
 };
 use libadwaita::prelude::*;
 use libadwaita::ActionRow;
@@ -16,18 +16,34 @@ use crate::api::models::{Album, Artist, Playlist, Track, TrackSource};
 use crate::api::provider::ProviderId;
 use crate::player::{PlayerManager, PlayerUiEvent, PlaySource, SourceTarget};
 
-/// Кэш текстур обложек с ограничением по памяти.
+/// Кэш текстур обложек с ограничением по памяти и дедупликацией живых текстур.
 ///
-/// Раньше сюда складывалась каждая увиденная обложка навсегда: после часа
-/// поиска и альбомов процесс разрастался до сотен мегабайт. Теперь это LRU
-/// с бюджетом 16 МБ; видимые картинки держат собственные ссылки и не ломаются.
+/// Ключ кэша — `(url_or_path, target_px)`, где `target_px` — физический размер под HiDPI.
+/// Поверх bounded LRU-кэша (16 МБ) ведётся реестр `WeakRef<gdk::Texture>`: пока хотя бы один
+/// виджет держит живую текстуру, повторные запросы не декодируют её заново и не плодят дубликаты.
 const COVER_CACHE_BUDGET: usize = 16 * 1024 * 1024;
+const DETAIL_TRACKS_BATCH: usize = 45;
+const DETAIL_LOAD_MORE_MARGIN_PX: f64 = 600.0;
+const BANNER_MAX_PX: i32 = 960;
+const GALLERY_MAX_PX: i32 = 1024;
+const COVER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
+type CoverKey = (String, i32);
+
+enum PendingCoverTarget {
+    Image(glib::WeakRef<Image>, u64),
+    Picture(glib::WeakRef<gtk4::Picture>),
+}
 
 #[derive(Default)]
 struct CoverCache {
-    map: HashMap<String, gdk::Texture>,
-    order: VecDeque<String>,
+    map: HashMap<CoverKey, gdk::Texture>,
+    order: VecDeque<CoverKey>,
     bytes: usize,
+    weak: HashMap<CoverKey, glib::WeakRef<gdk::Texture>>,
+    in_flight: HashMap<CoverKey, Vec<PendingCoverTarget>>,
+    image_reqs: HashMap<usize, (glib::WeakRef<Image>, u64)>,
+    next_req_id: u64,
 }
 
 impl CoverCache {
@@ -37,18 +53,33 @@ impl CoverCache {
             .saturating_mul(4)
     }
 
-    fn get(&mut self, key: &str) -> Option<gdk::Texture> {
-        let tex = self.map.get(key)?.clone();
+    fn touch_order(&mut self, key: &CoverKey) {
         if let Some(pos) = self.order.iter().position(|item| item == key) {
             self.order.remove(pos);
         }
-        self.order.push_back(key.to_owned());
-        Some(tex)
+        self.order.push_back(key.clone());
     }
 
-    fn insert(&mut self, key: String, tex: gdk::Texture) {
+    fn get(&mut self, key: &CoverKey) -> Option<gdk::Texture> {
+        if let Some(tex) = self.map.get(key).cloned() {
+            self.touch_order(key);
+            return Some(tex);
+        }
+        if let Some(weak_ref) = self.weak.get(key) {
+            if let Some(tex) = weak_ref.upgrade() {
+                // Текстура ещё жива в виджете: возвращаем её без повторного декодирования
+                // и возвращаем сильную ссылку в горячий LRU-кэш.
+                self.insert_strong(key.clone(), tex.clone());
+                return Some(tex);
+            }
+            self.weak.remove(key);
+        }
+        None
+    }
+
+    fn insert_strong(&mut self, key: CoverKey, tex: gdk::Texture) {
         let size = Self::texture_bytes(&tex);
-        // Одиночная гигантская обложка не должна вытеснять весь кэш.
+        // Одиночная гигантская текстура не должна вытеснять весь кэш.
         if size > COVER_CACHE_BUDGET / 2 {
             return;
         }
@@ -70,6 +101,48 @@ impl CoverCache {
             }
         }
     }
+
+    fn insert(&mut self, key: CoverKey, tex: gdk::Texture) {
+        let weak_ref = glib::WeakRef::new();
+        weak_ref.set(Some(&tex));
+        self.weak.insert(key.clone(), weak_ref);
+        if self.weak.len() > 256 && self.weak.len() > self.map.len().saturating_mul(2) {
+            self.retain_alive_weak();
+        }
+        self.insert_strong(key, tex);
+    }
+
+    fn retain_alive_weak(&mut self) {
+        self.weak.retain(|_, w| w.upgrade().is_some());
+        self.image_reqs.retain(|_, (w, _)| w.upgrade().is_some());
+    }
+
+    fn clear(&mut self) -> usize {
+        let bytes = self.bytes;
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+        self.retain_alive_weak();
+        bytes
+    }
+
+    fn mark_image_req(&mut self, image: &Image) -> u64 {
+        self.next_req_id = self.next_req_id.wrapping_add(1).max(1);
+        let id = self.next_req_id;
+        let ptr = image.as_ptr() as usize;
+        self.image_reqs.insert(ptr, (image.downgrade(), id));
+        if self.image_reqs.len() > 512 {
+            self.image_reqs.retain(|_, (w, _)| w.upgrade().is_some());
+        }
+        id
+    }
+
+    fn is_current_image_req(&self, image: &Image, req_id: u64) -> bool {
+        let ptr = image.as_ptr() as usize;
+        self.image_reqs
+            .get(&ptr)
+            .is_some_and(|(w, id)| *id == req_id && w.upgrade().as_ref() == Some(image))
+    }
 }
 
 thread_local! {
@@ -87,24 +160,105 @@ pub fn cover_cache_usage() -> (usize, usize) {
 /// Полностью очищает кэш текстур обложек; возвращает освобождённые байты.
 /// Видимые картинки продолжают работать: у них свои ссылки на текстуры.
 pub fn clear_cover_memory_cache() -> usize {
-    COVERS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let bytes = cache.bytes;
-        cache.map.clear();
-        cache.order.clear();
-        cache.bytes = 0;
-        bytes
-    })
+    COVERS.with(|cache| cache.borrow_mut().clear())
+}
+
+/// Вычищает мёртвые слабые ссылки из реестров строк и кэша текстур.
+pub fn prune_dead_caches() {
+    TRACK_ROW_REGISTRY.with(|reg| reg.borrow_mut().retain_alive());
+    COVERS.with(|c| c.borrow_mut().retain_alive_weak());
+}
+
+/// Целевой физический размер текстуры под HiDPI (`2x`, но не меньше 64 px).
+pub fn target_cover_px(logical_size: i32) -> i32 {
+    (logical_size.max(1) * 2).max(64)
+}
+
+/// Вычисляет новые размеры `(w, h)` с сохранением пропорций и ограничением по `max_px` (без апскейла).
+fn scaled_dimensions(w: i32, h: i32, max_px: i32) -> (i32, i32) {
+    let max_px = max_px.max(1);
+    if w <= 0 || h <= 0 {
+        return (max_px, max_px);
+    }
+    if w <= max_px && h <= max_px {
+        return (w, h);
+    }
+    if w >= h {
+        let new_h = ((h as f64) * (max_px as f64) / (w as f64)).round().max(1.0) as i32;
+        (max_px, new_h)
+    } else {
+        let new_w = ((w as f64) * (max_px as f64) / (h as f64)).round().max(1.0) as i32;
+        (new_w, max_px)
+    }
+}
+
+fn texture_from_pixbuf(pixbuf: &gtk4::gdk_pixbuf::Pixbuf) -> Option<gdk::Texture> {
+    let w = pixbuf.width();
+    let h = pixbuf.height();
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let has_alpha = pixbuf.has_alpha();
+    if pixbuf.bits_per_sample() == 8 && matches!((has_alpha, pixbuf.n_channels()), (false, 3) | (true, 4)) {
+        let bytes = pixbuf.read_pixel_bytes();
+        let stride = pixbuf.rowstride() as usize;
+        let format = if has_alpha {
+            gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gdk::MemoryFormat::R8g8b8
+        };
+        return Some(gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast());
+    }
+    #[allow(deprecated)]
+    Some(gdk::Texture::for_pixbuf(pixbuf))
+}
+
+/// Декодирует изображение из байтов с пропорциональным даунскейлом до `max_px` по длинной стороне.
+/// Если `gdk_pixbuf` не поддерживает формат (например, экзотический контейнер), делает fallback на `Texture::from_bytes`.
+pub fn decode_texture_scaled(bytes: &[u8], max_px: i32) -> Option<gdk::Texture> {
+    let max_px = max_px.max(1);
+    let loader = gtk4::gdk_pixbuf::PixbufLoader::new();
+    loader.connect_size_prepared(move |ldr, orig_w, orig_h| {
+        if orig_w > max_px || orig_h > max_px {
+            let (new_w, new_h) = scaled_dimensions(orig_w, orig_h, max_px);
+            ldr.set_size(new_w, new_h);
+        }
+    });
+    if loader.write(bytes).is_ok() {
+        if loader.close().is_ok() {
+            if let Some(pixbuf) = loader.pixbuf() {
+                if let Some(tex) = texture_from_pixbuf(&pixbuf) {
+                    return Some(tex);
+                }
+            }
+        }
+    } else {
+        let _ = loader.close();
+    }
+    gdk::Texture::from_bytes(&glib::Bytes::from(bytes)).ok()
+}
+
+/// Декодирует изображение из файла с пропорциональным даунскейлом до `max_px` по длинной стороне.
+pub fn decode_texture_from_file_scaled(path: &std::path::Path, max_px: i32) -> Option<gdk::Texture> {
+    let max_px = max_px.max(1);
+    if let Some((_, orig_w, orig_h)) = gtk4::gdk_pixbuf::Pixbuf::file_info(path) {
+        let pixbuf_res = if orig_w > max_px || orig_h > max_px {
+            let (target_w, target_h) = scaled_dimensions(orig_w, orig_h, max_px);
+            gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(path, target_w, target_h, true)
+        } else {
+            gtk4::gdk_pixbuf::Pixbuf::from_file(path)
+        };
+        if let Ok(pixbuf) = pixbuf_res {
+            if let Some(tex) = texture_from_pixbuf(&pixbuf) {
+                return Some(tex);
+            }
+        }
+    }
+    gdk::Texture::from_file(&gtk4::gio::File::for_path(path)).ok()
 }
 
 fn shared_http_client() -> &'static reqwest::Client {
-    static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-            .build()
-            .unwrap_or_default()
-    })
+    crate::shared_http_client()
 }
 
 #[derive(Clone)]
@@ -114,24 +268,160 @@ struct BannerRgba {
     rgba: Vec<u8>,
 }
 
-/// Загружает обложку по URL в `Image` (кэш в памяти; при ошибке остаётся заглушка)
-pub fn load_cover(image: &Image, url: Option<String>) {
-    let Some(url) = url else { return };
-    if let Some(tex) = COVERS.with(|c| c.borrow_mut().get(&url)) {
-        image.set_paintable(Some(&tex));
+struct InFlightGuard(CoverKey);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        COVERS.with(|c| {
+            c.borrow_mut().in_flight.remove(&self.0);
+        });
+    }
+}
+
+fn fetch_and_apply_cover_scaled(key: CoverKey, url: String, target: PendingCoverTarget) {
+    let cached = COVERS.with(|c| c.borrow_mut().get(&key));
+    if let Some(tex) = cached {
+        match target {
+            PendingCoverTarget::Image(w, req) => {
+                if let Some(img) = w.upgrade() {
+                    let is_current = COVERS.with(|c| c.borrow().is_current_image_req(&img, req));
+                    if is_current {
+                        img.set_paintable(Some(&tex));
+                    }
+                }
+            }
+            PendingCoverTarget::Picture(w) => {
+                if let Some(pic) = w.upgrade() {
+                    pic.set_paintable(Some(&tex));
+                }
+            }
+        }
         return;
     }
-    let client = shared_http_client().clone();
-    let weak = image.downgrade();
-    glib::spawn_future_local(async move {
-        let Ok(resp) = client.get(&url).send().await else { return };
-        let Ok(bytes) = resp.bytes().await else { return };
-        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
-        COVERS.with(|c| c.borrow_mut().insert(url, tex.clone()));
-        if let Some(img) = weak.upgrade() {
-            img.set_paintable(Some(&tex));
+
+    let should_spawn = COVERS.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(waiters) = cache.in_flight.get_mut(&key) {
+            waiters.push(target);
+            false
+        } else {
+            cache.in_flight.insert(key.clone(), vec![target]);
+            true
         }
     });
+    if !should_spawn {
+        return;
+    }
+
+    glib::spawn_future_local(async move {
+        let guard = InFlightGuard(key.clone());
+        let max_px = key.1;
+        let Ok(resp) = shared_http_client()
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, COVER_USER_AGENT)
+            .send()
+            .await
+        else {
+            return;
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        let Ok(bytes) = resp.bytes().await else { return };
+
+        let has_live_target = COVERS.with(|c| {
+            let cache = c.borrow();
+            cache.in_flight.get(&key).is_some_and(|waiters| {
+                waiters.iter().any(|t| match t {
+                    PendingCoverTarget::Image(w, req) => {
+                        w.upgrade().is_some_and(|img| cache.is_current_image_req(&img, *req))
+                    }
+                    PendingCoverTarget::Picture(w) => w.upgrade().is_some(),
+                })
+            })
+        });
+        if !has_live_target {
+            return;
+        }
+
+        let tex = match COVERS.with(|c| c.borrow_mut().get(&key)) {
+            Some(existing) => existing,
+            None => {
+                let Some(decoded) = decode_texture_scaled(&bytes, max_px) else {
+                    return;
+                };
+                COVERS.with(|c| c.borrow_mut().insert(key.clone(), decoded.clone()));
+                decoded
+            }
+        };
+
+        let waiters = COVERS.with(|c| c.borrow_mut().in_flight.remove(&key)).unwrap_or_default();
+        std::mem::forget(guard);
+        for waiter in waiters {
+            match waiter {
+                PendingCoverTarget::Image(w, req) => {
+                    if let Some(img) = w.upgrade() {
+                        let is_current = COVERS.with(|c| c.borrow().is_current_image_req(&img, req));
+                        if is_current {
+                            img.set_paintable(Some(&tex));
+                        }
+                    }
+                }
+                PendingCoverTarget::Picture(w) => {
+                    if let Some(pic) = w.upgrade() {
+                        pic.set_paintable(Some(&tex));
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Очищает обложку в `Image` и отменяет висящие асинхронные загрузки для него.
+pub fn clear_image_cover(image: &Image) {
+    COVERS.with(|c| {
+        let _ = c.borrow_mut().mark_image_req(image);
+    });
+    image.clear();
+}
+
+fn current_image_req(image: &Image) -> u64 {
+    let key = image.as_ptr() as usize;
+    COVERS.with(|c| c.borrow().image_reqs.get(&key).map(|(_, id)| *id).unwrap_or(0))
+}
+
+/// Загружает обложку по URL в `Image` с масштабированием под `logical_size` (HiDPI `2x`).
+pub fn load_cover_sized(image: &Image, url: Option<String>, logical_size: i32) {
+    let Some(url) = url else { return };
+    let req_id = COVERS.with(|c| c.borrow_mut().mark_image_req(image));
+    let key = (url.clone(), target_cover_px(logical_size));
+    fetch_and_apply_cover_scaled(key, url, PendingCoverTarget::Image(image.downgrade(), req_id));
+}
+
+/// Загружает обложку по URL в `Image` (использует `image.pixel_size()`, если задан).
+pub fn load_cover(image: &Image, url: Option<String>) {
+    let logical_size = image.pixel_size().max(40);
+    load_cover_sized(image, url, logical_size);
+}
+
+/// Загружает локальный файл обложки в `Image` с даунскейлом под `logical_size` и кэшированием.
+pub fn load_cover_file_sized(image: &Image, path: &std::path::Path, logical_size: i32) {
+    let req_id = COVERS.with(|c| c.borrow_mut().mark_image_req(image));
+    let max_px = target_cover_px(logical_size);
+    let key = (format!("file:{}", path.display()), max_px);
+    if let Some(tex) = COVERS.with(|c| c.borrow_mut().get(&key)) {
+        if COVERS.with(|c| c.borrow().is_current_image_req(image, req_id)) {
+            image.set_paintable(Some(&tex));
+        }
+        return;
+    }
+    let Some(tex) = decode_texture_from_file_scaled(path, max_px) else {
+        return;
+    };
+    COVERS.with(|c| c.borrow_mut().insert(key, tex.clone()));
+    if COVERS.with(|c| c.borrow().is_current_image_req(image, req_id)) {
+        image.set_paintable(Some(&tex));
+    }
 }
 
 /// Квадратная скруглённая обложка заданного размера
@@ -142,35 +432,44 @@ pub fn cover_image(size: i32, url: Option<String>) -> Image {
     img.set_valign(Align::Start);
     img.set_overflow(Overflow::Hidden);
     img.add_css_class("cover-art");
-    load_cover(&img, url);
+    load_cover_sized(&img, url, size);
     img
 }
 
-/// Загружает обложку трека. Если у трека обложка отсутствует или ведет на i.ytimg.com,
-/// сначала отображается быстрый превью (если есть), а параллельно в фоне вызывается
-/// `resolve_studio_cover`. При нахождении студийной обложки текстура плавно заменяется.
-pub fn load_track_cover(image: &Image, track: &Track) {
-    let preview_url = track.cover_url(100);
-    load_cover(image, preview_url.clone());
+/// Загружает обложку трека в `Image` с масштабированием под `logical_size`.
+/// Для превью (если `preview_url` уже есть) не грузит тяжёлую студийную обложку поверх;
+/// студийный резолв запускается только если у трека нет превью.
+pub fn load_track_cover_sized(image: &Image, track: &Track, logical_size: i32) {
+    let req_sz = if logical_size <= 64 { 100 } else { 400 };
+    let preview_url = track.cover_url(req_sz);
+    if let Some(url) = preview_url {
+        load_cover_sized(image, Some(url), logical_size);
+        return;
+    }
 
-    let is_ytimg = preview_url.as_deref().map_or(false, |u| u.contains("ytimg.com"));
-    let needs_studio = preview_url.is_none() || is_ytimg;
-
-    if needs_studio {
-        let artist = track.artists_string();
-        let title = track.title.clone();
-        let weak = image.downgrade();
-        glib::spawn_future_local(async move {
-            if let Some(studio_url) = crate::cache::resolve_studio_cover(&artist, &title).await {
-                if let Some(img) = weak.upgrade() {
-                    load_cover(&img, Some(studio_url));
+    let artist = track.artists_string();
+    let title = track.title.clone();
+    let weak = image.downgrade();
+    let base_req = COVERS.with(|c| c.borrow_mut().mark_image_req(image));
+    glib::spawn_future_local(async move {
+        if let Some(studio_url) = crate::cache::resolve_studio_cover(&artist, &title).await {
+            if let Some(img) = weak.upgrade() {
+                let still_waiting = COVERS.with(|c| c.borrow().is_current_image_req(&img, base_req));
+                if still_waiting {
+                    load_cover_sized(&img, Some(studio_url), logical_size);
                 }
             }
-        });
-    }
+        }
+    });
 }
 
-/// Квадратная скруглённая обложка трека с автоматическим фоновым резолвом студийной обложки
+/// Загружает обложку трека в `Image` (использует `image.pixel_size()`, по умолчанию 40px).
+pub fn load_track_cover(image: &Image, track: &Track) {
+    let logical_size = image.pixel_size().max(40);
+    load_track_cover_sized(image, track, logical_size);
+}
+
+/// Квадратная скруглённая обложка трека заданного логического размера
 pub fn track_cover_image(size: i32, track: &Track) -> Image {
     let img = Image::from_icon_name("audio-x-generic-symbolic");
     img.set_pixel_size(size);
@@ -178,15 +477,15 @@ pub fn track_cover_image(size: i32, track: &Track) -> Image {
     img.set_valign(Align::Start);
     img.set_overflow(Overflow::Hidden);
     img.add_css_class("cover-art");
-    load_track_cover(&img, track);
+    load_track_cover_sized(&img, track, size);
     img
 }
 
-/// Загружает аватар артиста в `Image`. Сначала отображает `fallback_url` (если есть).
+/// Загружает аватар артиста в `Image` под целевой `logical_size`. Сначала отображает `fallback_url` (если есть).
 /// Параллельно в фоне через `cover_resolver::resolve_artist_avatar` ищет студийный квадратный
 /// портрет 1:1 в Deezer/iTunes и при нахождении плавно обновляет текстуру.
-pub fn load_artist_avatar(image: &Image, artist_name: &str, fallback_url: Option<String>) {
-    load_cover(image, fallback_url);
+pub fn load_artist_avatar(image: &Image, artist_name: &str, fallback_url: Option<String>, logical_size: i32) {
+    load_cover_sized(image, fallback_url, logical_size);
 
     let trimmed = artist_name.trim();
     if trimmed.is_empty() {
@@ -198,7 +497,7 @@ pub fn load_artist_avatar(image: &Image, artist_name: &str, fallback_url: Option
     glib::spawn_future_local(async move {
         if let Some(avatar_url) = crate::cache::cover_resolver::resolve_artist_avatar(&name).await {
             if let Some(img) = weak.upgrade() {
-                load_cover(&img, Some(avatar_url));
+                load_cover_sized(&img, Some(avatar_url), logical_size);
             }
         }
     });
@@ -262,7 +561,135 @@ pub fn explicit_badge() -> Label {
     badge
 }
 
-/// Строка трека с обложкой и длительностью
+struct TrackRowEntry {
+    track_id: String,
+    row: glib::WeakRef<ActionRow>,
+    stack: glib::WeakRef<Stack>,
+    spinner: glib::WeakRef<Spinner>,
+}
+
+#[derive(Default)]
+struct TrackRowRegistry {
+    entries: Vec<TrackRowEntry>,
+    loading_track_id: Option<String>,
+    loading_started_at: Option<std::time::Instant>,
+    playing_track_id: Option<String>,
+}
+
+impl TrackRowRegistry {
+    fn retain_alive(&mut self) {
+        self.entries
+            .retain(|e| e.row.upgrade().is_some() && e.stack.upgrade().is_some());
+    }
+}
+
+thread_local! {
+    static TRACK_ROW_REGISTRY: RefCell<TrackRowRegistry> = RefCell::new(TrackRowRegistry::default());
+}
+
+fn apply_loading_to_entry(entry: &TrackRowEntry, active_id: Option<&str>) {
+    let Some(row) = entry.row.upgrade() else { return };
+    let Some(stack) = entry.stack.upgrade() else { return };
+    let spinner = entry.spinner.upgrade();
+    if active_id == Some(entry.track_id.as_str()) {
+        row.remove_css_class("track-error");
+        row.add_css_class("track-loading");
+        stack.set_visible_child_name("loading");
+        if let Some(sp) = spinner {
+            sp.start();
+        }
+    } else {
+        row.remove_css_class("track-loading");
+        stack.set_visible_child_name("dur");
+        if let Some(sp) = spinner {
+            sp.stop();
+        }
+    }
+}
+
+fn apply_playing_to_entry(entry: &TrackRowEntry, playing_id: Option<&str>) {
+    let Some(row) = entry.row.upgrade() else { return };
+    if playing_id == Some(entry.track_id.as_str()) {
+        row.add_css_class("track-playing");
+    } else {
+        row.remove_css_class("track-playing");
+    }
+}
+
+/// Подсвечивает строки трека с указанным `track_id` как загружаемые (спиннер вместо длительности)
+/// и снимает индикатор загрузки со всех остальных строк.
+pub fn set_loading_track_id(track_id: Option<&str>) {
+    TRACK_ROW_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.retain_alive();
+        reg.loading_track_id = track_id.map(str::to_string);
+        reg.loading_started_at = track_id.map(|_| std::time::Instant::now());
+        for entry in &reg.entries {
+            apply_loading_to_entry(entry, track_id);
+        }
+    });
+}
+
+/// Отмечает строки трека с указанным `track_id` классом `.track-playing` (и снимает с остальных).
+pub fn set_playing_track_id(track_id: Option<&str>) {
+    TRACK_ROW_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.retain_alive();
+        reg.playing_track_id = track_id.map(str::to_string);
+        for entry in &reg.entries {
+            apply_playing_to_entry(entry, track_id);
+        }
+    });
+}
+
+/// Кратковременно (~500 мс) подсвечивает строки трека ошибкой `.track-error` и возвращает длительность.
+pub fn flash_error_track_id(track_id: &str) {
+    let matched_rows: Vec<glib::WeakRef<ActionRow>> = TRACK_ROW_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.retain_alive();
+        if reg.loading_track_id.as_deref() == Some(track_id) {
+            reg.loading_track_id = None;
+            reg.loading_started_at = None;
+        }
+        let mut out = Vec::new();
+        for entry in &reg.entries {
+            if entry.track_id == track_id {
+                if let Some(row) = entry.row.upgrade() {
+                    row.remove_css_class("track-loading");
+                    row.add_css_class("track-error");
+                    out.push(entry.row.clone());
+                }
+                if let Some(stack) = entry.stack.upgrade() {
+                    stack.set_visible_child_name("dur");
+                }
+                if let Some(sp) = entry.spinner.upgrade() {
+                    sp.stop();
+                }
+            }
+        }
+        out
+    });
+
+    for weak_row in matched_rows {
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            if let Some(row) = weak_row.upgrade() {
+                row.remove_css_class("track-error");
+            }
+        });
+    }
+}
+
+fn is_duplicate_loading_click(track_id: &str) -> bool {
+    TRACK_ROW_REGISTRY.with(|reg| {
+        let reg = reg.borrow();
+        reg.loading_track_id.as_deref() == Some(track_id)
+            && reg
+                .loading_started_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(1500))
+    })
+}
+
+/// Строка трека с обложкой и длительностью (со стеком прогрузки в suffix)
 pub fn track_row(track: &Track, on_activate: impl Fn() + 'static) -> ActionRow {
     let row = ActionRow::builder()
         .title(track.title_markup())
@@ -278,13 +705,60 @@ pub fn track_row(track: &Track, on_activate: impl Fn() + 'static) -> ActionRow {
     }
 
     let dur_str = track.formatted_duration();
-    if !dur_str.is_empty() {
-        let dur = Label::new(Some(&dur_str));
-        dur.add_css_class("dim-label");
-        row.add_suffix(&dur);
-    }
+    let dur_label = Label::new(Some(&dur_str));
+    dur_label.add_css_class("dim-label");
+    dur_label.add_css_class("track-dur-label");
+    dur_label.set_xalign(1.0);
 
-    row.connect_activated(move |_| on_activate());
+    let spinner = Spinner::new();
+    spinner.set_size_request(16, 16);
+    spinner.set_halign(Align::Center);
+    spinner.set_valign(Align::Center);
+    spinner.add_css_class("track-loading-spinner");
+
+    let dur_stack = Stack::new();
+    dur_stack.add_css_class("track-dur-stack");
+    dur_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
+    dur_stack.set_transition_duration(120);
+    dur_stack.set_valign(Align::Center);
+    dur_stack.add_named(&dur_label, Some("dur"));
+    dur_stack.add_named(&spinner, Some("loading"));
+    dur_stack.set_visible_child_name("dur");
+    row.add_suffix(&dur_stack);
+
+    let entry = TrackRowEntry {
+        track_id: track.id.clone(),
+        row: row.downgrade(),
+        stack: dur_stack.downgrade(),
+        spinner: spinner.downgrade(),
+    };
+    TRACK_ROW_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        reg.retain_alive();
+        let loading_id = reg.loading_track_id.as_deref();
+        apply_loading_to_entry(&entry, loading_id);
+        let playing_id = reg.playing_track_id.as_deref();
+        apply_playing_to_entry(&entry, playing_id);
+        reg.entries.push(entry);
+    });
+
+    let track_id = track.id.clone();
+    let track_title = track.title.clone();
+    row.connect_activated(move |_| {
+        if is_duplicate_loading_click(&track_id) {
+            eprintln!(
+                "[ui] ignore duplicate click on loading track_row: id={}",
+                track_id
+            );
+            return;
+        }
+        eprintln!(
+            "[ui] activate track_row: id={} title=\"{}\"",
+            track_id, track_title
+        );
+        set_loading_track_id(Some(&track_id));
+        on_activate();
+    });
     row
 }
 
@@ -295,11 +769,14 @@ pub fn item_row(title: &str, subtitle: &str, url: Option<String>, round: bool, o
         .subtitle(glib::markup_escape_text(subtitle))
         .activatable(true)
         .build();
-    let cover = cover_image(40, url.clone());
-    if round {
-        cover.add_css_class("round-cover");
-        load_artist_avatar(&cover, title, url);
-    }
+    let cover = if round {
+        let img = cover_image(40, None);
+        img.add_css_class("round-cover");
+        load_artist_avatar(&img, title, url, 40);
+        img
+    } else {
+        cover_image(40, url)
+    };
     row.add_prefix(&cover);
     row.add_suffix(&Image::from_icon_name("go-next-symbolic"));
     row.connect_activated(move |_| on_activate());
@@ -313,9 +790,9 @@ pub fn artist_row(artist_name: &str, subtitle: &str, fallback_url: Option<String
         .subtitle(glib::markup_escape_text(subtitle))
         .activatable(true)
         .build();
-    let cover = cover_image(40, fallback_url.clone());
+    let cover = cover_image(40, None);
     cover.add_css_class("round-cover");
-    load_artist_avatar(&cover, artist_name, fallback_url);
+    load_artist_avatar(&cover, artist_name, fallback_url, 40);
     row.add_prefix(&cover);
     row.add_suffix(&Image::from_icon_name("go-next-symbolic"));
     row.connect_activated(move |_| on_activate());
@@ -375,6 +852,8 @@ pub struct DetailPage {
     owner_target: Rc<RefCell<Option<(String, String)>>>,
     /// Поиск треков для добавления и заглушка пустого плейлиста (только у своих)
     owner_box: GtkBox,
+    owner_search: gtk4::SearchEntry,
+    owner_results: ListBox,
     empty: GtkBox,
     desc_btn: Button,
     cover_btn: Button,
@@ -388,6 +867,12 @@ pub struct DetailPage {
     owner_btn: gtk4::MenuButton,
     /// Вызывается после удаления плейлиста, чтобы владелец страницы обновил свой список
     on_removed: RefCell<Option<Rc<dyn Fn()>>>,
+    /// Число уже созданных виджетов строк в `list` (для порционной подгрузки при прокрутке)
+    rendered_tracks: Rc<Cell<usize>>,
+    /// Поколение текущей открытой страницы; отменяет запоздавшие подгрузки и отложенную очистку
+    page_gen: Rc<Cell<u64>>,
+    /// Защита от планирования нескольких idle-подгрузок следующей порции треков подряд
+    load_more_pending: Rc<Cell<bool>>,
 }
 
 /// «Волна» по артисту или треку, запускается кнопкой на странице
@@ -430,7 +915,6 @@ impl DetailPage {
         back.set_margin_top(24);
         back.set_margin_start(32);
         back.set_tooltip_text(Some("Назад"));
-        back.connect_clicked(move |_| on_back());
         let heart_btn = Button::with_label(heart_glyph(false));
         heart_btn.add_css_class("pill");
         heart_btn.set_tooltip_text(Some("Мне нравится"));
@@ -652,6 +1136,9 @@ impl DetailPage {
         list.set_selection_mode(gtk4::SelectionMode::None);
 
         let tracks: Rc<RefCell<Vec<Track>>> = Rc::default();
+        let rendered_tracks = Rc::new(Cell::new(0usize));
+        let page_gen = Rc::new(Cell::new(0u64));
+        let load_more_pending = Rc::new(Cell::new(false));
         let source: Rc<RefCell<Option<PlaySource>>> = Rc::default();
         let owner_target: Rc<RefCell<Option<(String, String)>>> = Rc::default();
         let nav: NavCell = Rc::default();
@@ -681,8 +1168,16 @@ impl DetailPage {
 
         {
             let seq = Rc::new(std::cell::Cell::new(0u32));
-            let (p, tracks, target, list, empty, results, nav) =
-                (player.clone(), tracks.clone(), owner_target.clone(), list.clone(), empty.clone(), results.clone(), nav.clone());
+            let (p, tracks, target, list, empty, results, nav, rendered) = (
+                player.clone(),
+                tracks.clone(),
+                owner_target.clone(),
+                list.clone(),
+                empty.clone(),
+                results.clone(),
+                nav.clone(),
+                rendered_tracks.clone(),
+            );
             search.connect_search_changed(move |e| {
                 let q = e.text().trim().to_string();
                 seq.set(seq.get() + 1);
@@ -692,8 +1187,17 @@ impl DetailPage {
                 if q.is_empty() {
                     return;
                 }
-                let (p, tracks, target, list, empty, results, seq, nav) =
-                    (p.clone(), tracks.clone(), target.clone(), list.clone(), empty.clone(), results.clone(), seq.clone(), nav.clone());
+                let (p, tracks, target, list, empty, results, seq, nav, rendered) = (
+                    p.clone(),
+                    tracks.clone(),
+                    target.clone(),
+                    list.clone(),
+                    empty.clone(),
+                    results.clone(),
+                    seq.clone(),
+                    nav.clone(),
+                    rendered.clone(),
+                );
                 glib::spawn_future_local(async move {
                     let client = p.client.lock().unwrap().clone();
                     let Ok(found) = client.search(&q).await else { return };
@@ -711,18 +1215,35 @@ impl DetailPage {
                         add.add_css_class("circular");
                         add.set_valign(Align::Center);
                         add.set_tooltip_text(Some("Добавить в плейлист"));
-                        let (p, tracks, target, list, empty, t, nav) =
-                            (p.clone(), tracks.clone(), target.clone(), list.clone(), empty.clone(), t.clone(), nav.clone());
+                        let (p, tracks, target, list, empty, t, nav, rendered) = (
+                            p.clone(),
+                            tracks.clone(),
+                            target.clone(),
+                            list.clone(),
+                            empty.clone(),
+                            t.clone(),
+                            nav.clone(),
+                            rendered.clone(),
+                        );
                         add.connect_clicked(move |b| {
                             let Some((uid, kind)) = target.borrow().clone() else { return };
                             b.set_sensitive(false);
-                            let (p, tracks, list, empty, t, b, nav) = (p.clone(), tracks.clone(), list.clone(), empty.clone(), t.clone(), b.clone(), nav.clone());
+                            let (p, tracks, list, empty, t, b, nav, rendered) = (
+                                p.clone(),
+                                tracks.clone(),
+                                list.clone(),
+                                empty.clone(),
+                                t.clone(),
+                                b.clone(),
+                                nav.clone(),
+                                rendered.clone(),
+                            );
                             glib::spawn_future_local(async move {
                                 let client = p.client.lock().unwrap().clone();
                                 match client.add_track_to_playlist(&uid, &kind, &t).await {
                                     Ok(()) => {
                                         b.set_icon_name("object-select-symbolic");
-                                        insert_track_row(&p, &nav, &tracks, &list, &empty, &t);
+                                        insert_track_row(&p, &nav, &tracks, &list, &empty, &rendered, &t);
                                     }
                                     Err(e) => {
                                         b.set_sensitive(true);
@@ -824,7 +1345,106 @@ impl DetailPage {
             });
         }
 
-        Rc::new(Self { widget, cover, kind, title, title_badge, subtitle, list, tracks, source: source.clone(), photos: photos.clone(), ambient_pic, banner_wrap, banner_pic, banner_src, banner_rendered_w, banner_resize_pending, video, video_shared, video_gen, listeners: listeners.clone(), listeners_label: listeners_label.clone(), player: player.clone(), wave_btn, wave, extra, link_handler, link_albums: RefCell::default(), link_artists: RefCell::default(), about, about_for: Rc::default(), back, scrolled, nav, owner_target, owner_box, empty, desc_btn, cover_btn, offline_btn, cover_handler: Default::default(), heart_btn, heart_handler: Default::default(), desc_handler: Default::default(), owner_btn, on_removed: RefCell::default() })
+        let page = Rc::new(Self {
+            widget,
+            cover,
+            kind,
+            title,
+            title_badge,
+            subtitle,
+            list,
+            tracks,
+            source: source.clone(),
+            photos: photos.clone(),
+            ambient_pic,
+            banner_wrap,
+            banner_pic,
+            banner_src,
+            banner_rendered_w,
+            banner_resize_pending,
+            video,
+            video_shared,
+            video_gen,
+            listeners: listeners.clone(),
+            listeners_label: listeners_label.clone(),
+            player: player.clone(),
+            wave_btn,
+            wave,
+            extra,
+            link_handler,
+            link_albums: RefCell::default(),
+            link_artists: RefCell::default(),
+            about,
+            about_for: Rc::default(),
+            back,
+            scrolled,
+            nav,
+            owner_target,
+            owner_box,
+            owner_search: search,
+            owner_results: results,
+            empty,
+            desc_btn,
+            cover_btn,
+            offline_btn,
+            cover_handler: Default::default(),
+            heart_btn,
+            heart_handler: Default::default(),
+            desc_handler: Default::default(),
+            owner_btn,
+            on_removed: RefCell::default(),
+            rendered_tracks,
+            page_gen,
+            load_more_pending,
+        });
+
+        {
+            let weak = Rc::downgrade(&page);
+            page.back.connect_clicked(move |_| {
+                on_back();
+                let Some(pg) = weak.upgrade() else { return };
+                let gen_at_back = pg.page_gen.get();
+                let weak_after = Rc::downgrade(&pg);
+                // Очищаем виджеты только после завершения Crossfade-анимации (~250 мс)
+                // и только если пользователь за это время не открыл другую страницу.
+                glib::timeout_add_local_once(std::time::Duration::from_millis(260), move || {
+                    let Some(pg) = weak_after.upgrade() else { return };
+                    if pg.page_gen.get() != gen_at_back {
+                        return;
+                    }
+                    let hidden = pg
+                        .nav
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|(stack, _)| stack.visible_child_name().as_deref() != Some("detail"));
+                    if hidden {
+                        pg.clear_content();
+                    }
+                });
+            });
+        }
+
+        {
+            let adj = page.scrolled.vadjustment();
+            let weak_scroll = Rc::downgrade(&page);
+            adj.connect_value_changed(move |_| {
+                if let Some(pg) = weak_scroll.upgrade() {
+                    if pg.should_load_more_tracks() {
+                        pg.schedule_load_more_tracks();
+                    }
+                }
+            });
+            let weak_changed = Rc::downgrade(&page);
+            adj.connect_changed(move |_| {
+                if let Some(pg) = weak_changed.upgrade() {
+                    if pg.should_load_more_tracks() {
+                        pg.schedule_load_more_tracks();
+                    }
+                }
+            });
+        }
+
+        page
     }
 
     /// Синхронизирует боковые отступы содержимого и кнопки «Назад», сохраняя фон на всю ширину
@@ -842,7 +1462,7 @@ impl DetailPage {
         if let Some(old) = self.desc_handler.take() {
             self.desc_btn.disconnect(old);
         }
-        let (page, uid, kind, text) = (self.clone(), uid.to_string(), kind.to_string(), text.to_string());
+        let (weak_page, uid, kind, text) = (Rc::downgrade(self), uid.to_string(), kind.to_string(), text.to_string());
         let id = self.desc_btn.connect_clicked(move |b| {
             let dialog = libadwaita::AlertDialog::new(Some("Описание плейлиста"), None);
             let entry = gtk4::Entry::new();
@@ -853,12 +1473,14 @@ impl DetailPage {
             dialog.add_response("save", "Сохранить");
             dialog.set_response_appearance("save", libadwaita::ResponseAppearance::Suggested);
             dialog.set_default_response(Some("save"));
-            let (page, uid, kind) = (page.clone(), uid.clone(), kind.clone());
+            let (weak_page, uid, kind) = (weak_page.clone(), uid.clone(), kind.clone());
             dialog.choose(Some(b), None::<&gtk4::gio::Cancellable>, move |response| {
                 if response != "save" {
                     return;
                 }
+                let Some(page) = weak_page.upgrade() else { return };
                 let new_text = entry.text().trim().to_string();
+                let (uid, kind) = (uid.clone(), kind.clone());
                 glib::spawn_future_local(async move {
                     let client = page.player.client.lock().unwrap().clone();
                     match client.set_playlist_description(&uid, &kind, &new_text).await {
@@ -898,9 +1520,9 @@ impl DetailPage {
         if let Some(old) = self.cover_handler.take() {
             self.cover_btn.disconnect(old);
         }
-        let (page, uid, kind) = (self.clone(), uid.to_string(), kind.to_string());
+        let (weak_page, uid, kind) = (Rc::downgrade(self), uid.to_string(), kind.to_string());
         let id = self.cover_btn.connect_clicked(move |b| {
-            let (page, uid, kind, b) = (page.clone(), uid.clone(), kind.clone(), b.clone());
+            let (weak_page, uid, kind, b) = (weak_page.clone(), uid.clone(), kind.clone(), b.clone());
             glib::spawn_future_local(async move {
                 let filter = gtk4::FileFilter::new();
                 filter.add_mime_type("image/png");
@@ -912,6 +1534,7 @@ impl DetailPage {
                 let window = b.root().and_downcast::<gtk4::Window>();
                 let Ok(file) = dialog.open_future(window.as_ref()).await else { return };
                 let Some(path) = file.path() else { return };
+                let Some(page) = weak_page.upgrade() else { return };
                 let Ok(data) = std::fs::read(&path) else {
                     page.player.emit(PlayerUiEvent::Error("Не удалось прочитать файл".into()));
                     return;
@@ -926,7 +1549,7 @@ impl DetailPage {
                 match client.upload_playlist_cover(&uid, &kind, &name, mime, data).await {
                     Ok(url) => {
                         let url = url.map(|u| crate::api::models::cover_url(&u, 400));
-                        load_cover(&page.cover, url);
+                        load_cover_sized(&page.cover, url, 180);
                         page.player.emit(PlayerUiEvent::StatusMessage("Обложка загружена".into()));
                     }
                     Err(e) => page.player.emit(PlayerUiEvent::Error(format!("Не удалось загрузить обложку: {}", e))),
@@ -1014,30 +1637,69 @@ impl DetailPage {
         views.add_named(&others, Some("others"));
         pop.set_child(Some(&views));
         pop.connect_closed({
-            let views = views.clone();
-            move |_| views.set_visible_child_name("main")
+            let views_weak = views.downgrade();
+            move |_| {
+                if let Some(views) = views_weak.upgrade() {
+                    views.set_visible_child_name("main");
+                }
+            }
         });
         self.owner_btn.set_popover(Some(&pop));
         self.owner_btn.set_visible(true);
 
+        let weak_page = Rc::downgrade(self);
+        let pop_weak = pop.downgrade();
+        let views_weak = views.downgrade();
+        let others_weak = others.downgrade();
+
         {
-            let (page, views, others, pop, uid, kind) = (self.clone(), views.clone(), others.clone(), pop.clone(), uid.clone(), kind.clone());
+            let (weak_page, views_weak, others_weak, pop_weak, uid, kind) = (
+                weak_page.clone(),
+                views_weak.clone(),
+                others_weak.clone(),
+                pop_weak.clone(),
+                uid.clone(),
+                kind.clone(),
+            );
             to_other.connect_clicked(move |_| {
+                let (Some(others), Some(views)) = (others_weak.upgrade(), views_weak.upgrade()) else {
+                    return;
+                };
                 clear_box(&others);
                 let back = menu_item("go-previous-symbolic", "Назад");
-                let v = views.clone();
-                back.connect_clicked(move |_| v.set_visible_child_name("main"));
+                let v = views.downgrade();
+                back.connect_clicked(move |_| {
+                    if let Some(views) = v.upgrade() {
+                        views.set_visible_child_name("main");
+                    }
+                });
                 others.append(&back);
                 views.set_visible_child_name("others");
-                let (page, others, pop, uid, kind) = (page.clone(), others.clone(), pop.clone(), uid.clone(), kind.clone());
+                let (weak_page, others_weak, pop_weak, uid, kind) = (
+                    weak_page.clone(),
+                    others_weak.clone(),
+                    pop_weak.clone(),
+                    uid.clone(),
+                    kind.clone(),
+                );
                 glib::spawn_future_local(async move {
+                    let Some(page) = weak_page.upgrade() else { return };
                     let client = page.player.client.lock().unwrap().clone();
                     let Ok(lists) = client.get_user_playlists(&uid).await else { return };
+                    let Some(others) = others_weak.upgrade() else { return };
                     for pl in lists.into_iter().filter(|l| l.kind != kind) {
                         let b = menu_item("view-list-symbolic", &pl.title);
-                        let (page, pop, uid, target) = (page.clone(), pop.clone(), uid.clone(), pl.kind.clone());
+                        let (weak_page, pop_weak, uid, target) = (
+                            weak_page.clone(),
+                            pop_weak.clone(),
+                            uid.clone(),
+                            pl.kind.clone(),
+                        );
                         b.connect_clicked(move |_| {
-                            pop.popdown();
+                            if let Some(pop) = pop_weak.upgrade() {
+                                pop.popdown();
+                            }
+                            let Some(page) = weak_page.upgrade() else { return };
                             let tracks = page.tracks.borrow().clone();
                             let (uid, target) = (uid.clone(), target.clone());
                             run_api(&page.player, Some("Треки добавлены в плейлист"), move |c, _| async move {
@@ -1058,9 +1720,12 @@ impl DetailPage {
             });
         }
         {
-            let (page, pop, uid, kind) = (self.clone(), pop.clone(), uid.clone(), kind.clone());
+            let (weak_page, pop_weak, uid, kind) = (weak_page.clone(), pop_weak.clone(), uid.clone(), kind.clone());
             rename.connect_clicked(move |b| {
-                pop.popdown();
+                if let Some(pop) = pop_weak.upgrade() {
+                    pop.popdown();
+                }
+                let Some(page) = weak_page.upgrade() else { return };
                 let dialog = libadwaita::AlertDialog::new(Some("Название плейлиста"), None);
                 let entry = gtk4::Entry::new();
                 entry.set_text(&page.title.text());
@@ -1070,13 +1735,15 @@ impl DetailPage {
                 dialog.add_response("save", "Сохранить");
                 dialog.set_response_appearance("save", libadwaita::ResponseAppearance::Suggested);
                 dialog.set_default_response(Some("save"));
-                let (page, uid, kind) = (page.clone(), uid.clone(), kind.clone());
+                let (weak_page, uid, kind) = (weak_page.clone(), uid.clone(), kind.clone());
                 dialog.choose(Some(b), None::<&gtk4::gio::Cancellable>, move |response| {
                     let name = entry.text().trim().to_string();
                     if response != "save" || name.is_empty() {
                         return;
                     }
+                    let (weak_page, uid, kind) = (weak_page.clone(), uid.clone(), kind.clone());
                     glib::spawn_future_local(async move {
+                        let Some(page) = weak_page.upgrade() else { return };
                         let client = page.player.client.lock().unwrap().clone();
                         match client.rename_playlist(&uid, &kind, &name).await {
                             Ok(()) => page.title.set_text(&name),
@@ -1087,35 +1754,44 @@ impl DetailPage {
             });
         }
         {
-            let (page, pop, uid, kind) = (self.clone(), pop.clone(), uid.clone(), kind.clone());
+            let (weak_page, pop_weak, uid, kind) = (weak_page.clone(), pop_weak.clone(), uid.clone(), kind.clone());
             wave.connect_clicked(move |_| {
-                pop.popdown();
-                page.player.play_playlist_wave(&uid, &kind, &page.title.text());
+                if let Some(pop) = pop_weak.upgrade() {
+                    pop.popdown();
+                }
+                if let Some(page) = weak_page.upgrade() {
+                    page.player.play_playlist_wave(&uid, &kind, &page.title.text());
+                }
             });
         }
         {
-            let (p, pop, uid, kind) = (self.player.clone(), pop.clone(), uid.clone(), kind.clone());
+            let (p, pop_weak, uid, kind) = (self.player.clone(), pop_weak.clone(), uid.clone(), kind.clone());
             share.connect_clicked(move |_| {
-                pop.popdown();
+                if let Some(pop) = pop_weak.upgrade() {
+                    pop.popdown();
+                }
                 if let Some(d) = gdk::Display::default() {
                     d.clipboard().set_text(&format!("https://music.yandex.ru/users/{}/playlists/{}", uid, kind));
                     p.emit(PlayerUiEvent::StatusMessage("Ссылка скопирована".into()));
                 }
             });
         }
-        let page = self.clone();
         delete.connect_clicked(move |b| {
-            pop.popdown();
+            if let Some(pop) = pop_weak.upgrade() {
+                pop.popdown();
+            }
             let dialog = libadwaita::AlertDialog::new(Some("Удалить плейлист?"), Some("Это действие нельзя отменить."));
             dialog.add_response("cancel", "Отмена");
             dialog.add_response("delete", "Удалить");
             dialog.set_response_appearance("delete", libadwaita::ResponseAppearance::Destructive);
-            let (page, uid, kind) = (page.clone(), uid.clone(), kind.clone());
+            let (weak_page, uid, kind) = (weak_page.clone(), uid.clone(), kind.clone());
             dialog.choose(Some(b), None::<&gtk4::gio::Cancellable>, move |response| {
                 if response != "delete" {
                     return;
                 }
+                let (weak_page, uid, kind) = (weak_page.clone(), uid.clone(), kind.clone());
                 glib::spawn_future_local(async move {
+                    let Some(page) = weak_page.upgrade() else { return };
                     let client = page.player.client.lock().unwrap().clone();
                     match client.delete_playlist(&uid, &kind).await {
                         Ok(()) => {
@@ -1170,19 +1846,26 @@ impl DetailPage {
         self.ambient_pic.set_visible(false);
         let token = self.video_gen.get() + 1;
         self.video_gen.set(token);
-        let page = self.clone();
+        let weak_page = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let cache_key = format!("yt-banner-raw:{url}");
+            let cache_key = (format!("yt-banner-raw:{url}"), BANNER_MAX_PX);
             let tex = if let Some(cached) = COVERS.with(|c| c.borrow_mut().get(&cache_key)) {
                 cached
             } else {
                 let Ok(resp) = shared_http_client().get(&url).send().await else { return };
+                if !resp.status().is_success() {
+                    return;
+                }
                 let Ok(bytes) = resp.bytes().await else { return };
-                let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
+                if weak_page.upgrade().is_none_or(|pg| pg.video_token() != token) {
+                    return;
+                }
+                let Some(tex) = decode_texture_scaled(&bytes, BANNER_MAX_PX) else { return };
                 COVERS.with(|c| c.borrow_mut().insert(cache_key, tex.clone()));
                 tex
             };
 
+            let Some(page) = weak_page.upgrade() else { return };
             if page.video_token() != token {
                 return;
             }
@@ -1455,6 +2138,12 @@ impl DetailPage {
     }
 
     pub fn show(&self, kind: &str, title: &str, subtitle: &str, cover_url: Option<String>, tracks: Vec<Track>) {
+        eprintln!(
+            "[ui] detail open: kind=\"{}\" title=\"{}\" tracks={}",
+            kind,
+            title,
+            tracks.len()
+        );
         self.kind.set_text(kind);
         self.title.set_text(title);
         self.stop_background_video();
@@ -1468,26 +2157,36 @@ impl DetailPage {
         self.title_badge.set_visible(false);
         self.subtitle.set_markup(&glib::markup_escape_text(subtitle));
         self.link_albums.borrow_mut().clear();
+        self.link_artists.borrow_mut().clear();
         clear_box(&self.about);
         self.about.set_visible(false);
         self.about_for.borrow_mut().clear();
+        clear_image_cover(&self.cover);
         self.cover.set_icon_name(Some("audio-x-generic-symbolic"));
-        load_cover(&self.cover, cover_url.clone());
-        if cover_url.as_deref().map_or(false, |u| u.contains("ytimg.com")) {
+        load_cover_sized(&self.cover, cover_url.clone(), 180);
+        if cover_url.as_deref().is_some_and(|u| u.contains("ytimg.com")) {
             let weak_cover = self.cover.downgrade();
+            let expected_req = current_image_req(&self.cover);
             let a_str = subtitle.to_string();
             let t_str = title.to_string();
             glib::spawn_future_local(async move {
                 if let Some(studio_url) = crate::cache::resolve_studio_cover(&a_str, &t_str).await {
                     if let Some(img) = weak_cover.upgrade() {
-                        load_cover(&img, Some(studio_url));
+                        let still_current = COVERS.with(|c| c.borrow().is_current_image_req(&img, expected_req));
+                        if still_current {
+                            load_cover_sized(&img, Some(studio_url), 180);
+                        }
                     }
                 }
             });
         }
         self.set_round_cover(false);
         self.wave_btn.set_visible(false);
+        self.owner_btn.set_popover(None::<&gtk4::Popover>);
         self.owner_btn.set_visible(false);
+        self.owner_results.remove_all();
+        self.owner_results.set_visible(false);
+        self.owner_search.set_text("");
         self.owner_box.set_visible(false);
         self.heart_btn.set_visible(false);
         self.desc_btn.set_visible(false);
@@ -1495,31 +2194,183 @@ impl DetailPage {
         *self.owner_target.borrow_mut() = None;
         *self.wave.borrow_mut() = None;
         clear_box(&self.extra);
+        self.scrolled.vadjustment().set_value(0.0);
 
         self.set_tracks(tracks);
     }
 
-    /// Обновляет список треков на странице
+    /// Обновляет список треков на странице (сразу создаётся только первая порция строк).
     pub fn set_tracks(&self, tracks: Vec<Track>) {
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
-        }
-        for track in tracks.iter() {
-            let (p, t, id, src) = (self.player.clone(), self.tracks.clone(), track.id.clone(), self.source.clone());
-            // позицию ищем по id: добавление в плейлист сдвигает индексы
-            let row = track_row(track, move || {
-                let i = t.borrow().iter().position(|x| x.id == id).unwrap_or(0);
-                p.set_queue_and_play_from(t.borrow().clone(), i, src.borrow().clone())
-            });
-            row.add_suffix(&row_actions(&self.player, &self.nav, track));
-            self.list.append(&row);
-        }
+        self.page_gen.set(self.page_gen.get().wrapping_add(1));
+        self.load_more_pending.set(false);
+        self.list.remove_all();
+
+        let total = tracks.len();
+        let initial_end = total.min(DETAIL_TRACKS_BATCH);
+        self.rendered_tracks.set(initial_end);
         self.empty.set_visible(tracks.is_empty());
         self.offline_btn.set_label(offline_label(&tracks));
         self.offline_btn.set_visible(
             !tracks.is_empty() && !tracks.iter().any(|track| track.source == TrackSource::Vk),
         );
         *self.tracks.borrow_mut() = tracks;
+        if initial_end > 0 {
+            self.append_track_range(0, initial_end);
+        }
+    }
+
+    /// Создаёт и добавляет строки треков для диапазона `start..end` уже загруженного `self.tracks`.
+    fn append_track_range(&self, start: usize, end: usize) {
+        let slice: Vec<Track> = {
+            let guard = self.tracks.borrow();
+            let clamped_end = end.min(guard.len());
+            if start >= clamped_end {
+                return;
+            }
+            guard[start..clamped_end].to_vec()
+        };
+        for track in &slice {
+            let row = build_track_list_row(
+                &self.player,
+                &self.nav,
+                &self.tracks,
+                &self.source,
+                track,
+            );
+            self.list.append(&row);
+        }
+    }
+
+    /// Проверяет, приблизилась ли прокрутка к нижней границе уже отрендеренного списка треков.
+    fn should_load_more_tracks(&self) -> bool {
+        let total = self.tracks.borrow().len();
+        if self.rendered_tracks.get() >= total {
+            return false;
+        }
+        let adj = self.scrolled.vadjustment();
+        let page_size = adj.page_size();
+        // Пока виджет не прошёл первичную разметку, не догружаем сверх стартовой порции.
+        if page_size <= 1.0 {
+            return false;
+        }
+        let extra_h = if self.extra.is_visible() {
+            self.extra.height().max(0) as f64
+        } else {
+            0.0
+        };
+        let list_bottom = (adj.upper() - extra_h).max(0.0);
+        list_bottom <= page_size + DETAIL_LOAD_MORE_MARGIN_PX
+            || (list_bottom - (adj.value() + page_size)) < DETAIL_LOAD_MORE_MARGIN_PX
+    }
+
+    /// Планирует асинхронную догрузку следующей порции строк на ближайшем idle-тике.
+    fn schedule_load_more_tracks(self: &Rc<Self>) {
+        if self.load_more_pending.get() {
+            return;
+        }
+        if self.rendered_tracks.get() >= self.tracks.borrow().len() {
+            return;
+        }
+        self.load_more_pending.set(true);
+        let expected_gen = self.page_gen.get();
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(page) = weak.upgrade() else { return };
+            page.load_more_pending.set(false);
+            if page.page_gen.get() != expected_gen {
+                return;
+            }
+            if !page.should_load_more_tracks() {
+                return;
+            }
+            page.load_next_track_batch();
+        });
+    }
+
+    /// Догружает до `DETAIL_TRACKS_BATCH` следующих строк списка треков.
+    fn load_next_track_batch(self: &Rc<Self>) {
+        let start = self.rendered_tracks.get();
+        let total = self.tracks.borrow().len();
+        if start >= total {
+            return;
+        }
+        let end = (start + DETAIL_TRACKS_BATCH).min(total);
+        self.append_track_range(start, end);
+        self.rendered_tracks.set(end);
+        if self.should_load_more_tracks() {
+            self.schedule_load_more_tracks();
+        }
+    }
+
+    /// Освобождает виджеты, треки, баннер, видео и обработчики скрытой страницы деталей.
+    pub fn clear_content(&self) {
+        let tracks_count = self.tracks.borrow().len();
+        let had_content = tracks_count > 0
+            || self.banner_src.borrow().is_some()
+            || self.banner_pic.paintable().is_some()
+            || self.ambient_pic.paintable().is_some()
+            || !self.photos.borrow().is_empty()
+            || self.cover.paintable().is_some()
+            || self.about.first_child().is_some()
+            || !self.about_for.borrow().is_empty()
+            || self.extra.first_child().is_some();
+
+        self.page_gen.set(self.page_gen.get().wrapping_add(1));
+        self.load_more_pending.set(false);
+        self.rendered_tracks.set(0);
+        self.tracks.borrow_mut().clear();
+        self.list.remove_all();
+        self.empty.set_visible(false);
+        self.offline_btn.set_visible(false);
+
+        self.stop_background_video();
+        self.photos.borrow_mut().clear();
+        self.cover.set_cursor(None::<&gdk::Cursor>);
+        self.cover.set_tooltip_text(None);
+        clear_image_cover(&self.cover);
+        self.cover.set_icon_name(Some("audio-x-generic-symbolic"));
+        self.set_round_cover(false);
+
+        clear_box(&self.extra);
+        clear_box(&self.about);
+        self.about.set_visible(false);
+        self.about_for.borrow_mut().clear();
+        self.link_albums.borrow_mut().clear();
+        self.link_artists.borrow_mut().clear();
+
+        self.owner_results.remove_all();
+        self.owner_results.set_visible(false);
+        self.owner_search.set_text("");
+        self.owner_box.set_visible(false);
+        *self.owner_target.borrow_mut() = None;
+        self.owner_btn.set_popover(None::<&gtk4::Popover>);
+        self.owner_btn.set_visible(false);
+        *self.wave.borrow_mut() = None;
+        self.wave_btn.set_visible(false);
+
+        if let Some(id) = self.cover_handler.take() {
+            self.cover_btn.disconnect(id);
+        }
+        if let Some(id) = self.heart_handler.take() {
+            self.heart_btn.disconnect(id);
+        }
+        if let Some(id) = self.desc_handler.take() {
+            self.desc_btn.disconnect(id);
+        }
+        self.cover_btn.set_visible(false);
+        self.heart_btn.set_visible(false);
+        self.desc_btn.set_visible(false);
+
+        self.scrolled.vadjustment().set_value(0.0);
+        prune_dead_caches();
+        crate::trim_allocator();
+        if had_content {
+            eprintln!(
+                "[ui] detail clear: tracks={} rss_mb={:.1}",
+                tracks_count,
+                crate::current_rss_mb()
+            );
+        }
     }
 
     /// Реактивно добавляет или удаляет трек из «Мне нравится» или обновляет сердечко в открытых списках
@@ -1529,7 +2380,15 @@ impl DetailPage {
                 if self.tracks.borrow().iter().any(|t| t.id == track.id) {
                     return;
                 }
-                insert_track_row(&self.player, &self.nav, &self.tracks, &self.list, &self.empty, track);
+                insert_track_row(
+                    &self.player,
+                    &self.nav,
+                    &self.tracks,
+                    &self.list,
+                    &self.empty,
+                    &self.rendered_tracks,
+                    track,
+                );
                 let count = self.tracks.borrow().len();
                 self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
                 self.offline_btn.set_visible(track.source != TrackSource::Vk);
@@ -1537,8 +2396,12 @@ impl DetailPage {
                 let pos = self.tracks.borrow().iter().position(|t| t.id == track.id);
                 if let Some(idx) = pos {
                     self.tracks.borrow_mut().remove(idx);
-                    if let Some(row) = self.list.row_at_index(idx as i32) {
-                        self.list.remove(&row);
+                    let rendered = self.rendered_tracks.get();
+                    if idx < rendered {
+                        if let Some(row) = self.list.row_at_index(idx as i32) {
+                            self.list.remove(&row);
+                        }
+                        self.rendered_tracks.set(rendered - 1);
                     }
                     let count = self.tracks.borrow().len();
                     self.subtitle.set_markup(&glib::markup_escape_text(&format!("{} треков", count)));
@@ -1551,28 +2414,55 @@ impl DetailPage {
         } else {
             // В открытых страницах альбомов, артистов или плейлистов обновляем сердечко на соответствующей строке
             if let Some(idx) = self.tracks.borrow().iter().position(|t| t.id == track.id) {
-                if let Some(row) = self.list.row_at_index(idx as i32) {
-                    update_heart_in_widget(row.upcast_ref(), liked);
+                if idx < self.rendered_tracks.get() {
+                    if let Some(row) = self.list.row_at_index(idx as i32) {
+                        update_heart_in_widget(row.upcast_ref(), liked);
+                    }
                 }
             }
         }
     }
 }
 
-/// Добавляет трек в начало списка страницы (как делает сервер при добавлении в плейлист)
-fn insert_track_row(p: &PlayerManager, nav: &NavCell, tracks: &Rc<RefCell<Vec<Track>>>, list: &ListBox, empty: &GtkBox, track: &Track) {
-    tracks.borrow_mut().insert(0, track.clone());
-    empty.set_visible(false);
-    let (p2, t) = (p.clone(), tracks.clone());
-    // индексы строк сдвинулись, поэтому позицию ищем по id
-    let id = track.id.clone();
-    let source = nav.borrow().as_ref().and_then(|(_, w)| w.upgrade()).map(|pg| pg.source.clone()).unwrap_or_default();
+/// Строит строку трека для `DetailPage` с актуальным поиском позиции в полной очереди по ID.
+fn build_track_list_row(
+    p: &PlayerManager,
+    nav: &NavCell,
+    tracks: &Rc<RefCell<Vec<Track>>>,
+    source: &Rc<RefCell<Option<PlaySource>>>,
+    track: &Track,
+) -> ActionRow {
+    let (p2, t, id, src) = (p.clone(), tracks.clone(), track.id.clone(), source.clone());
+    // позицию ищем по id: добавление в плейлист сдвигает индексы
     let row = track_row(track, move || {
         let i = t.borrow().iter().position(|x| x.id == id).unwrap_or(0);
-        p2.set_queue_and_play_from(t.borrow().clone(), i, source.borrow().clone())
+        p2.set_queue_and_play_from(t.borrow().clone(), i, src.borrow().clone())
     });
     row.add_suffix(&row_actions(p, nav, track));
+    row
+}
+
+/// Добавляет трек в начало списка страницы (как делает сервер при добавлении в плейлист)
+fn insert_track_row(
+    p: &PlayerManager,
+    nav: &NavCell,
+    tracks: &Rc<RefCell<Vec<Track>>>,
+    list: &ListBox,
+    empty: &GtkBox,
+    rendered_tracks: &Rc<Cell<usize>>,
+    track: &Track,
+) {
+    tracks.borrow_mut().insert(0, track.clone());
+    empty.set_visible(false);
+    let source = nav
+        .borrow()
+        .as_ref()
+        .and_then(|(_, w)| w.upgrade())
+        .map(|pg| pg.source.clone())
+        .unwrap_or_default();
+    let row = build_track_list_row(p, nav, tracks, &source, track);
     list.insert(&row, 0);
+    rendered_tracks.set(rendered_tracks.get() + 1);
 }
 
 type NavCell = Rc<RefCell<Option<(Stack, std::rc::Weak<DetailPage>)>>>;
@@ -1797,9 +2687,9 @@ pub fn playlist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage
 pub fn artist_tile(player: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, artist: &Artist, source: TrackSource, size: i32) -> Button {
     let col = GtkBox::new(Orientation::Vertical, 4);
     col.set_width_request(size);
-    let cover = cover_image(size, artist.cover_url(300));
+    let cover = cover_image(size, None);
     cover.add_css_class("round-cover");
-    load_artist_avatar(&cover, &artist.name, artist.cover_url(300));
+    load_artist_avatar(&cover, &artist.name, artist.cover_url(300), size);
     col.append(&cover);
     col.append(&ellipsized(&artist.name, "tile-title"));
     col.append(&ellipsized("Исполнитель", "tile-sub"));
@@ -1877,7 +2767,7 @@ pub fn open_artist(
                 let a = &brief.artist;
                 page.show("Исполнитель", &a.name, "", None, brief.popular_tracks);
                 page.set_round_cover(true);
-                load_artist_avatar(&page.cover, &a.name, None);
+                load_artist_avatar(&page.cover, &a.name, None, 180);
                 let real_artist_id = match source {
                     TrackSource::Vk => {
                         if a.id.starts_with("vk:") {
@@ -2215,7 +3105,8 @@ fn menu_item(icon: &str, text: &str) -> Button {
     b
 }
 
-/// Сердечко и меню «⋯» справа от трека: волна по треку, дизлайк, плейлист, ссылка, переходы
+/// Сердечко и меню «⋯» справа от трека: волна по треку, дизлайк, плейлист, ссылка, переходы.
+/// Поповер меню и все его дочерние виджеты строятся лениво только при первом открытии.
 pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage>)>, track: &Track) -> GtkBox {
     let bx = GtkBox::new(Orientation::Horizontal, 2);
     bx.set_valign(Align::Center);
@@ -2248,6 +3139,27 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     menu.set_icon_name("view-more-symbolic");
     menu.add_css_class("flat");
     menu.add_css_class("circular");
+    let nav_weak = nav.map(|(stack, page)| (stack.downgrade(), Rc::downgrade(page)));
+    let p_menu = player.clone();
+    let t_menu = track.clone();
+    menu.set_create_popup_func(move |btn| {
+        if btn.popover().is_none() {
+            let pop = build_track_popover(&p_menu, nav_weak.as_ref(), &t_menu, btn);
+            btn.set_popover(Some(&pop));
+        }
+    });
+
+    bx.append(&menu);
+    bx
+}
+
+/// Строит `Popover` меню трека без циклических сильных ссылок на `Popover` и `MenuButton`.
+fn build_track_popover(
+    player: &PlayerManager,
+    nav_weak: Option<&(glib::WeakRef<Stack>, std::rc::Weak<DetailPage>)>,
+    track: &Track,
+    anchor_btn: &gtk4::MenuButton,
+) -> gtk4::Popover {
     let pop = gtk4::Popover::new();
     let views = Stack::new();
     let main = GtkBox::new(Orientation::Vertical, 0);
@@ -2255,17 +3167,27 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     views.add_named(&main, Some("main"));
     views.add_named(&plists, Some("playlists"));
     pop.set_child(Some(&views));
-    pop.connect_closed({
-        let views = views.clone();
-        move |_| views.set_visible_child_name("main")
-    });
-    menu.set_popover(Some(&pop));
+    {
+        let views_weak = views.downgrade();
+        let plists_weak = plists.downgrade();
+        pop.connect_closed(move |_| {
+            if let Some(views) = views_weak.upgrade() {
+                views.set_visible_child_name("main");
+            }
+            if let Some(plists) = plists_weak.upgrade() {
+                clear_box(&plists);
+            }
+        });
+    }
 
+    let pop_weak = pop.downgrade();
     let add = |icon: &str, text: &str, f: Box<dyn Fn()>| {
         let b = menu_item(icon, text);
-        let pop = pop.clone();
+        let pop_w = pop_weak.clone();
         b.connect_clicked(move |_| {
-            pop.popdown();
+            if let Some(pop) = pop_w.upgrade() {
+                pop.popdown();
+            }
             f();
         });
         main.append(&b);
@@ -2356,20 +3278,35 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     // «Добавить в плейлист» открывает вторую страницу с плейлистами пользователя
     let to_pl = menu_item("list-add-symbolic", "Добавить в плейлист");
     {
-        let (p, t, views, plists) = (player.clone(), track.clone(), views.clone(), plists.clone());
-        let pop = pop.clone();
+        let (p, t, views_weak, plists_weak, pop_w) = (
+            player.clone(),
+            track.clone(),
+            views.downgrade(),
+            plists.downgrade(),
+            pop_weak.clone(),
+        );
         to_pl.connect_clicked(move |_| {
+            let (Some(plists), Some(views)) = (plists_weak.upgrade(), views_weak.upgrade()) else {
+                return;
+            };
             clear_box(&plists);
             let back = menu_item("go-previous-symbolic", "Назад");
-            let v = views.clone();
-            back.connect_clicked(move |_| v.set_visible_child_name("main"));
+            let v = views.downgrade();
+            back.connect_clicked(move |_| {
+                if let Some(views) = v.upgrade() {
+                    views.set_visible_child_name("main");
+                }
+            });
             plists.append(&back);
             let create = menu_item("list-add-symbolic", "Создать плейлист");
-            let is_yt = t.source == TrackSource::YouTubeMusic || p.providers.active_id() == ProviderId::YouTubeMusic;
+            let is_yt = t.source == TrackSource::YouTubeMusic
+                || p.providers.active_id() == ProviderId::YouTubeMusic;
             {
-                let (p, t, pop) = (p.clone(), t.clone(), pop.clone());
+                let (p, t, pop_w) = (p.clone(), t.clone(), pop_w.clone());
                 create.connect_clicked(move |b| {
-                    pop.popdown();
+                    if let Some(pop) = pop_w.upgrade() {
+                        pop.popdown();
+                    }
                     if is_yt {
                         let yt = p.yt_client.clone();
                         let p_clone = p.clone();
@@ -2377,25 +3314,34 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                         ask_playlist_name(b, move |name| {
                             glib::spawn_future_local(async move {
                                 match yt.create_playlist(&name, Some(&t_clone.id)).await {
-                                    Ok(_) => p_clone.emit(PlayerUiEvent::StatusMessage("Плейлист создан, трек добавлен".into())),
-                                    Err(e) => p_clone.emit(PlayerUiEvent::Error(format!("Ошибка создания плейлиста: {}", e))),
+                                    Ok(_) => p_clone.emit(PlayerUiEvent::StatusMessage(
+                                        "Плейлист создан, трек добавлен".into(),
+                                    )),
+                                    Err(e) => p_clone.emit(PlayerUiEvent::Error(format!(
+                                        "Ошибка создания плейлиста: {}",
+                                        e
+                                    ))),
                                 }
                             });
                         });
                     } else {
                         let (p, t) = (p.clone(), t.clone());
                         ask_playlist_name(b, move |name| {
-                            run_api(&p, Some("Плейлист создан, трек добавлен"), move |c, uid| async move {
-                                let kind = c.create_playlist(&uid, &name).await?;
-                                c.add_track_to_playlist(&uid, &kind, &t).await
-                            });
+                            run_api(
+                                &p,
+                                Some("Плейлист создан, трек добавлен"),
+                                move |c, uid| async move {
+                                    let kind = c.create_playlist(&uid, &name).await?;
+                                    c.add_track_to_playlist(&uid, &kind, &t).await
+                                },
+                            );
                         });
                     }
                 });
             }
             plists.append(&create);
             views.set_visible_child_name("playlists");
-            let (p, t, plists, pop) = (p.clone(), t.clone(), plists.clone(), pop.clone());
+            let (p, t, plists_w, pop_w) = (p.clone(), t.clone(), plists_weak.clone(), pop_w.clone());
             glib::spawn_future_local(async move {
                 if is_yt {
                     let lists = if let Some(yt_prov) = p.providers.get(ProviderId::YouTubeMusic) {
@@ -2403,6 +3349,7 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                     } else {
                         p.providers.current().get_playlists().await
                     };
+                    let Some(plists) = plists_w.upgrade() else { return };
                     match lists {
                         Ok(lists) => {
                             for pl in lists {
@@ -2411,21 +3358,36 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                                 let p_clone = p.clone();
                                 let pl_id = pl.id().to_string();
                                 let track_id = t.id.clone();
-                                let pop = pop.clone();
+                                let pop_w = pop_w.clone();
                                 b.connect_clicked(move |_| {
-                                    pop.popdown();
-                                    let (yt, p_clone, pl_id, track_id) = (yt.clone(), p_clone.clone(), pl_id.clone(), track_id.clone());
+                                    if let Some(pop) = pop_w.upgrade() {
+                                        pop.popdown();
+                                    }
+                                    let (yt, p_clone, pl_id, track_id) = (
+                                        yt.clone(),
+                                        p_clone.clone(),
+                                        pl_id.clone(),
+                                        track_id.clone(),
+                                    );
                                     glib::spawn_future_local(async move {
                                         match yt.add_track_to_playlist(&pl_id, &track_id).await {
-                                            Ok(()) => p_clone.emit(PlayerUiEvent::StatusMessage("Добавлено в плейлист".into())),
-                                            Err(e) => p_clone.emit(PlayerUiEvent::Error(format!("Не удалось добавить: {}", e))),
+                                            Ok(()) => p_clone.emit(PlayerUiEvent::StatusMessage(
+                                                "Добавлено в плейлист".into(),
+                                            )),
+                                            Err(e) => p_clone.emit(PlayerUiEvent::Error(format!(
+                                                "Не удалось добавить: {}",
+                                                e
+                                            ))),
                                         }
                                     });
                                 });
                                 plists.append(&b);
                             }
                         }
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить плейлисты: {}", e))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось загрузить плейлисты: {}",
+                            e
+                        ))),
                     }
                 } else {
                     let client = p.client.lock().unwrap().clone();
@@ -2433,23 +3395,38 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
                         Ok(uid) => client.get_user_playlists(&uid).await,
                         Err(e) => Err(e),
                     };
+                    let Some(plists) = plists_w.upgrade() else { return };
                     match lists {
                         Ok(lists) => {
                             for pl in lists {
                                 let b = menu_item("view-list-symbolic", &pl.title);
-                                let (p, t, pop, kind) = (p.clone(), t.clone(), pop.clone(), pl.kind.clone());
+                                let (p, t, pop_w, kind) = (
+                                    p.clone(),
+                                    t.clone(),
+                                    pop_w.clone(),
+                                    pl.kind.clone(),
+                                );
                                 b.connect_clicked(move |_| {
-                                    pop.popdown();
+                                    if let Some(pop) = pop_w.upgrade() {
+                                        pop.popdown();
+                                    }
                                     let t = t.clone();
                                     let kind = kind.clone();
-                                    run_api(&p, Some("Добавлено в плейлист"), move |c, uid| async move {
-                                        c.add_track_to_playlist(&uid, &kind, &t).await
-                                    });
+                                    run_api(
+                                        &p,
+                                        Some("Добавлено в плейлист"),
+                                        move |c, uid| async move {
+                                            c.add_track_to_playlist(&uid, &kind, &t).await
+                                        },
+                                    );
                                 });
                                 plists.append(&b);
                             }
                         }
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось загрузить плейлисты: {}", e))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось загрузить плейлисты: {}",
+                            e
+                        ))),
                     }
                 }
             });
@@ -2488,14 +3465,26 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
             glib::spawn_future_local(async move {
                 if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
                     match p.yt_client.download_track_file(&t).await {
-                        Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!("Сохранено: {}", path.display()))),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось скачать: {}", e))),
+                        Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!(
+                            "Сохранено: {}",
+                            path.display()
+                        ))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось скачать: {}",
+                            e
+                        ))),
                     }
                 } else {
                     let client = p.client.lock().unwrap().clone();
                     match client.download_track(&t).await {
-                        Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!("Сохранено: {}", path.display()))),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось скачать: {}", e))),
+                        Ok(path) => p.emit(PlayerUiEvent::StatusMessage(format!(
+                            "Сохранено: {}",
+                            path.display()
+                        ))),
+                        Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                            "Не удалось скачать: {}",
+                            e
+                        ))),
                     }
                 }
             });
@@ -2504,29 +3493,43 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
     }
     {
         let (p, t) = (player.clone(), track.clone());
-        let offline = add("folder-download-symbolic", "Сохранить офлайн (в приложении)", Box::new(move || {
-            if crate::cache::offline_audio_path(&t.id).is_some() {
-                crate::cache::remove_offline(&t.id);
-                p.emit(PlayerUiEvent::StatusMessage("Удалено из офлайна".into()));
-                return;
-            }
-            p.emit(PlayerUiEvent::StatusMessage("Загрузка для офлайна…".into()));
-            let (p, t) = (p.clone(), t.clone());
-            glib::spawn_future_local(async move {
-                if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
-                    match p.yt_client.save_track_offline(&t).await {
-                        Ok(()) => p.emit(PlayerUiEvent::StatusMessage("Трек сохранён для прослушивания без интернета".into())),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить: {}", e))),
-                    }
-                } else {
-                    let client = p.client.lock().unwrap().clone();
-                    match client.save_track_offline(&t).await {
-                        Ok(()) => p.emit(PlayerUiEvent::StatusMessage("Трек сохранён для прослушивания без интернета".into())),
-                        Err(e) => p.emit(PlayerUiEvent::Error(format!("Не удалось сохранить: {}", e))),
-                    }
+        let offline = add(
+            "folder-download-symbolic",
+            "Сохранить офлайн (в приложении)",
+            Box::new(move || {
+                if crate::cache::offline_audio_path(&t.id).is_some() {
+                    crate::cache::remove_offline(&t.id);
+                    p.emit(PlayerUiEvent::StatusMessage("Удалено из офлайна".into()));
+                    return;
                 }
-            });
-        }));
+                p.emit(PlayerUiEvent::StatusMessage("Загрузка для офлайна…".into()));
+                let (p, t) = (p.clone(), t.clone());
+                glib::spawn_future_local(async move {
+                    if t.source == TrackSource::YouTubeMusic || t.id.len() == 11 {
+                        match p.yt_client.save_track_offline(&t).await {
+                            Ok(()) => p.emit(PlayerUiEvent::StatusMessage(
+                                "Трек сохранён для прослушивания без интернета".into(),
+                            )),
+                            Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                                "Не удалось сохранить: {}",
+                                e
+                            ))),
+                        }
+                    } else {
+                        let client = p.client.lock().unwrap().clone();
+                        match client.save_track_offline(&t).await {
+                            Ok(()) => p.emit(PlayerUiEvent::StatusMessage(
+                                "Трек сохранён для прослушивания без интернета".into(),
+                            )),
+                            Err(e) => p.emit(PlayerUiEvent::Error(format!(
+                                "Не удалось сохранить: {}",
+                                e
+                            ))),
+                        }
+                    }
+                });
+            }),
+        );
         offline.set_visible(track.source != TrackSource::Vk);
     }
     {
@@ -2582,32 +3585,59 @@ pub fn track_actions(player: &PlayerManager, nav: Option<(&Stack, &Rc<DetailPage
         html.set_visible(track.source != TrackSource::Vk);
     }
     {
-        let (p, t, anchor) = (player.clone(), track.clone(), menu.clone());
-        add("dialog-information-symbolic", "О треке", Box::new(move || show_track_credits(&p, &anchor, &t)));
+        let (p, t, btn_weak) = (player.clone(), track.clone(), anchor_btn.downgrade());
+        add("dialog-information-symbolic", "О треке", Box::new(move || {
+            if let Some(anchor) = btn_weak.upgrade() {
+                show_track_credits(&p, &anchor, &t);
+            }
+        }));
     }
     // переходы нужны экрану со стеком страниц; без него (например, добавление в плейлист на лету) их нет
-    if let (Some((stack, page)), Some(album)) = (nav, track.albums.first().cloned()) {
-        let (p, stack, page) = (player.clone(), stack.clone(), page.clone());
-        let album_nav = add("media-optical-symbolic", "Перейти к альбому", Box::new(move || open_album(&p, &stack, &page, &album)));
-        album_nav.set_visible(track.source != TrackSource::Vk);
-    }
-    if let Some((stack, page)) = nav {
+    if let Some((stack_w, page_w)) = nav_weak {
+        if let Some(album) = track.albums.first().cloned() {
+            let (p, stack_w, page_w) = (player.clone(), stack_w.clone(), page_w.clone());
+            let album_nav = add("media-optical-symbolic", "Перейти к альбому", Box::new(move || {
+                if let (Some(stack), Some(page)) = (stack_w.upgrade(), page_w.upgrade()) {
+                    open_album(&p, &stack, &page, &album);
+                }
+            }));
+            album_nav.set_visible(track.source != TrackSource::Vk);
+        }
         if track.artists.len() <= 1 {
             if let Some(artist) = track.artists.first() {
-                let (p, stack, page, artist, source) = (player.clone(), stack.clone(), page.clone(), artist.clone(), track.source);
-                add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || open_artist(&p, &stack, &page, artist.clone(), source)));
+                let (p, stack_w, page_w, artist, source) = (
+                    player.clone(),
+                    stack_w.clone(),
+                    page_w.clone(),
+                    artist.clone(),
+                    track.source,
+                );
+                add("avatar-default-symbolic", "Перейти к исполнителю", Box::new(move || {
+                    if let (Some(stack), Some(page)) = (stack_w.upgrade(), page_w.upgrade()) {
+                        open_artist(&p, &stack, &page, artist.clone(), source);
+                    }
+                }));
             }
         } else {
             for a in &track.artists {
-                let (p, stack, page, artist, source) = (player.clone(), stack.clone(), page.clone(), a.clone(), track.source);
+                let (p, stack_w, page_w, artist, source) = (
+                    player.clone(),
+                    stack_w.clone(),
+                    page_w.clone(),
+                    a.clone(),
+                    track.source,
+                );
                 let label = format!("Перейти к {}", artist.name);
-                add("avatar-default-symbolic", &label, Box::new(move || open_artist(&p, &stack, &page, artist.clone(), source)));
+                add("avatar-default-symbolic", &label, Box::new(move || {
+                    if let (Some(stack), Some(page)) = (stack_w.upgrade(), page_w.upgrade()) {
+                        open_artist(&p, &stack, &page, artist.clone(), source);
+                    }
+                }));
             }
         }
     }
 
-    bx.append(&menu);
-    bx
+    pop
 }
 
 /// Спрашивает название нового плейлиста; пустое название игнорируется
@@ -3234,22 +4264,10 @@ mod ambient_tests {
     }
 }
 
-/// Загружает картинку в `Picture` (тот же кэш в памяти, что у обложек)
+/// Загружает картинку в `Picture` с даунскейлом до `GALLERY_MAX_PX` (тот же дедуплицированный кэш).
 fn load_picture(pic: &gtk4::Picture, url: String) {
-    if let Some(tex) = COVERS.with(|c| c.borrow_mut().get(&url)) {
-        pic.set_paintable(Some(&tex));
-        return;
-    }
-    let weak = pic.downgrade();
-    glib::spawn_future_local(async move {
-        let Ok(resp) = reqwest::get(&url).await else { return };
-        let Ok(bytes) = resp.bytes().await else { return };
-        let Ok(tex) = gdk::Texture::from_bytes(&glib::Bytes::from(&bytes[..])) else { return };
-        COVERS.with(|c| c.borrow_mut().insert(url, tex.clone()));
-        if let Some(p) = weak.upgrade() {
-            p.set_paintable(Some(&tex));
-        }
-    });
+    let key = (url.clone(), GALLERY_MAX_PX);
+    fetch_and_apply_cover_scaled(key, url, PendingCoverTarget::Picture(pic.downgrade()));
 }
 
 /// Просмотр фото артиста: листается стрелками на экране, клавишами и жестом, внизу точки
@@ -3337,4 +4355,94 @@ fn show_photo_gallery(anchor: &impl IsA<gtk4::Widget>, title: &str, urls: &[Stri
     toolbar.set_content(Some(&content));
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(anchor));
+}
+
+#[cfg(test)]
+mod cover_cache_tests {
+    use super::*;
+
+    #[test]
+    fn target_cover_px_doubles_logical_with_minimum_floor() {
+        assert_eq!(target_cover_px(40), 80);
+        assert_eq!(target_cover_px(64), 128);
+        assert_eq!(target_cover_px(160), 320);
+        assert_eq!(target_cover_px(180), 360);
+        assert_eq!(target_cover_px(20), 64);
+    }
+
+    #[test]
+    fn scaled_dimensions_preserves_aspect_ratio() {
+        assert_eq!(scaled_dimensions(1000, 1000, 80), (80, 80));
+        assert_eq!(scaled_dimensions(1200, 600, 320), (320, 160));
+        assert_eq!(scaled_dimensions(600, 1200, 320), (160, 320));
+        assert_eq!(scaled_dimensions(50, 50, 80), (50, 50));
+    }
+
+    #[test]
+    fn decode_texture_scaled_resizes_png_preserving_aspect() {
+        let pixbuf = gtk4::gdk_pixbuf::Pixbuf::new(
+            gtk4::gdk_pixbuf::Colorspace::Rgb,
+            true,
+            8,
+            300,
+            150,
+        )
+        .expect("pixbuf created");
+        let png_bytes = pixbuf.save_to_bufferv("png", &[]).expect("encoded png");
+
+        let tex = decode_texture_scaled(&png_bytes, 80).expect("decoded scaled texture");
+        assert_eq!((tex.width(), tex.height()), (80, 40));
+    }
+
+    #[test]
+    fn cover_cache_deduplicates_live_textures_across_eviction_and_separates_sizes() {
+        let mut cache = CoverCache::default();
+        // ~7.48 МБ (< 8 МБ на запись, чтобы три записи гарантированно превысили бюджет 16 МБ)
+        let make_tex = |tag: u8| -> gdk::Texture {
+            let (w, h) = (1400, 1400);
+            let data = vec![tag; (w as usize) * (h as usize) * 4];
+            gdk::MemoryTexture::new(
+                w,
+                h,
+                gdk::MemoryFormat::R8g8b8a8,
+                &glib::Bytes::from_owned(data),
+                (w * 4) as usize,
+            )
+            .upcast()
+        };
+
+        let k1_small = ("https://example.test/a.jpg".to_string(), 80);
+        let k1_large = ("https://example.test/a.jpg".to_string(), 320);
+        let k2 = ("https://example.test/b.jpg".to_string(), 80);
+        let k3 = ("https://example.test/c.jpg".to_string(), 80);
+
+        let tex1_small = make_tex(1);
+        let tex1_large = make_tex(2);
+        cache.insert(k1_small.clone(), tex1_small.clone());
+        cache.insert(k1_large.clone(), tex1_large.clone());
+
+        // Разные target_px не затирают друг друга
+        assert_ne!(
+            cache.get(&k1_small).unwrap().as_ptr(),
+            cache.get(&k1_large).unwrap().as_ptr()
+        );
+
+        // Вытесняем k1_small из сильного LRU-кэша (оставляя k1_small живым в tex1_small)
+        drop(tex1_large);
+        cache.insert(k2, make_tex(3));
+        cache.insert(k3, make_tex(4));
+        assert!(!cache.map.contains_key(&k1_small));
+
+        // Пока внешний виджет держит tex1_small, weak-реестр возвращает тот же экземпляр
+        let reused = cache.get(&k1_small).expect("live texture reused via weak ref");
+        assert_eq!(reused.as_ptr(), tex1_small.as_ptr());
+
+        // Как только все сильные ссылки ушли и запись вытеснена, weak-ссылка очищается
+        drop(reused);
+        drop(tex1_small);
+        cache.insert(("https://example.test/d.jpg".to_string(), 80), make_tex(5));
+        cache.insert(("https://example.test/e.jpg".to_string(), 80), make_tex(6));
+        assert!(!cache.map.contains_key(&k1_small));
+        assert!(cache.get(&k1_small).is_none());
+    }
 }

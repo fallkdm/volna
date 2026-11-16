@@ -61,6 +61,7 @@ fn history_row(p: &PlayerManager, stack: &Stack, page: &Rc<DetailPage>, item: &H
             let row = track_row(t, move || {
                 push_history_for(provider, it.clone());
                 if let HistoryItem::Track(t) = &it {
+                    eprintln!("[ui] search history click: id={} title=\"{}\"", t.id, t.title);
                     p.play_single_track(t.clone());
                 }
             });
@@ -210,6 +211,8 @@ fn search_placeholder(id: ProviderId) -> &'static str {
                 if let Some(reb) = reb_click.borrow().as_ref() {
                     reb();
                 }
+                super::collection::prune_dead_caches();
+                crate::trim_allocator();
             });
             header.append(&clear);
             hb.append(&header);
@@ -312,6 +315,7 @@ fn search_placeholder(id: ProviderId) -> &'static str {
             seq.set(my_seq);
             let seq = seq.clone();
             if query.is_empty() {
+                let had_results = sections.iter().any(|s| s.has_items.get());
                 status_label.set_text("Введите запрос");
                 rebuild_history();
                 tracks_list.remove_all();
@@ -322,6 +326,11 @@ fn search_placeholder(id: ProviderId) -> &'static str {
                     s.has_items.set(false);
                 }
                 apply_filter();
+                super::collection::prune_dead_caches();
+                crate::trim_allocator();
+                if had_results {
+                    eprintln!("[ui] search clear");
+                }
                 return;
             }
             history_box.set_visible(false);
@@ -344,6 +353,7 @@ fn search_placeholder(id: ProviderId) -> &'static str {
                     status.set_text("Укажите токен Яндекс Музыки в настройках ⚙ для поиска");
                     return;
                 }
+                eprintln!("[ui] search query: \"{}\"", query);
                 let result: SearchResult = match provider.search(&query).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -376,6 +386,7 @@ fn search_placeholder(id: ProviderId) -> &'static str {
                     let (p2, t) = (p.clone(), track.clone());
                     let row = track_row(track, move || {
                         push_history_for(p2.providers.active_id(), HistoryItem::Track(t.clone()));
+                        eprintln!("[ui] search click: id={} title=\"{}\"", t.id, t.title);
                         p2.play_single_track(t.clone());
                     });
                     row.add_suffix(&track_actions(&p, Some((&stack, &page)), track));
@@ -405,6 +416,13 @@ fn search_placeholder(id: ProviderId) -> &'static str {
                 sections[2].has_items.set(!albums.is_empty());
                 sections[3].has_items.set(!playlists.is_empty());
                 apply();
+                eprintln!(
+                    "[ui] search result: tracks={} artists={} albums={} playlists={}",
+                    tracks.len(),
+                    artists.len(),
+                    albums.len(),
+                    playlists.len()
+                );
 
                 if tracks.is_empty() && artists.is_empty() && albums.is_empty() && playlists.is_empty() {
                     status.set_text("Ничего не найдено");

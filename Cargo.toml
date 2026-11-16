@@ -42,4 +42,5 @@ thiserror = "2"
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "crypto-rust"] }
 zeroize = "1"
 libc = "0.2"
+dirs = "7.0.0"
 

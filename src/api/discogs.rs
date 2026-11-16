@@ -81,7 +81,13 @@ pub(crate) fn usable_profile(text: &str) -> bool {
 }
 
 async fn get_json(client: &reqwest::Client, url: &str) -> Option<Value> {
-    let resp = client.get(url).send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -93,17 +99,13 @@ pub async fn artist_summary(name: &str) -> Option<ArtistSummary> {
     if name.trim().is_empty() {
         return None;
     }
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
+    let client = crate::shared_http_client();
 
     let search = format!(
         "https://api.discogs.com/database/search?q={}&type=artist",
         urlencoding_encode(name)
     );
-    let found = get_json(&client, &search).await?;
+    let found = get_json(client, &search).await?;
     let ids: Vec<u64> = found["results"]
         .as_array()?
         .iter()
@@ -114,7 +116,7 @@ pub async fn artist_summary(name: &str) -> Option<ArtistSummary> {
 
     for id in ids {
         let url = format!("https://api.discogs.com/artists/{id}");
-        let Some(artist) = get_json(&client, &url).await else { continue };
+        let Some(artist) = get_json(client, &url).await else { continue };
         let profile = artist["profile"].as_str().unwrap_or_default();
         let cleaned = clean_discogs_bbcode(profile);
         if !usable_profile(&cleaned) {

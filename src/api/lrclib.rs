@@ -113,11 +113,20 @@ pub fn same_song_title(a: &str, b: &str) -> bool {
 
 /// Совпадают ли исполнители: у нас они через запятую, у сервиса бывает один из них
 pub fn same_artist_name(a: &str, b: &str) -> bool {
-    let (x, y) = (normalize_name(a), normalize_name(b));
-    if x.is_empty() || y.is_empty() {
+    if a.trim().is_empty() || b.trim().is_empty() {
         return true;
     }
-    let first = |s: &str| s.split(',').next().map(normalize_name).unwrap_or_default();
+    let (x, y) = (normalize_artist_name(a), normalize_artist_name(b));
+    if x.is_empty() || y.is_empty() {
+        // Строки из одних символов вроде «!!!» или «†††» сравниваем точно без учёта регистра
+        return a.trim().to_lowercase() == b.trim().to_lowercase();
+    }
+    let first = |s: &str| {
+        s.split(',')
+            .next()
+            .map(normalize_artist_name)
+            .unwrap_or_default()
+    };
     let (fx, fy) = (first(a), first(b));
     x == y
         || (fx.chars().count() >= 4 && y.contains(&fx))
@@ -224,6 +233,37 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
     None
 }
 
+fn normalize_alnum(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_bracket_noise(norm: &str) -> bool {
+    matches!(
+        norm,
+        "official video"
+            | "official music video"
+            | "official audio"
+            | "official lyric video"
+            | "official visualizer"
+            | "lyric video"
+            | "lyrics"
+            | "audio"
+            | "music video"
+            | "visualizer"
+            | "clip"
+            | "клип"
+            | "премьера клипа"
+            | "hd"
+            | "4k"
+    )
+}
+
 /// Название для сравнения: без регистра, без скобок («(feat. …)», «[Remix]»), хвоста « - Remastered» и пунктуации
 pub fn normalize_name(s: &str) -> String {
     let mut depth = 0u32;
@@ -242,13 +282,95 @@ pub fn normalize_name(s: &str) -> String {
         })
         .collect();
     let head = no_brackets.split(" - ").next().unwrap_or("");
-    head.to_lowercase()
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    normalize_alnum(head)
+}
+
+/// Имя исполнителя для сравнения: учитывает псевдонимы в скобках вроде `††† (Crosses)` / `✝✝✝ (Crosses)`,
+/// когда основная часть состоит из одних спецсимволов
+pub fn normalize_artist_name(s: &str) -> String {
+    let base = normalize_name(s);
+    if !base.is_empty() {
+        return base;
+    }
+    let mut parts = Vec::new();
+    let mut depth = 0u32;
+    let mut current = String::new();
+    for c in s.chars() {
+        match c {
+            '(' | '[' => {
+                if depth > 0 {
+                    current.push(c);
+                }
+                depth += 1;
+            }
+            ')' | ']' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        let norm = normalize_alnum(&current);
+                        if !norm.is_empty() && !is_bracket_noise(&norm) {
+                            parts.push(norm);
+                        }
+                        current.clear();
+                    } else {
+                        current.push(c);
+                    }
+                }
+            }
+            _ if depth > 0 => current.push(c),
+            _ => {}
+        }
+    }
+    if depth > 0 && !current.is_empty() {
+        let norm = normalize_alnum(&current);
+        if !norm.is_empty() && !is_bracket_noise(&norm) {
+            parts.push(norm);
+        }
+    }
+    parts.join(" ")
+}
+
+/// Сверка кандидата текста песни с эталонным текстом (например, официальным текстом из YTM или Яндекса)
+/// по пересечению символьных 3-грамм и слов длиной от 3 символов. Работает для любого UTF-8.
+pub fn lyrics_match_reference(candidate_text: &str, reference_text: &str) -> bool {
+    use std::collections::HashSet;
+
+    let a_clean = strip_lrc_tags(candidate_text).to_lowercase();
+    let b_clean = strip_lrc_tags(reference_text).to_lowercase();
+
+    let a_chars: Vec<char> = a_clean.chars().filter(|c| c.is_alphanumeric()).collect();
+    let b_chars: Vec<char> = b_clean.chars().filter(|c| c.is_alphanumeric()).collect();
+    if a_chars.len() < 20 || b_chars.len() < 20 {
+        return true;
+    }
+
+    fn trigrams(chars: &[char]) -> HashSet<[char; 3]> {
+        chars.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
+    }
+    let g_a = trigrams(&a_chars);
+    let g_b = trigrams(&b_chars);
+    let min_g = g_a.len().min(g_b.len());
+    let overlap_3 = if min_g == 0 {
+        0.0
+    } else {
+        g_a.intersection(&g_b).count() as f64 / min_g as f64
+    };
+
+    fn words(s: &str) -> HashSet<&str> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 3)
+            .collect()
+    }
+    let w_a = words(&a_clean);
+    let w_b = words(&b_clean);
+    let overlap_w = if w_a.len() >= 4 && w_b.len() >= 4 {
+        let min_w = w_a.len().min(w_b.len());
+        w_a.intersection(&w_b).count() as f64 / min_w as f64
+    } else {
+        0.0
+    };
+
+    overlap_3 >= 0.18 || overlap_w >= 0.18
 }
 
 pub fn urlencoding_encode(s: &str) -> String {
@@ -267,61 +389,43 @@ pub fn urlencoding_encode(s: &str) -> String {
     encoded
 }
 
-/// Поиск в LRCLIB записи с синхронизированным текстом той же длительности (±4 с)
-///
-/// Обёртка над статусной версией: сетевой сбой и «ничего не нашли» здесь
-/// неразличимы — вызывающим, которым важна терминальность, нужен
-/// `lrclib_search_synced_status`.
-pub async fn lrclib_search_synced(
-    http: &reqwest::Client,
+/// Выбор лучшего синхронизированного кандидата из массива ответа `/api/search`.
+pub fn pick_best_synced_candidate(
+    items: &[serde_json::Value],
     artist: &str,
     title: &str,
     duration_secs: Option<u64>,
+    reference_lyrics: Option<&str>,
 ) -> Option<String> {
-    lrclib_search_synced_status(http, artist, title, duration_secs)
-        .await
-        .unwrap_or(None)
-}
-
-/// То же, но с сохранением терминальности: `Err(())` — сетевой сбой или битый JSON.
-async fn lrclib_search_synced_status(
-    http: &reqwest::Client,
-    artist: &str,
-    title: &str,
-    duration_secs: Option<u64>,
-) -> Result<Option<String>, ()> {
     let clean_t = clean_title_for_lyrics(title);
-    let url = format!(
-        "https://lrclib.net/api/search?q={}",
-        urlencoding_encode(&format!("{clean_t} {artist}"))
-    );
-    let resp = match lrclib_get(http, &url).await {
-        LrclibFetch::Found(resp) => resp,
-        LrclibFetch::Failed => return Err(()),
-        LrclibFetch::NotFound => return Ok(None),
-    };
-    let items: Vec<serde_json::Value> = resp.json().await.map_err(|_| ())?;
-    let (title_n, artist_n) = (normalize_name(&clean_t), normalize_name(artist));
-    let first_artist = normalize_name(artist.split(',').next().unwrap_or(artist));
-    let raw_artist = artist.trim().to_lowercase();
-    let same_artist = |a: &str, raw: &str| {
-        if artist_n.is_empty() {
-            return raw.trim() == raw_artist;
+    let title_n = normalize_name(&clean_t);
+    let artist_norm = normalize_artist_name(artist);
+    let raw_title = clean_t.trim().to_lowercase();
+
+    let title_matches = |rec_title: &str| {
+        if title_n.is_empty() {
+            !raw_title.is_empty() && rec_title.trim().to_lowercase() == raw_title
+        } else {
+            normalize_name(rec_title) == title_n
         }
-        let long = |x: &str| x.chars().count() >= 4;
-        !a.is_empty()
-            && (a == artist_n
-                || (long(&first_artist) && a.contains(&first_artist))
-                || (long(a) && artist_n.contains(a)))
     };
+
     let names_match = |v: &serde_json::Value| {
-        let field = |k: &str| normalize_name(v[k].as_str().unwrap_or(""));
-        let (t, a) = (field("trackName"), field("artistName"));
-        let raw = v["artistName"].as_str().unwrap_or("").to_lowercase();
-        (t == title_n && same_artist(&a, &raw))
-            || (!artist_n.is_empty() && t == artist_n && a == title_n)
+        let rec_title = v["trackName"].as_str().unwrap_or("");
+        let rec_artist = v["artistName"].as_str().unwrap_or("");
+        if rec_title.trim().is_empty() || rec_artist.trim().is_empty() {
+            return false;
+        }
+        if title_matches(rec_title) && same_artist_name(rec_artist, artist) {
+            return true;
+        }
+        !artist_norm.is_empty()
+            && !title_n.is_empty()
+            && same_artist_name(rec_title, artist)
+            && normalize_name(rec_artist) == title_n
     };
-    Ok(items
+
+    items
         .iter()
         .filter(|v| names_match(v))
         .filter(|v| match (duration_secs, v["duration"].as_f64()) {
@@ -333,8 +437,100 @@ async fn lrclib_search_synced_status(
                 .as_str()
                 .map(str::trim)
                 .filter(|t| usable_synced_at(t, duration_secs))
+                .filter(|t| reference_lyrics.is_none_or(|r| lyrics_match_reference(t, r)))
                 .map(String::from)
-        }))
+        })
+}
+
+/// Поиск в LRCLIB записи с синхронизированным текстом той же длительности (±4 с)
+///
+/// Обёртка над статусной версией: сетевой сбой и «ничего не нашли» здесь
+/// неразличимы — вызывающим, которым важна терминальность, нужен
+/// `lrclib_search_synced_status`.
+pub async fn lrclib_search_synced(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+) -> Option<String> {
+    lrclib_search_synced_status(http, artist, title, duration_secs, None)
+        .await
+        .unwrap_or(None)
+}
+
+async fn lrclib_search_query(
+    http: &reqwest::Client,
+    query_artist: &str,
+    clean_t: &str,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+    reference_lyrics: Option<&str>,
+) -> Result<Option<String>, ()> {
+    let url = format!(
+        "https://lrclib.net/api/search?q={}",
+        urlencoding_encode(&format!("{clean_t} {query_artist}"))
+    );
+    let resp = match lrclib_get(http, &url).await {
+        LrclibFetch::Found(resp) => resp,
+        LrclibFetch::Failed => return Err(()),
+        LrclibFetch::NotFound => return Ok(None),
+    };
+    let items: Vec<serde_json::Value> = resp.json().await.map_err(|_| ())?;
+    Ok(pick_best_synced_candidate(
+        &items,
+        artist,
+        title,
+        duration_secs,
+        reference_lyrics,
+    ))
+}
+
+/// То же, но с сохранением терминальности: `Err(())` — сетевой сбой или битый JSON.
+async fn lrclib_search_synced_status(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+    reference_lyrics: Option<&str>,
+) -> Result<Option<String>, ()> {
+    let clean_t = clean_title_for_lyrics(title);
+    let norm_name_artist = normalize_name(artist);
+    let norm_artist = normalize_artist_name(artist);
+    let artist_query = if norm_name_artist.is_empty() && !norm_artist.is_empty() {
+        norm_artist.as_str()
+    } else {
+        artist
+    };
+
+    if let Some(found) = lrclib_search_query(
+        http,
+        artist_query,
+        &clean_t,
+        artist,
+        title,
+        duration_secs,
+        reference_lyrics,
+    )
+    .await?
+    {
+        return Ok(Some(found));
+    }
+
+    if norm_artist != norm_name_artist && !norm_artist.is_empty() && norm_artist != artist_query {
+        return lrclib_search_query(
+            http,
+            &norm_artist,
+            &clean_t,
+            artist,
+            title,
+            duration_secs,
+            reference_lyrics,
+        )
+        .await;
+    }
+
+    Ok(None)
 }
 
 /// Один запрос к LRCLIB без повторов и с коротким таймаутом.
@@ -430,13 +626,14 @@ pub async fn lookup_lyrics_fast(
 
 /// Поиск текста с сохранением терминальности (для алгоритмических фильтров Волны).
 ///
-/// Отличается от `fetch_lrclib_lyrics` тем, что не схлопывает «нет текста»,
-/// «это чужой трек» и «сеть недоступна» в один `None`.
-pub async fn lookup_lyrics(
+/// При передаче `reference_lyrics` отсекает записи LRCLIB, текст которых не совпадает
+/// с эталоном (защита от отравленных записей с подменённым текстом другой песни).
+pub async fn lookup_lyrics_with_reference(
     http: &reqwest::Client,
     artist: &str,
     title: &str,
     duration_secs: Option<u64>,
+    reference_lyrics: Option<&str>,
 ) -> LyricsLookup {
     let clean_artist = artist.trim();
     let clean_title = clean_title_for_lyrics(title);
@@ -509,17 +706,31 @@ pub async fn lookup_lyrics(
                     );
                 }
                 if record_matches {
+                    let matches_ref =
+                        |t: &str| reference_lyrics.is_none_or(|r| lyrics_match_reference(t, r));
+                    let mut text_mismatch = false;
                     if let Some(synced) = data.synced_lyrics {
                         let trimmed = synced.trim();
-                        if usable_synced_at(trimmed, duration_secs) {
+                        if !trimmed.is_empty() && !matches_ref(trimmed) {
+                            text_mismatch = true;
+                        } else if usable_synced_at(trimmed, duration_secs) {
                             return LyricsLookup::Found(trimmed.to_string());
                         }
                     }
-                    if let Some(plain) = data.plain_lyrics {
+                    if !text_mismatch
+                        && let Some(plain) = data.plain_lyrics
+                    {
                         let trimmed = plain.trim();
                         if !trimmed.is_empty() {
-                            plain_fallback = Some(trimmed.to_string());
+                            if matches_ref(trimmed) {
+                                plain_fallback = Some(trimmed.to_string());
+                            } else {
+                                text_mismatch = true;
+                            }
                         }
+                    }
+                    if text_mismatch {
+                        mismatch = true;
                     }
                 }
             }
@@ -527,7 +738,15 @@ pub async fn lookup_lyrics(
     }
 
     // Точное совпадение дало только обычный текст или 404: ищем запись с таймингами через поиск
-    match lrclib_search_synced_status(http, clean_artist, &clean_title, duration_secs).await {
+    match lrclib_search_synced_status(
+        http,
+        clean_artist,
+        &clean_title,
+        duration_secs,
+        reference_lyrics,
+    )
+    .await
+    {
         Ok(Some(synced)) => return LyricsLookup::Found(synced),
         Ok(None) => {}
         Err(()) => saw_failure = true,
@@ -545,20 +764,129 @@ pub async fn lookup_lyrics(
     }
 }
 
+/// Поиск текста с сохранением терминальности (для алгоритмических фильтров Волны).
+///
+/// Отличается от `fetch_lrclib_lyrics` тем, что не схлопывает «нет текста»,
+/// «это чужой трек» и «сеть недоступна» в один `None`.
+pub async fn lookup_lyrics(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+) -> LyricsLookup {
+    lookup_lyrics_with_reference(http, artist, title, duration_secs, None).await
+}
+
+/// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net) с проверкой эталона
+pub async fn fetch_lrclib_lyrics_with_reference(
+    http: &reqwest::Client,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+    reference_lyrics: Option<&str>,
+) -> Option<String> {
+    match lookup_lyrics_with_reference(http, artist, title, duration_secs, reference_lyrics).await
+    {
+        LyricsLookup::Found(text) => Some(text),
+        _ => None,
+    }
+}
+
 /// Запрос текста песни из открытой глобальной базы LRCLIB (https://lrclib.net)
 ///
-/// Обёртка над `lookup_lyrics`: три существующих вызова (UI-путь и кэш)
-/// продолжают работать с `Option<String>`.
+/// Обёртка над `lookup_lyrics`: существующие вызовы продолжают работать с `Option<String>`.
 pub async fn fetch_lrclib_lyrics(
     http: &reqwest::Client,
     artist: &str,
     title: &str,
     duration_secs: Option<u64>,
 ) -> Option<String> {
-    match lookup_lyrics(http, artist, title, duration_secs).await {
-        LyricsLookup::Found(text) => Some(text),
-        _ => None,
+    fetch_lrclib_lyrics_with_reference(http, artist, title, duration_secs, None).await
+}
+
+/// Сверка первичного ответа LRCLIB с эталонным текстом (например, официальным текстом YTM).
+/// Если первичный текст не прошёл `lyrics_match_reference`, логирует предупреждение
+/// и переискивает запись в LRCLIB с фильтрацией по эталону.
+pub async fn verify_or_refetch_lrclib(
+    http: &reqwest::Client,
+    initial_lrclib: Option<String>,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+    reference_lyrics: &str,
+    refetch_timeout: Option<std::time::Duration>,
+) -> Option<String> {
+    match initial_lrclib {
+        Some(lr_text) => {
+            if lyrics_match_reference(&lr_text, reference_lyrics) {
+                Some(lr_text)
+            } else {
+                println!("[lyrics] LRCLIB отброшен (не совпал с официальным текстом YTM)");
+                let fut = fetch_lrclib_lyrics_with_reference(
+                    http,
+                    artist,
+                    title,
+                    duration_secs,
+                    Some(reference_lyrics),
+                );
+                match refetch_timeout {
+                    Some(limit) => tokio::time::timeout(limit, fut).await.ok().flatten(),
+                    None => fut.await,
+                }
+            }
+        }
+        None => None,
     }
+}
+
+/// Получение текста песни с дисковым кэшированием и проверкой по эталону
+pub async fn get_cached_or_fetch_lrclib_with_reference(
+    http: &reqwest::Client,
+    track_id: &str,
+    artist: &str,
+    title: &str,
+    duration_secs: Option<u64>,
+    reference_lyrics: Option<&str>,
+) -> Option<String> {
+    let cache_path = crate::cache::lyrics_cache_path(track_id);
+    let mut stale_plain = None;
+    if let Ok(cached) = std::fs::read_to_string(&cache_path) {
+        let trimmed = cached.trim();
+        let matches_ref = reference_lyrics.is_none_or(|r| lyrics_match_reference(trimmed, r));
+        if looks_like_foreign_song(trimmed, duration_secs) || !matches_ref {
+            // Текст чужой песни: держать его нельзя даже без таймкодов, а кэш по одному id
+            // будет отдавать его вечно — удаляем и ищем заново
+            println!(
+                "[lyrics] Кэш {} отброшен: {}",
+                track_id,
+                if !matches_ref {
+                    "не совпал с эталонным текстом"
+                } else {
+                    "размечен под другой трек"
+                }
+            );
+            let _ = std::fs::remove_file(&cache_path);
+        } else if cached_usable(trimmed, duration_secs) {
+            return Some(cached);
+        } else if !trimmed.is_empty() {
+            stale_plain = Some(strip_lrc_tags(trimmed));
+        }
+    }
+
+    let lyrics = fetch_lrclib_lyrics_with_reference(
+        http,
+        artist,
+        title,
+        duration_secs,
+        reference_lyrics,
+    )
+    .await;
+    if let Some(text) = &lyrics {
+        let _ = std::fs::write(&cache_path, text);
+    }
+    // Разметка из кэша не от этого трека, а новой не нашлось: отдаём хотя бы текст,
+    // но без таймкодов — уехавшая подсветка хуже, чем текст без караоке
+    lyrics.or(stale_plain)
 }
 
 /// Получение текста песни с дисковым кэшированием для мгновенного доступа
@@ -569,32 +897,8 @@ pub async fn get_cached_or_fetch_lrclib(
     title: &str,
     duration_secs: Option<u64>,
 ) -> Option<String> {
-    let cache_path = crate::cache::lyrics_cache_path(track_id);
-    let mut stale_plain = None;
-    if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-        let trimmed = cached.trim();
-        if looks_like_foreign_song(trimmed, duration_secs) {
-            // Текст чужой песни: держать его нельзя даже без таймкодов, а кэш по одному id
-            // будет отдавать его вечно — удаляем и ищем заново
-            println!(
-                "[lyrics] Кэш {} отброшен: размечен под другой трек",
-                track_id
-            );
-            let _ = std::fs::remove_file(&cache_path);
-        } else if cached_usable(trimmed, duration_secs) {
-            return Some(cached);
-        } else if !trimmed.is_empty() {
-            stale_plain = Some(strip_lrc_tags(trimmed));
-        }
-    }
-
-    let lyrics = fetch_lrclib_lyrics(http, artist, title, duration_secs).await;
-    if let Some(text) = &lyrics {
-        let _ = std::fs::write(&cache_path, text);
-    }
-    // Разметка из кэша не от этого трека, а новой не нашлось: отдаём хотя бы текст,
-    // но без таймкодов — уехавшая подсветка хуже, чем текст без караоке
-    lyrics.or(stale_plain)
+    get_cached_or_fetch_lrclib_with_reference(http, track_id, artist, title, duration_secs, None)
+        .await
 }
 
 #[cfg(test)]
@@ -672,6 +976,33 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_artist_name() {
+        assert_eq!(normalize_artist_name("††† (Crosses)"), "crosses");
+        assert_eq!(normalize_artist_name("✝✝✝ (Crosses)"), "crosses");
+        assert_eq!(
+            normalize_artist_name("††† (Crosses) [Official Video]"),
+            "crosses"
+        );
+        assert_eq!(
+            normalize_artist_name(
+                "††† (Crosses) (Lyric Video) (Lyrics) (Audio) (HD) (4K) (Visualizer) (Clip)"
+            ),
+            "crosses"
+        );
+        assert_eq!(
+            normalize_artist_name("Bring Me The Horizon"),
+            "bring me the horizon"
+        );
+        assert_eq!(
+            normalize_artist_name("Bring Me The Horizon (feat. Grimes)"),
+            "bring me the horizon"
+        );
+        assert_eq!(normalize_artist_name("!!!"), "");
+        assert_eq!(normalize_artist_name("(Official Video)"), "");
+        assert_eq!(normalize_artist_name("(Lyrics) [Audio]"), "");
+    }
+
+    #[test]
     fn test_same_artist_name() {
         assert!(same_artist_name(
             "Bring Me The Horizon",
@@ -684,6 +1015,152 @@ mod tests {
         assert!(!same_artist_name("BMTH", "Bring Me The Horizon"));
         assert!(!same_artist_name("Linkin Park", "Bring Me The Horizon"));
         assert!(same_artist_name("", "Bring Me The Horizon"));
+        assert!(same_artist_name("††† (Crosses)", "✝✝✝ (Crosses)"));
+        assert!(same_artist_name("††† (Crosses)", "Crosses"));
+        assert!(!same_artist_name("††† (Crosses)", "BTS"));
+        assert!(!same_artist_name("††† (Crosses)", "†††"));
+        assert!(!same_artist_name("!!!", "Bring Me The Horizon"));
+        assert!(same_artist_name("!!!", "!!!"));
+        assert!(same_artist_name("†††", "†††"));
+        assert!(!same_artist_name("†††", "✝✝✝"));
+    }
+
+    #[test]
+    fn test_lyrics_match_reference() {
+        let crosses_ytm = "\
+This is a trick of the mind\n\
+You have been watching me slide\n\
+Into the place where you hide\n\
+Tell me the things you decide";
+        let crosses_lrc = "\
+[00:12.10] This is a trick of the mind\n\
+[00:16.40] You have been watching me slide\n\
+[00:20.80] Into the place where you hide\n\
+[00:25.10] Tell me the things you decide";
+        let bts_lrc = "\
+[00:20.37] 매번 같은 하루들 중에 (들 중에)\n\
+[00:24.52] 너를 만날 때 가장 난 행복해 (행복해)\n\
+[00:29.89] 매번 다른 일상들 속에 (들 속에)\n\
+[00:34.34] 너란 사람은 내게 가장 특별해 (특별해)\n\
+[01:53.79] Yeah, R.M., yo (Oh) Oh, can I be your Bibilly Hills";
+
+        assert!(lyrics_match_reference(crosses_lrc, crosses_ytm));
+        assert!(!lyrics_match_reference(bts_lrc, crosses_ytm));
+
+        // Мало материала для браковки (< 20 алфавитно-цифровых символов)
+        assert!(lyrics_match_reference("short text", crosses_ytm));
+        assert!(lyrics_match_reference(bts_lrc, "[00:05.00] la la la"));
+
+        // Кириллица и CJK без паник
+        let ru_a = "Город под подошвой, фонари горят в ночи и ветер бьёт в окно";
+        let ru_b = "[00:10.00] Город под подошвой\n[00:14.00] Фонари горят в ночи\n[00:18.00] Ветер бьёт в окно";
+        let ru_other = "Солнце встаёт над рекой, птицы поют в тишине зелёного леса";
+        assert!(lyrics_match_reference(ru_b, ru_a));
+        assert!(!lyrics_match_reference(ru_other, ru_a));
+
+        let cjk_a = "夜空に星が輝く静かな冬の街を歩いていく君と二人で";
+        let cjk_b = "[00:05.00] 夜空に星が輝く静かな冬の街を歩いていく";
+        let cjk_other = "青い海と白い砂浜で夏の思い出を作ろうみんなで笑って";
+        assert!(lyrics_match_reference(cjk_b, cjk_a));
+        assert!(!lyrics_match_reference(cjk_other, cjk_a));
+    }
+
+    #[test]
+    fn test_pick_best_synced_candidate_crosses_poisoned() {
+        let crosses_ytm = "\
+This is a trick of the mind\n\
+You have been watching me slide\n\
+Into the place where you hide\n\
+Tell me the things you decide";
+        let bts_lrc = "\
+[00:20.37] 매번 같은 하루들 중에 (들 중에)\n\
+[00:24.52] 너를 만날 때 가장 난 행복해 (행복해)\n\
+[00:29.89] 매번 다른 일상들 속에 (들 속에)\n\
+[00:34.34] 너란 사람은 내게 가장 특별해 (특별해)";
+        let crosses_lrc = "\
+[00:12.10] This is a trick of the mind\n\
+[00:16.40] You have been watching me slide\n\
+[00:20.80] Into the place where you hide\n\
+[00:25.10] Tell me the things you decide";
+
+        let items = vec![
+            serde_json::json!({
+                "id": 21868897,
+                "trackName": "Telepathy",
+                "artistName": "††† (Crosses)",
+                "duration": 185.0,
+                "syncedLyrics": bts_lrc,
+            }),
+            serde_json::json!({
+                "id": 123456,
+                "trackName": "Telepathy",
+                "artistName": "✝✝✝ (Crosses)",
+                "duration": 185.0,
+                "syncedLyrics": crosses_lrc,
+            }),
+        ];
+
+        // При проверке по эталону отравленная запись BTS отбрасывается и выбирается `✝✝✝ (Crosses)`
+        let picked = pick_best_synced_candidate(
+            &items,
+            "††† (Crosses)",
+            "Telepathy",
+            Some(185),
+            Some(crosses_ytm),
+        );
+        assert_eq!(picked.as_deref(), Some(crosses_lrc));
+
+        // Если в выдаче только отравленная запись — кандидат не выбирается
+        let poisoned_only = vec![items[0].clone()];
+        assert_eq!(
+            pick_best_synced_candidate(
+                &poisoned_only,
+                "††† (Crosses)",
+                "Telepathy",
+                Some(185),
+                Some(crosses_ytm),
+            ),
+            None
+        );
+
+        // Запись с сильно другой длительностью отбрасывается
+        let wrong_dur = vec![serde_json::json!({
+            "id": 999,
+            "trackName": "Telepathy",
+            "artistName": "✝✝✝ (Crosses)",
+            "duration": 250.0,
+            "syncedLyrics": crosses_lrc,
+        })];
+        assert_eq!(
+            pick_best_synced_candidate(
+                &wrong_dur,
+                "††† (Crosses)",
+                "Telepathy",
+                Some(185),
+                Some(crosses_ytm),
+            ),
+            None
+        );
+
+        // Запись с перепутанными artistName и trackName тоже подбирается
+        let swapped = vec![serde_json::json!({
+            "id": 777,
+            "trackName": "✝✝✝ (Crosses)",
+            "artistName": "Telepathy",
+            "duration": 185.0,
+            "syncedLyrics": crosses_lrc,
+        })];
+        assert_eq!(
+            pick_best_synced_candidate(
+                &swapped,
+                "††† (Crosses)",
+                "Telepathy",
+                Some(185),
+                Some(crosses_ytm),
+            )
+            .as_deref(),
+            Some(crosses_lrc)
+        );
     }
 
     #[test]

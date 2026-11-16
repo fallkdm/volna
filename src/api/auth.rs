@@ -738,8 +738,7 @@ pub struct DeviceCodeResponse {
 
 /// Запрашивает device_code для авторизации по коду на ya.ru/device
 pub async fn request_device_code() -> Result<DeviceCodeResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = crate::shared_http_client()
         .post("https://oauth.yandex.ru/device/code")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!("client_id={}", CLIENT_ID))

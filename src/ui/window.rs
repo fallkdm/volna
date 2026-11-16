@@ -745,6 +745,22 @@ impl VolnaWindow {
         update_active_nav();
 
         {
+            let last_tab = Rc::new(RefCell::new(
+                view_stack.visible_child_name().map(|name| name.to_string()),
+            ));
+            view_stack.connect_visible_child_name_notify(move |stack| {
+                if let Some(name) = stack.visible_child_name() {
+                    let name = name.as_str();
+                    let mut last = last_tab.borrow_mut();
+                    if last.as_deref() != Some(name) {
+                        *last = Some(name.to_string());
+                        eprintln!("[ui] tab -> {}", name);
+                    }
+                }
+            });
+        }
+
+        {
             let u = update_active_nav.clone();
             let vs = view_stack.clone();
             let rel = search_view.reload_history.clone();
@@ -1383,6 +1399,7 @@ impl VolnaWindow {
             let wave_btn = wave_view.menu_button.clone();
             Rc::new(move || {
                 if let Some(w) = win_weak.upgrade() {
+                    eprintln!("[ui] settings open");
                     let (vs, wave_btn) = (vs.clone(), wave_btn.clone());
                     show_preferences_dialog(&w, &p_clone, move || {
                         vs.set_visible_child_name("wave");
@@ -1794,6 +1811,11 @@ fn update_dynamic_accent_css(provider: &gtk4::CssProvider, r: f64, g: f64, b: f6
         ".accent-dynamic .island-play {{ background-color: rgb({r}, {g}, {b}); background-image: linear-gradient(180deg, rgba(255,255,255,0.2) 0%, rgba(0,0,0,0.1) 100%); box-shadow: 0 6px 18px rgba({r}, {g}, {b}, 0.45); }}\n\
          .accent-dynamic scale.adw-scale highlight {{ background-color: rgb({r}, {g}, {b}); background-image: none; }}\n\
          .accent-dynamic scale.volume-vertical highlight {{ background-color: rgb({r}, {g}, {b}); background-image: none; }}\n\
+         .accent-dynamic progressbar.island-loading-bar:not(.error) > trough > progress {{ background-color: rgb({r}, {g}, {b}); background-image: none; }}\n\
+         .accent-dynamic progressbar.island-seek-pulse:not(.error) > trough > progress {{ background-color: rgb({r}, {g}, {b}); background-image: none; }}\n\
+         .accent-dynamic .island-loading-spinner, .accent-dynamic .track-loading-spinner {{ color: rgb({r}, {g}, {b}); }}\n\
+         .accent-dynamic row.track-loading, .accent-dynamic row.track-playing {{ box-shadow: inset 3px 0 0 rgb({r}, {g}, {b}); }}\n\
+         .accent-dynamic row.track-playing .title {{ color: rgb({r}, {g}, {b}); }}\n\
          .accent-dynamic .sidebar-nav-btn.active {{ background-color: rgba({r}, {g}, {b}, 0.16); color: #ffffff; border: none; }}\n\
          .accent-dynamic .sidebar-nav-btn.active .sidebar-nav-icon {{ color: rgb({r}, {g}, {b}); }}\n\
          .accent-dynamic .brand-badge {{ background-color: rgba({r}, {g}, {b}, 0.22); color: rgb({r}, {g}, {b}); border-color: rgba({r}, {g}, {b}, 0.45); }}\n\
@@ -2019,6 +2041,57 @@ fn update_auth_ui(
     }
 }
 
+/// Применяет метаданные, лайк, палитру волны и прогресс-шкалу трека к нижнему плееру, волне и караоке.
+#[allow(clippy::too_many_arguments)]
+fn apply_track_visuals(
+    island: &FloatingIslandWidgets,
+    wave_view: &WaveViewWidgets,
+    pet: &super::pet::PetWidgets,
+    player: &PlayerManager,
+    k_track_title: &Label,
+    k_explicit: &Label,
+    k_track_artist: &Label,
+    theme_accent_state: &Rc<RefCell<String>>,
+    dynamic_provider: &gtk4::CssProvider,
+    track: &crate::api::models::Track,
+) {
+    let artists = track.artists_string();
+    wave_view.set_track_meta(track);
+
+    let accent = theme_accent_state.borrow().clone();
+    if accent == "dynamic" {
+        wave_view.update_track_colors(track);
+        let c = track.core_rgb();
+        update_dynamic_accent_css(dynamic_provider, c[0] as f64, c[1] as f64, c[2] as f64);
+    } else if let Some((core, deep, ridge)) = get_accent_palette(&accent) {
+        wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
+    }
+
+    wave_view.refresh();
+    pet.refresh(&track.title);
+
+    island.title_label.set_markup(&track.title_markup());
+    island.explicit_badge.set_visible(track.is_explicit());
+    island.artist_label.set_text(&artists);
+
+    if player.is_track_liked(&track.id) {
+        island.like_btn.add_css_class("liked");
+    } else {
+        island.like_btn.remove_css_class("liked");
+    }
+    island.dislike_btn.remove_css_class("disliked");
+
+    k_track_title.set_markup(&track.title_markup());
+    k_explicit.set_visible(track.is_explicit());
+    k_track_artist.set_text(&artists);
+
+    if let Some(dur_ms) = track.duration_ms {
+        let total_secs = dur_ms / 1000;
+        island.total_time_label.set_text(&format_seconds(total_secs));
+        island.seek_scale.set_range(0.0, total_secs as f64);
+    }
+}
+
 fn setup_event_listener(
     receiver: Receiver<PlayerUiEvent>,
     window: ApplicationWindow,
@@ -2055,9 +2128,98 @@ fn setup_event_listener(
     library_set_margins: Rc<dyn Fn(i32, i32)>,
     is_collapsed: Rc<RefCell<bool>>,
 ) {
+    let mut last_provider = player.providers.active_id();
     let yandex_login_state: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     // Трек, к которому относится фон: запоздалый клип чужого трека не должен перебить текущий
     let current_clip_track: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let is_loading = Rc::new(std::cell::Cell::new(false));
+    let buffering_pct: Rc<std::cell::Cell<Option<u8>>> = Rc::new(std::cell::Cell::new(None));
+    let loading_track: Rc<RefCell<Option<crate::api::models::Track>>> = Rc::new(RefCell::new(None));
+    let last_loading_track: Rc<RefCell<Option<crate::api::models::Track>>> =
+        Rc::new(RefCell::new(None));
+    let pending_track: Rc<RefCell<Option<crate::api::models::Track>>> = Rc::new(RefCell::new(None));
+    let pending_cover: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let committed_track: Rc<RefCell<Option<(crate::api::models::Track, Option<String>)>>> =
+        Rc::new(RefCell::new(None));
+    let pulse_timer_active = Rc::new(std::cell::Cell::new(false));
+    let error_flash_gen = Rc::new(std::cell::Cell::new(0_u64));
+
+    let sync_island_loading: Rc<dyn Fn()> = {
+        let island = island.clone();
+        let is_loading = is_loading.clone();
+        let buffering_pct = buffering_pct.clone();
+        let loading_track = loading_track.clone();
+        let pulse_timer_active = pulse_timer_active.clone();
+        let error_flash_gen = error_flash_gen.clone();
+        Rc::new(move || {
+            let loading = is_loading.get();
+            let pct = buffering_pct.get();
+            let is_dock = island.container.has_css_class("is-dock-layout")
+                || island.container.has_css_class("dock-player");
+            let flashing_err = island.floating_loading_bar.has_css_class("error")
+                || island.dock_loading_bar.has_css_class("error");
+
+            if loading {
+                error_flash_gen.set(error_flash_gen.get().wrapping_add(1));
+                island.floating_loading_bar.remove_css_class("error");
+                island.dock_loading_bar.remove_css_class("error");
+
+                let status_text = match (pct, loading_track.borrow().as_ref()) {
+                    (Some(p), Some(t)) => format!("Буфер {p}% — {}", t.title),
+                    (Some(p), None) => format!("Буфер {p}%…"),
+                    (None, Some(t)) => format!("Подключение… ({})", t.title),
+                    (None, None) => "Подключение…".to_string(),
+                };
+                island.loading_status_label.set_text(&status_text);
+                island.artist_stack.set_visible_child_name("loading");
+                island.loading_spinner.start();
+
+                if let Some(p) = pct {
+                    let frac = (p as f64 / 100.0).clamp(0.0, 1.0);
+                    island.dock_loading_bar.set_fraction(frac);
+                    island.floating_loading_bar.set_fraction(frac);
+                }
+
+                if is_dock {
+                    island.dock_loading_bar.set_visible(true);
+                    island.seek_stack.set_visible_child_name("seek");
+                } else {
+                    island.dock_loading_bar.set_visible(false);
+                    island.seek_stack.set_visible_child_name("loading");
+                }
+
+                if pct.is_none() && !pulse_timer_active.get() {
+                    pulse_timer_active.set(true);
+                    let is_loading_t = is_loading.clone();
+                    let buf_t = buffering_pct.clone();
+                    let active_t = pulse_timer_active.clone();
+                    let dock_bar = island.dock_loading_bar.clone();
+                    let float_bar = island.floating_loading_bar.clone();
+                    let container = island.container.clone();
+                    gtk4::glib::timeout_add_local(Duration::from_millis(60), move || {
+                        if !is_loading_t.get() || buf_t.get().is_some() {
+                            active_t.set(false);
+                            return gtk4::glib::ControlFlow::Break;
+                        }
+                        if container.has_css_class("is-dock-layout")
+                            || container.has_css_class("dock-player")
+                        {
+                            dock_bar.pulse();
+                        } else {
+                            float_bar.pulse();
+                        }
+                        gtk4::glib::ControlFlow::Continue
+                    });
+                }
+            } else if !flashing_err {
+                island.loading_spinner.stop();
+                island.artist_stack.set_visible_child_name("artist");
+                island.seek_stack.set_visible_child_name("seek");
+                island.dock_loading_bar.set_visible(false);
+            }
+        })
+    };
+
     update_auth_ui(
         &auth_btn,
         &auth_icon,
@@ -2071,7 +2233,11 @@ fn setup_event_listener(
         while let Ok(event) = receiver.recv().await {
             match event {
                 PlayerUiEvent::TrackStarted { track, .. } => {
-                    island.cover_image.clear();
+                    *pending_track.borrow_mut() = Some(track.clone());
+                    *pending_cover.borrow_mut() = None;
+                    super::collection::set_playing_track_id(Some(&track.id));
+
+                    island.set_cover_path(None);
                     awaiting_start.set(std::env::var_os("VOLNA_DEMO_POS_MS").is_none());
                     // повторный TrackStarted того же трека (замена на студийную версию)
                     // не должен гасить уже показанный клип
@@ -2082,36 +2248,18 @@ fn setup_event_listener(
                         wave_view.clip.stop();
                         player.clips.telemetry().set_local_active(false);
                     }
-                    let artists = track.artists_string();
-                    wave_view.set_track_meta(&track);
-
-                    let accent = theme_accent_state.borrow().clone();
-                    if accent == "dynamic" {
-                        wave_view.update_track_colors(&track);
-                        let c = track.core_rgb();
-                        update_dynamic_accent_css(&dynamic_provider, c[0] as f64, c[1] as f64, c[2] as f64);
-                    } else if let Some((core, deep, ridge)) = get_accent_palette(&accent) {
-                        wave_view.shader_state.borrow_mut().set_target_colors(core, deep, ridge);
-                    }
-
-                    wave_view.refresh();
-                    pet.refresh(&track.title);
-
-                    island.title_label.set_markup(&track.title_markup());
-                    island.explicit_badge.set_visible(track.is_explicit());
-                    island.artist_label.set_text(&artists);
-
-                    let is_liked = player.is_track_liked(&track.id);
-                    if is_liked {
-                        island.like_btn.add_css_class("liked");
-                    } else {
-                        island.like_btn.remove_css_class("liked");
-                    }
-                    island.dislike_btn.remove_css_class("disliked");
-
-                    k_track_title.set_markup(&track.title_markup());
-                    k_explicit.set_visible(track.is_explicit());
-                    k_track_artist.set_text(&artists);
+                    apply_track_visuals(
+                        &island,
+                        &wave_view,
+                        &pet,
+                        &player,
+                        &k_track_title,
+                        &k_explicit,
+                        &k_track_artist,
+                        &theme_accent_state,
+                        &dynamic_provider,
+                        &track,
+                    );
 
                     // Сбрасываем текст песни и обратный отсчет для нового трека
                     while let Some(child) = lyrics_container.first_child() {
@@ -2121,16 +2269,23 @@ fn setup_event_listener(
                     *lyrics_labels.borrow_mut() = Vec::new();
                     countdown_label.set_visible(false);
                     lyrics_scrolled.set_opacity(1.0);
-
-                    if let Some(dur_ms) = track.duration_ms {
-                        let total_secs = dur_ms / 1000;
-                        island.total_time_label.set_text(&format_seconds(total_secs));
-                        island.seek_scale.set_range(0.0, total_secs as f64);
-                    }
                 }
                 PlayerUiEvent::PlaybackToggled(is_playing) => {
                     *is_playing_state.borrow_mut() = is_playing;
                     if is_playing {
+                        if let Some(t) = pending_track.borrow_mut().take() {
+                            let cov = pending_cover.borrow_mut().take();
+                            *committed_track.borrow_mut() = Some((t, cov));
+                        }
+                        is_loading.set(false);
+                        buffering_pct.set(None);
+                        loading_track.borrow_mut().take();
+                        last_loading_track.borrow_mut().take();
+                        super::collection::set_loading_track_id(None);
+                        sync_island_loading();
+                        if let Some((ref ct, _)) = *committed_track.borrow() {
+                            super::collection::set_playing_track_id(Some(&ct.id));
+                        }
                         wave_view.clip.resume();
                     } else {
                         wave_view.clip.pause();
@@ -2221,7 +2376,12 @@ fn setup_event_listener(
                     island.quality_badge.set_text(&label);
                 }
                 PlayerUiEvent::CoverUpdated(path) => {
-                    island.cover_image.set_from_file(Some(&path));
+                    if pending_track.borrow().is_some() {
+                        *pending_cover.borrow_mut() = Some(path.clone());
+                    } else if let Some((_, ref mut cov)) = *committed_track.borrow_mut() {
+                        *cov = Some(path.clone());
+                    }
+                    island.set_cover_path(Some(&path));
                     let accent = theme_accent_state.borrow().clone();
                     if accent == "dynamic" {
                         wave_view.shader_state.borrow_mut().update_from_cover(&path);
@@ -2381,7 +2541,34 @@ fn setup_event_listener(
                     island.explicit_badge.set_visible(false);
                     island.title_label.set_text("Волна");
                     island.artist_label.set_text("Яндекс Музыка");
-                    island.cover_image.clear(); // пустая картинка = CSS-заглушка обложки
+                    island.set_cover_path(None); // пустая картинка = CSS-заглушка обложки
+                }
+                PlayerUiEvent::LoadingTrack(opt_track) => {
+                    if let Some(ref track) = opt_track {
+                        *last_loading_track.borrow_mut() = Some(track.clone());
+                        super::collection::set_loading_track_id(Some(&track.id));
+                    } else {
+                        super::collection::set_loading_track_id(None);
+                    }
+                    *loading_track.borrow_mut() = opt_track;
+                    sync_island_loading();
+                }
+                PlayerUiEvent::LoadingState(loading) => {
+                    is_loading.set(loading);
+                    if !loading {
+                        buffering_pct.set(None);
+                        if loading_track.borrow_mut().take().is_some() {
+                            super::collection::set_loading_track_id(None);
+                        }
+                    }
+                    sync_island_loading();
+                }
+                PlayerUiEvent::BufferingProgress(pct) => {
+                    buffering_pct.set(pct);
+                    if pct.is_some() && !is_loading.get() {
+                        is_loading.set(true);
+                    }
+                    sync_island_loading();
                 }
                 PlayerUiEvent::WaveLoading(text) => {
                     wave_view.set_wave_loading(text.as_deref());
@@ -2397,6 +2584,88 @@ fn setup_event_listener(
                     toast_overlay.add_toast(toast);
                 }
                 PlayerUiEvent::Error(err) => {
+                    let failed_track = loading_track
+                        .borrow_mut()
+                        .take()
+                        .or_else(|| last_loading_track.borrow_mut().take());
+                    let pending_was = pending_track.borrow_mut().take();
+                    pending_cover.borrow_mut().take();
+                    let is_track_load_error = failed_track.is_some() || pending_was.is_some();
+
+                    is_loading.set(false);
+                    buffering_pct.set(None);
+                    if let Some(ref ft) = failed_track {
+                        super::collection::flash_error_track_id(&ft.id);
+                    } else {
+                        super::collection::set_loading_track_id(None);
+                    }
+
+                    if is_track_load_error {
+                        let flash_id = error_flash_gen.get().wrapping_add(1);
+                        error_flash_gen.set(flash_id);
+                        island.loading_spinner.stop();
+                        island.loading_status_label.set_text("Ошибка загрузки");
+                        island.dock_loading_bar.add_css_class("error");
+                        island.dock_loading_bar.set_fraction(1.0);
+                        island.floating_loading_bar.add_css_class("error");
+                        island.floating_loading_bar.set_fraction(1.0);
+
+                        let is_dock = island.container.has_css_class("is-dock-layout")
+                            || island.container.has_css_class("dock-player");
+                        if is_dock {
+                            island.dock_loading_bar.set_visible(true);
+                        } else {
+                            island.seek_stack.set_visible_child_name("loading");
+                        }
+
+                        let dock_bar = island.dock_loading_bar.clone();
+                        let float_bar = island.floating_loading_bar.clone();
+                        let gen_ref = error_flash_gen.clone();
+                        let sync_fn = sync_island_loading.clone();
+                        gtk4::glib::timeout_add_local_once(
+                            Duration::from_millis(350),
+                            move || {
+                                if gen_ref.get() == flash_id {
+                                    dock_bar.remove_css_class("error");
+                                    float_bar.remove_css_class("error");
+                                    sync_fn();
+                                }
+                            },
+                        );
+
+                        if player.audio.is_playing() {
+                            if let Some((ref prev, ref prev_cover)) = *committed_track.borrow() {
+                                let failed_other = failed_track
+                                    .as_ref()
+                                    .is_some_and(|ft| ft.id != prev.id)
+                                    || pending_was
+                                        .as_ref()
+                                        .is_some_and(|pt| pt.id != prev.id);
+                                if failed_other {
+                                    apply_track_visuals(
+                                        &island,
+                                        &wave_view,
+                                        &pet,
+                                        &player,
+                                        &k_track_title,
+                                        &k_explicit,
+                                        &k_track_artist,
+                                        &theme_accent_state,
+                                        &dynamic_provider,
+                                        prev,
+                                    );
+                                    island.set_cover_path(prev_cover.as_deref());
+                                    *current_clip_track.borrow_mut() = Some(prev.id.clone());
+                                    super::collection::set_playing_track_id(Some(&prev.id));
+                                }
+                            }
+                        } else if committed_track.borrow().is_none() {
+                            super::collection::set_playing_track_id(None);
+                        }
+                    } else {
+                        sync_island_loading();
+                    }
+
                     // текст ошибки может содержать «<host>» и подобное: разметку отключаем, иначе тост не показывается
                     let toast = Toast::new(&format!("Ошибка: {}", err));
                     toast.set_use_markup(false);
@@ -2427,6 +2696,7 @@ fn setup_event_listener(
                 }
                 PlayerUiEvent::PlayerLayoutChanged(layout) => {
                     super::floating_island::apply_player_layout(&island, &layout);
+                    sync_island_loading();
                     // отступ футера пересчитает наблюдатель геометрии
                     main_content_box.set_margin_bottom(if layout == "dock" { 92 } else { 0 });
                 }
@@ -2457,19 +2727,26 @@ fn setup_event_listener(
                     }
                 }
                 PlayerUiEvent::ProviderChanged(id) => {
-                    match id {
+                    let prov_id = match id {
                         crate::api::provider::ProviderId::YouTubeMusic => {
                             source_icon.set_text("🔴");
                             source_label.set_text("YouTube Music");
+                            "ytmusic"
                         }
                         crate::api::provider::ProviderId::Vk => {
                             source_icon.set_text("🔵");
                             source_label.set_text("ВКонтакте");
+                            "vk"
                         }
                         crate::api::provider::ProviderId::Yandex => {
                             source_icon.set_text("🌊");
                             source_label.set_text("Яндекс");
+                            "yandex"
                         }
+                    };
+                    if id != last_provider {
+                        last_provider = id;
+                        eprintln!("[ui] provider -> {}", prov_id);
                     }
                     // У YouTube Music нет BPM/energy — «Настроение» доступно только в Яндексе
                     wave_view.set_mood_sensitive(

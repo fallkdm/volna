@@ -744,12 +744,8 @@ impl MusicProvider for VkProvider {
 
         let artist = track.artists_string();
         let duration = track.duration_ms.map(|duration| duration / 1000);
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .ok()?;
         crate::api::lrclib::get_cached_or_fetch_lrclib(
-            &http,
+            crate::shared_http_client(),
             &track.id,
             &artist,
             &track.title,

@@ -10,7 +10,7 @@ use crate::api::provider::{FeedbackEvent, MusicProvider, ProviderId};
 use crate::api::provider_manager::ProviderManager;
 use crate::api::vk::provider::VkProvider;
 use crate::api::ytmusic::YtMusicClient;
-use super::audio::AudioBackend;
+use super::audio::{AudioBackend, StartOutcome};
 use super::source::*;
 use super::wave_engine::WaveEngine;
 
@@ -85,6 +85,10 @@ pub enum PlayerUiEvent {
     StreamQuality(String),
     Seeked(u64),
     LoadingState(bool),
+    /// Какой именно трек сейчас загружается/буферизируется (`None` — загрузка завершена).
+    LoadingTrack(Option<Track>),
+    /// Процент буферизации активного или стартующего потока (`Some(0..=99)` или `None`).
+    BufferingProgress(Option<u8>),
     /// Подбор Волны под фильтр: `Some("…")` — показать прогресс, `None` — скрыть
     WaveLoading(Option<String>),
     AuthRequired,
@@ -172,9 +176,24 @@ pub struct PlayerState {
     pub wave_refill_in_flight: bool,
     /// Полные объекты любимых треков — источник сидов для алгоритмических фильтров
     pub liked_tracks_cache: Vec<Track>,
+    /// Предыдущий реально играющий трек и его индекс для отката при ошибке переключения
+    pub rollback_track: Option<(usize, Track)>,
+    /// Сколько попыток получения потока подряд завершились ошибкой (сбрасывается при успешном старте)
+    pub consecutive_resolve_failures: usize,
 }
 
 impl PlayerState {
+    /// Фиксирует текущий трек для отката при ошибке перехода, если аудио ещё играет.
+    /// Во время активного перехода уже сохранённый `rollback_track` не перезаписывается.
+    pub fn save_rollback_if_needed(&mut self, audio_playing: bool) {
+        if audio_playing
+            && (!self.is_transitioning || self.rollback_track.is_none())
+            && let Some(prev_track) = self.current_track.clone()
+        {
+            self.rollback_track = Some((self.current_index, prev_track));
+        }
+    }
+
     /// Обновляет `is_liked` и `is_disliked` для указанного трека по текущему кэшу `liked_track_ids`
     pub fn sync_track_like_status(&mut self, track_id: &str) -> bool {
         let is_liked = self.liked_track_ids.contains(track_id);
@@ -240,8 +259,18 @@ impl Default for PlayerState {
             refill_failures: 0,
             wave_refill_in_flight: false,
             liked_tracks_cache: Vec::new(),
+            rollback_track: None,
+            consecutive_resolve_failures: 0,
         }
     }
+}
+
+/// Контекст потока для однократного автоматического восстановления при ошибке старта GStreamer
+#[derive(Clone)]
+struct PlaybackRetryCtx {
+    track_id: String,
+    track_source: TrackSource,
+    allow_retry: bool,
 }
 
 /// Ссылка на поток следующего трека, полученная заранее
@@ -296,6 +325,170 @@ const WAVE_REFILL_ATTEMPTS: usize = 3;
 /// Пауза между попытками продления Волны, чтобы не долбить API в один момент.
 const WAVE_REFILL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// Порог зависания HTTP-потока для переключения на локальный кэш (мс)
+const WATCHDOG_CACHE_SWITCH_MS: u64 = 4_000;
+/// Порог зависания HTTP-потока для переподключения по сети (мс)
+const WATCHDOG_RETRY_STREAM_MS: u64 = 12_000;
+/// Минимальное приращение позиции, подтверждающее реальный прогресс воспроизведения (мс)
+const WATCHDOG_PROGRESS_STEP_MS: u64 = 50;
+/// Продвижение после переподключения, снимающее блокировку повторного retry в текущей эпохе (мс)
+const WATCHDOG_RETRY_UNLOCK_DELTA_MS: u64 = 1_000;
+
+/// Решение watchdog о восстановлении зависшего HTTP-потока
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WatchdogAction {
+    None,
+    SwitchToCache {
+        track_id: String,
+        resume_pos_ms: u64,
+        stalled_ms: u64,
+    },
+    RetryStream {
+        track_id: String,
+        track_source: TrackSource,
+        resume_pos_ms: u64,
+        stalled_ms: u64,
+    },
+}
+
+/// Конечный автомат отслеживания зависаний активного HTTP-потока (без async-зависимостей)
+#[derive(Debug)]
+pub(crate) struct PlaybackWatchdog {
+    started_at: Instant,
+    epoch: Option<u64>,
+    last_pos_ms: u64,
+    stalled_since_ms: Option<u64>,
+    cache_swapped_epoch: Option<u64>,
+    retried_epoch: Option<u64>,
+    retry_pos_anchor_ms: u64,
+}
+
+impl Default for PlaybackWatchdog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PlaybackWatchdog {
+    pub(crate) fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            epoch: None,
+            last_pos_ms: 0,
+            stalled_since_ms: None,
+            cache_swapped_epoch: None,
+            retried_epoch: None,
+            retry_pos_anchor_ms: 0,
+        }
+    }
+
+    /// Watchdog следит только за сетевыми HTTP/HTTPS-потоками
+    pub(crate) fn is_http_uri(uri: Option<&str>) -> bool {
+        uri.is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"))
+    }
+
+    /// Фиксирует явную перемотку, чтобы движение с более ранней позиции не считалось зависанием
+    pub(crate) fn note_seek(&mut self, pos_ms: u64) {
+        self.last_pos_ms = pos_ms;
+        self.stalled_since_ms = None;
+        self.retry_pos_anchor_ms = pos_ms;
+    }
+
+    /// Выполняет шаг конечного автомата по текущему монотонному времени
+    pub(crate) fn poll_now<F>(
+        &mut self,
+        eligible: bool,
+        epoch: u64,
+        track_id: &str,
+        track_source: TrackSource,
+        pos_ms: Option<u64>,
+        has_cached_file: F,
+    ) -> WatchdogAction
+    where
+        F: FnOnce() -> bool,
+    {
+        let now_ms = self.started_at.elapsed().as_millis() as u64;
+        self.poll(now_ms, eligible, epoch, track_id, track_source, pos_ms, has_cached_file)
+    }
+
+    /// Детерминированный шаг автомата для заданной временной отметки `now_ms`.
+    /// Замыкание `has_cached_file` вызывается только при достижении порога 4000 мс.
+    pub(crate) fn poll<F>(
+        &mut self,
+        now_ms: u64,
+        eligible: bool,
+        epoch: u64,
+        track_id: &str,
+        track_source: TrackSource,
+        pos_ms: Option<u64>,
+        has_cached_file: F,
+    ) -> WatchdogAction
+    where
+        F: FnOnce() -> bool,
+    {
+        if !eligible {
+            self.stalled_since_ms = None;
+            return WatchdogAction::None;
+        }
+
+        if self.epoch != Some(epoch) {
+            self.epoch = Some(epoch);
+            self.last_pos_ms = pos_ms.unwrap_or(0);
+            self.stalled_since_ms = None;
+            self.cache_swapped_epoch = None;
+            self.retried_epoch = None;
+            self.retry_pos_anchor_ms = 0;
+        }
+
+        if let Some(pos) = pos_ms
+            && pos > self.last_pos_ms.saturating_add(WATCHDOG_PROGRESS_STEP_MS)
+        {
+            self.last_pos_ms = pos;
+            self.stalled_since_ms = None;
+            if self.retried_epoch == Some(epoch)
+                && pos > self.retry_pos_anchor_ms.saturating_add(WATCHDOG_RETRY_UNLOCK_DELTA_MS)
+            {
+                self.retried_epoch = None;
+            }
+            return WatchdogAction::None;
+        }
+
+        let stalled_since = match self.stalled_since_ms {
+            Some(since) => since,
+            None => {
+                self.stalled_since_ms = Some(now_ms);
+                now_ms
+            }
+        };
+        let stalled_ms = now_ms.saturating_sub(stalled_since);
+
+        if stalled_ms >= WATCHDOG_CACHE_SWITCH_MS
+            && self.cache_swapped_epoch != Some(epoch)
+            && has_cached_file()
+        {
+            self.cache_swapped_epoch = Some(epoch);
+            return WatchdogAction::SwitchToCache {
+                track_id: track_id.to_string(),
+                resume_pos_ms: self.last_pos_ms,
+                stalled_ms,
+            };
+        }
+
+        if stalled_ms >= WATCHDOG_RETRY_STREAM_MS && self.retried_epoch != Some(epoch) {
+            self.retried_epoch = Some(epoch);
+            self.retry_pos_anchor_ms = self.last_pos_ms;
+            return WatchdogAction::RetryStream {
+                track_id: track_id.to_string(),
+                track_source,
+                resume_pos_ms: self.last_pos_ms,
+                stalled_ms,
+            };
+        }
+
+        WatchdogAction::None
+    }
+}
+
 /// Менеджер плеера
 #[derive(Clone)]
 pub struct PlayerManager {
@@ -321,6 +514,8 @@ pub struct PlayerManager {
     tail_swap_epoch: Arc<AtomicU64>,
     /// Настройки плавного перехода: (включен, длительность в секундах)
     crossfade: Arc<Mutex<(bool, u32)>>,
+    /// Watchdog зависания HTTP-потока
+    watchdog: Arc<Mutex<PlaybackWatchdog>>,
     pub artist_registry: Arc<std::sync::Mutex<std::collections::HashMap<(TrackSource, String), String>>>,
 }
 
@@ -491,6 +686,7 @@ impl PlayerManager {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade,
+            watchdog: Arc::new(Mutex::new(PlaybackWatchdog::new())),
             artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
@@ -500,15 +696,30 @@ impl PlayerManager {
             mgr_eos.on_track_finished();
         });
 
-        // Фоновый мониторинг прогресса трека для автоматической сводки (кроссфейда) в конце песни
-        let mgr_crossfade = manager.clone();
+        // Подключаем обработчик ошибок активного слота GStreamer
+        let mgr_err = manager.clone();
+        manager.audio.set_on_error(move |err| {
+            mgr_err.on_playback_error(err);
+        });
+
+        // Подключаем прогресс буферизации активного или стартующего слота GStreamer
+        let buf_senders = manager.event_senders.clone();
+        let last_buf_pct = Arc::new(std::sync::atomic::AtomicU8::new(255));
+        manager.audio.set_on_buffering(move |pct| {
+            emit_buffering_if_changed(&last_buf_pct, &buf_senders, pct);
+        });
+
+        // Фоновый мониторинг прогресса трека для автосводки (кроссфейда) и восстановления зависших HTTP-потоков
+        let mgr_monitor = manager.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 interval.tick().await;
-                if let Some(pos_ms) = mgr_crossfade.audio.position_ms() {
-                    mgr_crossfade.check_auto_crossfade(pos_ms);
+                let pos_ms = mgr_monitor.audio.position_ms();
+                if let Some(pos_ms) = pos_ms {
+                    mgr_monitor.check_auto_crossfade(pos_ms);
                 }
+                mgr_monitor.check_playback_stall(pos_ms);
             }
         });
 
@@ -752,6 +963,7 @@ impl PlayerManager {
                 state.restored = false;
             }
             self.audio.stop();
+            self.clear_loading_ui();
             self.emit(PlayerUiEvent::QueueUpdated(Vec::new()));
             self.emit(PlayerUiEvent::PlaybackToggled(false));
             let me = self.clone();
@@ -998,6 +1210,130 @@ impl PlayerManager {
         }
     }
 
+    /// Проверяет, не завис ли активный HTTP-поток; при превышении порогов
+    /// переключает на локальный кэш или переполучает URL потока с сохранением позиции.
+    pub fn check_playback_stall(&self, pos_ms: Option<u64>) {
+        let (is_transitioning, current_track) = match self.state.lock() {
+            Ok(state) => (state.is_transitioning, state.current_track.clone()),
+            Err(_) => return,
+        };
+
+        let active_uri = self.audio.active_uri();
+        let eligible = self.audio.is_playing()
+            && !is_transitioning
+            && !self.audio.is_fading()
+            && !self.cast_active()
+            && PlaybackWatchdog::is_http_uri(active_uri.as_deref())
+            && current_track.is_some();
+
+        let (track_id, track_source, track_title) = match current_track {
+            Some(track) => (track.id, track.source, track.title),
+            None => (String::new(), TrackSource::Yandex, String::new()),
+        };
+        let epoch = self.generation.load(Ordering::SeqCst);
+
+        let mut cached_path: Option<std::path::PathBuf> = None;
+        let action = {
+            let Ok(mut watchdog) = self.watchdog.lock() else {
+                return;
+            };
+            watchdog.poll_now(eligible, epoch, &track_id, track_source, pos_ms, || {
+                cached_path = crate::cache::offline_audio_path(&track_id)
+                    .or_else(|| crate::cache::cached_audio_path(&track_id));
+                cached_path.is_some()
+            })
+        };
+
+        match action {
+            WatchdogAction::None => {}
+            WatchdogAction::SwitchToCache {
+                track_id,
+                resume_pos_ms,
+                stalled_ms,
+            } => {
+                let Some(path) = cached_path.or_else(|| {
+                    crate::cache::offline_audio_path(&track_id)
+                        .or_else(|| crate::cache::cached_audio_path(&track_id))
+                }) else {
+                    return;
+                };
+                let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
+                eprintln!(
+                    "[watchdog] HTTP-поток «{}» завис на {} мс (pos={} мс) — переключаем на локальный кэш",
+                    track_title, stalled_ms, resume_pos_ms
+                );
+                self.audio.play_url_at_ms(&uri, resume_pos_ms);
+            }
+            WatchdogAction::RetryStream {
+                track_id,
+                track_source,
+                resume_pos_ms,
+                stalled_ms,
+            } => {
+                eprintln!(
+                    "[watchdog] HTTP-поток «{}» завис на {} мс (pos={} мс) — переподключаем поток",
+                    track_title, stalled_ms, resume_pos_ms
+                );
+                let providers = self.providers.clone();
+                let client = match self.client.lock() {
+                    Ok(c) => c.clone(),
+                    Err(_) => return,
+                };
+                let audio = self.audio.clone();
+                let generation = self.generation.clone();
+                tokio::spawn(async move {
+                    let is_still_stalled = || {
+                        if generation.load(Ordering::SeqCst) != epoch || !audio.is_playing() {
+                            return false;
+                        }
+                        // Если за время поиска кэша или сетевого запроса поток сам «ожил» и ушёл вперёд,
+                        // переподключение отменяем
+                        let jumped_ahead = audio
+                            .position_ms()
+                            .is_some_and(|p| p > resume_pos_ms.saturating_add(1500));
+                        !jumped_ahead
+                    };
+
+                    // На случай, если кэш успел докачаться к моменту повторного подключения
+                    if let Some(path) = crate::cache::offline_audio_path(&track_id)
+                        .or_else(|| crate::cache::cached_audio_path(&track_id))
+                    {
+                        if is_still_stalled() {
+                            let local_uri =
+                                gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
+                            eprintln!(
+                                "[watchdog] HTTP-поток «{}» переведён в локальный кэш (pos={} мс): {}",
+                                track_title, resume_pos_ms, local_uri
+                            );
+                            audio.play_url_at_ms(&local_uri, resume_pos_ms);
+                        }
+                        return;
+                    }
+
+                    match resolve_stream_for_source(&providers, &client, &track_id, track_source).await {
+                        Ok((fresh_url, _label)) => {
+                            if is_still_stalled() {
+                                if fresh_url.starts_with("file://") {
+                                    eprintln!(
+                                        "[watchdog] Поток «{}» переведён в локальный кэш (pos={} мс): {}",
+                                        track_title, resume_pos_ms, fresh_url
+                                    );
+                                }
+                                audio.play_url_at_ms(&fresh_url, resume_pos_ms);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[watchdog] Не удалось переподключить поток «{}»: {}",
+                                track_title, err
+                            );
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     /// Играет ли музыка: на станции, если она привязана, иначе в приложении
     pub fn is_playing(&self) -> bool {
         self.cast_playing().unwrap_or_else(|| self.audio.is_playing())
@@ -1185,6 +1521,61 @@ impl PlayerManager {
         self.next_track_inner(true);
     }
 
+    /// Снимает индикацию загрузки и буферизации трека в UI.
+    fn clear_loading_ui(&self) {
+        emit_clear_loading(&self.event_senders);
+    }
+
+    /// Откатывает `current_index`, `current_track` и `is_liked` на реально играющий в активном
+    /// слоте трек, если переход сорвался при живом аудио. Не испускает `TrackStarted`, чтобы UI
+    /// не сбрасывал активный клип, позицию и обложку.
+    fn rollback_track_if_playing(&self, audio_playing: bool) {
+        let rolled_back = if let Ok(mut state) = self.state.lock() {
+            state.is_transitioning = false;
+            if audio_playing {
+                if let Some((prev_idx, prev_track)) = state.rollback_track.take() {
+                    let restored_idx = if !state.queue.is_empty() {
+                        prev_idx.min(state.queue.len() - 1)
+                    } else {
+                        prev_idx
+                    };
+                    state.current_index = restored_idx;
+                    state.current_track = Some(prev_track.clone());
+                    let is_liked = state.sync_track_like_status(&prev_track.id);
+                    let is_wave = state.wave;
+                    Some((prev_track, restored_idx, is_liked, is_wave))
+                } else {
+                    None
+                }
+            } else {
+                state.rollback_track = None;
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((prev_track, prev_idx, is_liked, is_wave)) = rolled_back {
+            crate::api::history::save_last_track(&prev_track);
+            if !is_wave {
+                crate::cache::save_session_index(prev_idx);
+            }
+            self.emit(PlayerUiEvent::LikeStateChanged(is_liked));
+        }
+    }
+
+    /// Обрабатывает ошибку воспроизведения активного слота GStreamer:
+    /// снимает состояние загрузки/перехода, откатывает индекс при живом аудио и уведомляет UI.
+    pub fn on_playback_error(&self, err: String) {
+        eprintln!("[play] Ошибка GStreamer: {}", err);
+        let audio_playing = self.audio.is_playing();
+        self.rollback_track_if_playing(audio_playing);
+        self.clear_loading_ui();
+        if !audio_playing {
+            self.emit(PlayerUiEvent::PlaybackToggled(false));
+        }
+        self.emit(PlayerUiEvent::Error(format!("Ошибка воспроизведения: {}", err)));
+    }
+
     /// Переключает повтор по кругу: нет → один трек → вся очередь (кроме Волны) → нет
     pub fn cycle_repeat(&self) {
         let next = {
@@ -1309,11 +1700,13 @@ impl PlayerManager {
             }
         }
 
+        let audio_playing = self.audio.is_playing();
         let (next_track, idx, total, is_liked) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
                 return;
             }
+            state.save_rollback_if_needed(audio_playing);
             state.current_index = (state.current_index + 1) % state.queue.len();
             let idx = state.current_index;
             let track = state.queue[idx].clone();
@@ -1914,11 +2307,13 @@ impl PlayerManager {
         if self.resume_restored() {
             return;
         }
+        let audio_playing = self.audio.is_playing();
         let (prev_track, idx, total, is_liked) = {
             let mut state = self.state.lock().unwrap();
             if state.queue.is_empty() {
                 return;
             }
+            state.save_rollback_if_needed(audio_playing);
             if state.current_index == 0 {
                 state.current_index = state.queue.len().saturating_sub(1);
             } else {
@@ -1947,6 +2342,22 @@ impl PlayerManager {
 
     /// Воспроизводит трек и продолжает «Моей волной по этому треку»
     pub fn play_single_track(&self, track: Track) {
+        let was_playing = self.audio.is_playing();
+        let is_transitioning = self
+            .state
+            .lock()
+            .map(|mut s| {
+                s.rollback_track = None;
+                s.is_transitioning
+            })
+            .unwrap_or(false);
+        eprintln!(
+            "[play] play_single_track id={} title=\"{}\" source={:?} was_playing={} is_transitioning={}",
+            track.id, track.title, track.source, was_playing, is_transitioning
+        );
+        self.emit(PlayerUiEvent::LoadingTrack(Some(track.clone())));
+        self.emit(PlayerUiEvent::BufferingProgress(None));
+        self.emit(PlayerUiEvent::LoadingState(true));
         let station = format!("track:{}", track.id);
         let label = format!("По треку: {}", track.title);
         self.start_station(station, Some(track), label);
@@ -1975,13 +2386,22 @@ impl PlayerManager {
 
     /// Запускает станцию для указанного источника.
     pub fn start_station_for_source(&self, station_id: String, first: Option<Track>, label: String, source: TrackSource) {
+        eprintln!(
+            "[station] start_station_for_source station_id={} source={:?} first_id={} label=\"{}\"",
+            station_id,
+            source,
+            first.as_ref().map(|t| t.id.as_str()).unwrap_or("none"),
+            label
+        );
         let provider_id: ProviderId = source.into();
         let Some(provider) = self.providers.get(provider_id) else {
+            self.clear_loading_ui();
             self.emit(PlayerUiEvent::StatusMessage(format!("Сервис {:?} не подключён", source)));
             return;
         };
         if provider.provider_id() == ProviderId::Vk {
             if !provider.is_authenticated() {
+                self.clear_loading_ui();
                 self.emit(PlayerUiEvent::VkAuthRequired);
                 self.emit(PlayerUiEvent::StatusMessage(
                     "Войдите в VK ID для запуска Стрим-микса".to_string(),
@@ -1993,6 +2413,7 @@ impl PlayerManager {
             && (station_id == "user:onyourwave" || station_id.contains("onyourwave"))
             && !provider.is_authenticated()
         {
+            self.clear_loading_ui();
             self.emit(PlayerUiEvent::StatusMessage(
                 "Войдите в Google Аккаунт внизу сайдбара для доступа к персонализированной волне YouTube Music".to_string(),
             ));
@@ -2003,6 +2424,7 @@ impl PlayerManager {
             let mut state = self.state.lock().unwrap();
             state.crossfade_triggered = false;
             state.is_transitioning = true;
+            state.rollback_track = None;
             // Новая станция — новый цикл: прежние «очередь кончилась» и «волна мертва»
             // относятся к прошлой подборке.
             state.pending_advance = false;
@@ -2160,6 +2582,7 @@ impl PlayerManager {
             let mut state = self.state.lock().unwrap();
             state.crossfade_triggered = false;
             state.is_transitioning = true;
+            state.rollback_track = None;
             state.pending_advance = false;
             state.wave_dead = false;
             state.queue = tracks.clone();
@@ -2200,6 +2623,9 @@ impl PlayerManager {
     /// Перемотка к заданной миллисекунде (клик по строке текста)
     pub fn seek_ms(&self, ms: u64) {
         if !self.cast_seek(ms / 1000) {
+            if let Ok(mut watchdog) = self.watchdog.lock() {
+                watchdog.note_seek(ms);
+            }
             self.audio.seek_ms(ms);
         }
         self.emit(PlayerUiEvent::Seeked(ms / 1000));
@@ -2209,6 +2635,9 @@ impl PlayerManager {
     pub fn seek(&self, seconds: u64) {
         if self.cast_seek(seconds) {
             return;
+        }
+        if let Ok(mut watchdog) = self.watchdog.lock() {
+            watchdog.note_seek(seconds.saturating_mul(1000));
         }
         self.audio.seek_seconds(seconds);
         self.emit(PlayerUiEvent::Seeked(seconds));
@@ -2479,10 +2908,453 @@ impl PlayerManager {
             state.queue.clear();
             state.current_track = None;
             state.current_index = 0;
+            state.rollback_track = None;
         }
         self.emit(PlayerUiEvent::PlaybackToggled(false));
         self.emit(PlayerUiEvent::UserLoggedOut);
         self.emit(PlayerUiEvent::StatusMessage("Вы вышли из аккаунта Яндекс Музыки".into()));
+    }
+
+    /// Запускает воспроизведение подготовленного URI (прямо или с кроссфейдом) и гарантирует
+    /// согласованный перевод UI из состояния загрузки в `PlaybackToggled(true)` или `Error(...)`.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_stream_playback<F>(
+        &self,
+        epoch: u64,
+        url: &str,
+        quality_label: String,
+        crossfade: bool,
+        was_playing: bool,
+        fade_ms: u64,
+        fade_in_when_idle: bool,
+        retry_ctx: Option<PlaybackRetryCtx>,
+        on_started: F,
+    ) where
+        F: FnOnce(&PlayerManager) + Send + 'static,
+    {
+        self.dispatch_stream_playback_boxed(
+            epoch,
+            url,
+            quality_label,
+            crossfade,
+            was_playing,
+            fade_ms,
+            fade_in_when_idle,
+            retry_ctx,
+            Box::new(on_started),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_stream_playback_boxed(
+        &self,
+        epoch: u64,
+        url: &str,
+        quality_label: String,
+        crossfade: bool,
+        was_playing: bool,
+        fade_ms: u64,
+        fade_in_when_idle: bool,
+        retry_ctx: Option<PlaybackRetryCtx>,
+        on_started: Box<dyn FnOnce(&PlayerManager) + Send>,
+    ) {
+        self.emit(PlayerUiEvent::StreamQuality(quality_label.clone()));
+
+        let mgr = self.clone();
+        let failed_url = url.to_string();
+        let mut on_started = Some(on_started);
+        let on_outcome = move |outcome: StartOutcome| {
+            if mgr.generation.load(Ordering::SeqCst) != epoch {
+                return;
+            }
+            match outcome {
+                StartOutcome::Started => {
+                    if let Ok(mut state) = mgr.state.lock() {
+                        state.is_transitioning = false;
+                        state.rollback_track = None;
+                        state.consecutive_resolve_failures = 0;
+                    }
+                    mgr.clear_loading_ui();
+                    mgr.emit(PlayerUiEvent::PlaybackToggled(true));
+                    if let Some(cb) = on_started.take() {
+                        cb(&mgr);
+                    }
+                }
+                StartOutcome::Failed(err) => {
+                    let is_http_url =
+                        failed_url.starts_with("http://") || failed_url.starts_with("https://");
+                    if is_http_url
+                        && let Some(ctx) = retry_ctx
+                        && ctx.allow_retry
+                        && let Ok(handle) = tokio::runtime::Handle::try_current()
+                    {
+                        let retry_cb = on_started.take();
+                        let mgr_retry = mgr.clone();
+                        handle.spawn(async move {
+                            mgr_retry
+                                .recover_and_retry_playback(
+                                    epoch,
+                                    failed_url,
+                                    quality_label,
+                                    crossfade,
+                                    fade_ms,
+                                    fade_in_when_idle,
+                                    ctx,
+                                    err,
+                                    retry_cb,
+                                )
+                                .await;
+                        });
+                        return;
+                    }
+                    mgr.on_playback_error(err);
+                }
+                StartOutcome::Cancelled => {
+                    if let Ok(mut state) = mgr.state.lock() {
+                        state.is_transitioning = false;
+                    }
+                    mgr.clear_loading_ui();
+                }
+            }
+        };
+
+        if crossfade && was_playing {
+            self.audio
+                .crossfade_to_url_with_outcome(url, fade_ms, on_outcome);
+        } else {
+            self.audio.stop();
+            if fade_in_when_idle && crossfade {
+                self.audio
+                    .play_url_fade_in_with_outcome(url, fade_ms, on_outcome);
+            } else {
+                self.audio.play_url_with_outcome(url, on_outcome);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_and_retry_playback(
+        &self,
+        epoch: u64,
+        failed_url: String,
+        quality_label: String,
+        crossfade: bool,
+        fade_ms: u64,
+        fade_in_when_idle: bool,
+        ctx: PlaybackRetryCtx,
+        original_err: String,
+        on_started: Option<Box<dyn FnOnce(&PlayerManager) + Send>>,
+    ) {
+        let is_stale = || self.generation.load(Ordering::SeqCst) != epoch;
+        if is_stale() {
+            return;
+        }
+        eprintln!(
+            "[play] #{} ошибка запуска HTTP-потока ({}), пробуем восстановление для {}...",
+            epoch, original_err, ctx.track_id
+        );
+
+        if ctx.track_source == TrackSource::YouTubeMusic || failed_url.contains("googlevideo.com") {
+            crate::api::ytmusic::remember_blocked_ggc_node_for_url(&failed_url);
+        }
+
+        // 1. Проверяем локальный офлайн / дисковый кэш
+        if let Some(path) = crate::cache::offline_audio_path(&ctx.track_id)
+            .or_else(|| crate::cache::cached_audio_path(&ctx.track_id))
+        {
+            if is_stale() {
+                return;
+            }
+            let local_uri =
+                gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path)).to_string();
+            let cur_was_playing = self.audio.is_playing();
+            self.dispatch_stream_playback_boxed(
+                epoch,
+                &local_uri,
+                quality_label,
+                crossfade,
+                cur_was_playing,
+                fade_ms,
+                fade_in_when_idle,
+                Some(PlaybackRetryCtx {
+                    allow_retry: false,
+                    ..ctx
+                }),
+                on_started.unwrap_or_else(|| Box::new(|_| {})),
+            );
+            return;
+        }
+
+        // 2. Запрашиваем свежую ссылку потока
+        let client = match self.client.lock() {
+            Ok(c) => c.clone(),
+            Err(_) => {
+                if !is_stale() {
+                    self.on_playback_error(original_err);
+                }
+                return;
+            }
+        };
+
+        let resolved = resolve_stream_for_source(
+            &self.providers,
+            &client,
+            &ctx.track_id,
+            ctx.track_source,
+        )
+        .await;
+
+        if is_stale() {
+            return;
+        }
+
+        let (mut next_url, fresh_label) = match resolved {
+            Ok(res) => res,
+            Err(resolve_err) => {
+                eprintln!(
+                    "[play] #{} восстановление потока для {} не удалось: {}",
+                    epoch, ctx.track_id, resolve_err
+                );
+                if !is_stale() {
+                    self.on_playback_error(original_err);
+                }
+                return;
+            }
+        };
+
+        // 3. Для подходящих потоков (YT/googlevideo <= 16 МБ, VK HLS) пробуем скачать в кэш,
+        // чтобы повторный запуск шёл с локального file:// без повторного сетевого обрыва
+        let is_hls = (ctx.track_source == TrackSource::Vk
+            && crate::player::audio::is_hls_url(&next_url))
+            || next_url.contains(".m3u8");
+        if is_hls || should_predownload_segmented(ctx.track_source, &next_url) {
+            let is_yt_stream =
+                ctx.track_source == TrackSource::YouTubeMusic || next_url.contains("googlevideo.com");
+            let ext = audio_cache_ext_for_url(&next_url, is_hls, is_yt_stream);
+            if let Some(path) =
+                download_audio_to_cache_if_fresh(&next_url, &ctx.track_id, ext, &is_stale).await
+            {
+                if is_stale() {
+                    return;
+                }
+                next_url = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path))
+                    .to_string();
+            }
+        }
+
+        if is_stale() {
+            return;
+        }
+
+        let effective_label = if quality_label.contains("(YT)") {
+            quality_label
+        } else {
+            fresh_label
+        };
+        let cur_was_playing = self.audio.is_playing();
+        eprintln!(
+            "[play] #{} повторный запуск потока для {} (local={})",
+            epoch,
+            ctx.track_id,
+            next_url.starts_with("file://")
+        );
+        self.dispatch_stream_playback_boxed(
+            epoch,
+            &next_url,
+            effective_label,
+            crossfade,
+            cur_was_playing,
+            fade_ms,
+            fade_in_when_idle,
+            Some(PlaybackRetryCtx {
+                allow_retry: false,
+                ..ctx
+            }),
+            on_started.unwrap_or_else(|| Box::new(|_| {})),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_and_dispatch_stream(
+        &self,
+        epoch: u64,
+        client: &YandexMusicClient,
+        track_id: String,
+        track_source: TrackSource,
+        mut url: String,
+        quality_label: String,
+        crossfade: bool,
+        was_playing: bool,
+        fade_ms: u64,
+        fade_in_when_idle: bool,
+        station_id: String,
+        batch_id: Option<String>,
+        log_mode: &str,
+        resolve_ms: u128,
+        prefetch_hit: bool,
+    ) {
+        let is_stale = || self.generation.load(Ordering::SeqCst) != epoch;
+        if is_stale() {
+            eprintln!("[play] #{} устарел, поток не запускаем", epoch);
+            return;
+        }
+
+        if track_source == TrackSource::Vk && !url.starts_with("file://") {
+            if let Some(cached_path) = crate::cache::cached_audio_path(&track_id) {
+                let local_uri =
+                    gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&cached_path))
+                        .to_string();
+                eprintln!("[play] Используем закэшированный трек: {}", local_uri);
+                url = local_uri;
+            } else if crate::player::audio::is_hls_url(&url) || url.contains(".m3u8") {
+                // Холодный старт VK HLS трека: скачиваем и упаковываем в .mka перед стартом,
+                // чтобы исключить разрывы потока на 2-й секунде
+                eprintln!("[play] Холодный remux HLS трека в mka...");
+                self.audio.fade_out(300);
+                if let Some(cached_path) =
+                    download_audio_to_cache_if_fresh(&url, &track_id, "mka", &is_stale).await
+                {
+                    let local_uri =
+                        gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&cached_path))
+                            .to_string();
+                    eprintln!("[play] HLS трек сконвертирован и запущен локально: {}", local_uri);
+                    url = local_uri;
+                }
+            }
+        }
+
+        if should_predownload_segmented(track_source, &url) {
+            let is_yt_stream =
+                track_source == TrackSource::YouTubeMusic || url.contains("googlevideo.com");
+            let cache_ext = audio_cache_ext_for_url(&url, false, is_yt_stream);
+            let (resolved_url, cached_path) = download_audio_to_cache_with_retry(
+                &self.providers,
+                client,
+                &track_id,
+                track_source,
+                url,
+                cache_ext,
+                &is_stale,
+            )
+            .await;
+            url = resolved_url;
+            if is_stale() {
+                eprintln!(
+                    "[play] #{} устарел во время предзагрузки, поток не запускаем",
+                    epoch
+                );
+                return;
+            }
+            if let Some(path) = cached_path {
+                let local_uri =
+                    gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path)).to_string();
+                eprintln!(
+                    "[play] #{} трек {} предзагружен в кэш до старта GStreamer: {}",
+                    epoch, track_id, local_uri
+                );
+                url = local_uri;
+            }
+        }
+
+        if is_stale() {
+            eprintln!("[play] #{} устарел после подготовки потока, не запускаем", epoch);
+            return;
+        }
+
+        let is_yt_stream =
+            track_source == TrackSource::YouTubeMusic || url.contains("googlevideo.com");
+        let is_hls = (track_source == TrackSource::Vk && crate::player::audio::is_hls_url(&url))
+            || url.contains(".m3u8");
+        let cache_ext = audio_cache_ext_for_url(&url, is_hls, is_yt_stream);
+        let cache_tid = track_id.clone();
+        let cache_url = url.clone();
+        let fb_providers = self.providers.clone();
+        let fb_client = client.clone();
+        let fb_track_id = track_id.clone();
+        let fb_station_id = station_id;
+        let fb_batch_id = batch_id;
+        let cur_was_playing = was_playing && self.audio.is_playing();
+
+        let dispatch_mode = if crossfade {
+            if cur_was_playing {
+                "crossfade"
+            } else if fade_in_when_idle {
+                "fade_in"
+            } else {
+                "direct"
+            }
+        } else {
+            "direct"
+        };
+        eprintln!(
+            "[play] #{} track={} source={:?} mode={} resolve_ms={} prefetch={} local={} dispatch={}",
+            epoch,
+            track_id,
+            track_source,
+            log_mode,
+            resolve_ms,
+            prefetch_hit,
+            url.starts_with("file://"),
+            dispatch_mode
+        );
+
+        self.dispatch_stream_playback(
+            epoch,
+            &url,
+            quality_label,
+            crossfade,
+            cur_was_playing,
+            fade_ms,
+            fade_in_when_idle,
+            Some(PlaybackRetryCtx {
+                track_id,
+                track_source,
+                allow_retry: true,
+            }),
+            move |mgr| {
+                // Фоновое сохранение играющего трека в audio_cache (если ещё не запущен с file://)
+                let active_url = mgr.audio.active_uri().unwrap_or_else(|| cache_url.clone());
+                if !active_url.starts_with("file://") && !is_hls {
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            // Даем 4 секунды конвейеру GStreamer спокойно наполнить буфер звука без конкуренции за сеть
+                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                            download_audio_to_cache(&active_url, &cache_tid, cache_ext).await;
+                        });
+                    }
+                }
+
+                // Предзагрузка следующего трека
+                mgr.prefetch_next_track();
+
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        match track_source {
+                            TrackSource::YouTubeMusic | TrackSource::Vk => {
+                                if let Some(provider) = fb_providers.get(match track_source {
+                                    TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
+                                    TrackSource::Vk => ProviderId::Vk,
+                                    TrackSource::Yandex => unreachable!(),
+                                }) {
+                                    let _ = provider
+                                        .send_feedback(FeedbackEvent::TrackStarted {
+                                            track_id: fb_track_id,
+                                            station_id: fb_station_id,
+                                            batch_id: fb_batch_id,
+                                        })
+                                        .await;
+                                }
+                            }
+                            TrackSource::Yandex => {
+                                let _ = fb_client
+                                    .feedback_track_started(&fb_station_id, &fb_track_id, fb_batch_id)
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            },
+        );
     }
 
     /// Загружает прямую ссылку на трек, кэширует обложку и начинает воспроизведение через GStreamer
@@ -2517,8 +3389,16 @@ impl PlayerManager {
 
         // привязана Станция: трек играет на ней, звук приложения молчит
         if self.cast_play(track) {
+            if let Ok(mut state) = self.state.lock() {
+                state.is_transitioning = false;
+            }
+            self.clear_loading_ui();
             return;
         }
+
+        self.emit(PlayerUiEvent::LoadingTrack(Some(track.clone())));
+        self.emit(PlayerUiEvent::BufferingProgress(None));
+        self.emit(PlayerUiEvent::LoadingState(true));
 
         let (crossfade, crossfade_dur) = self.crossfade_settings();
         let fade_ms = (crossfade_dur as u64) * 1000;
@@ -2531,7 +3411,6 @@ impl PlayerManager {
 
         if let Some((path, is_offline)) = cached_opt {
             let uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&path));
-            emit_all(&senders, PlayerUiEvent::LoadingState(false));
             let ext_label = path.extension().and_then(|e| e.to_str()).map(|ext| {
                 match ext {
                     "flac" => "FLAC (диск)",
@@ -2542,21 +3421,28 @@ impl PlayerManager {
                 }
             }).unwrap_or("Диск (0 мс)");
             let label = if is_offline { "Офлайн" } else { ext_label };
-            emit_all(&senders, PlayerUiEvent::StreamQuality(label.to_string()));
-
-            if crossfade && was_playing {
-                audio_clone.crossfade_to_url(&uri, fade_ms);
-            } else {
-                audio_clone.stop();
-                audio_clone.play_url(&uri);
-            }
-
-            if let Ok(mut state) = self.state.lock() {
-                state.is_transitioning = false;
-            }
-
-            emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-            self.prefetch_next_track();
+            let dispatch_mode = if crossfade && was_playing { "crossfade" } else { "direct" };
+            eprintln!(
+                "[play] #{} track={} source={:?} mode=cache({}) dispatch={}",
+                epoch,
+                track_id,
+                track.source,
+                if is_offline { "offline" } else { "disk" },
+                dispatch_mode
+            );
+            self.dispatch_stream_playback(
+                epoch,
+                &uri,
+                label.to_string(),
+                crossfade,
+                was_playing,
+                fade_ms,
+                false,
+                None,
+                |mgr| {
+                    mgr.prefetch_next_track();
+                },
+            );
             return;
         }
 
@@ -2576,7 +3462,6 @@ impl PlayerManager {
         // Преролл следующего трека делает ветка успешного старта (и next_track).
 
         tokio::spawn(async move {
-            let is_yt = track_source == TrackSource::YouTubeMusic;
             let can_play = match track_source {
                 TrackSource::YouTubeMusic => true,
                 TrackSource::Vk => providers_clone
@@ -2586,7 +3471,6 @@ impl PlayerManager {
             };
 
             if can_play {
-                emit_all(&senders, PlayerUiEvent::LoadingState(true));
                 let started = std::time::Instant::now();
                 // ссылка могла быть получена заранее, пока играл прежний трек
                 let ready = prefetch.lock().unwrap().take().filter(|p| p.track_id == track_id && p.is_fresh());
@@ -2603,93 +3487,85 @@ impl PlayerManager {
                         .await
                     }
                 };
-                eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, started.elapsed().as_millis(), if result.is_ok() { "ok" } else { "ошибка" });
+                let resolve_ms = started.elapsed().as_millis();
+                eprintln!("[play] #{} ссылка {} за {} мс ({})", epoch, if hit { "из предзагрузки" } else { "получена" }, resolve_ms, if result.is_ok() { "ok" } else { "ошибка" });
                 if is_stale() {
                     eprintln!("[play] #{} устарел, поток не запускаем", epoch);
                     return;
                 }
                 match result {
-                    Ok((mut url, label)) => {
-                        if track_source == TrackSource::Vk && !url.starts_with("file://") {
-                            if let Some(cached_path) = crate::cache::cached_audio_path(&track_id) {
-                                let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&cached_path)).to_string();
-                                eprintln!("[play] Используем закэшированный трек: {}", local_uri);
-                                url = local_uri;
-                            } else if crate::player::audio::is_hls_url(&url) || url.contains(".m3u8") {
-                                // Холодный старт VK HLS трека: скачиваем и упаковываем в .mka перед стартом,
-                                // чтобы исключить разрывы потока на 2-й секунде
-                                eprintln!("[play] Холодный remux HLS трека в mka...");
-                                audio_clone.fade_out(300);
-                                if let Some(cached_path) = download_audio_to_cache(&url, &track_id, "mka").await {
-                                    let local_uri = gtk4::gio::prelude::FileExt::uri(&gtk4::gio::File::for_path(&cached_path)).to_string();
-                                    eprintln!("[play] HLS трек сконвертирован и запущен локально: {}", local_uri);
-                                    url = local_uri;
-                                }
-                            }
-                        }
-
+                    Ok((url, label)) => {
+                        mgr_clone
+                            .prepare_and_dispatch_stream(
+                                epoch,
+                                &client,
+                                track_id,
+                                track_source,
+                                url,
+                                label,
+                                crossfade,
+                                was_playing,
+                                fade_ms,
+                                false,
+                                station_id,
+                                batch_id,
+                                "http",
+                                resolve_ms,
+                                hit,
+                            )
+                            .await;
+                    }
+                    Err(e) => {
                         if is_stale() {
-                            eprintln!("[play] #{} устарел после подготовки потока, не запускаем", epoch);
+                            return;
+                        }
+                        let audio_playing = audio_clone.is_playing();
+                        let (is_wave, failures, queue_len) = {
+                            if let Ok(mut state) = state_arc.lock() {
+                                state.consecutive_resolve_failures += 1;
+                                (
+                                    state.wave,
+                                    state.consecutive_resolve_failures,
+                                    state.queue.len(),
+                                )
+                            } else {
+                                (false, 99, 0)
+                            }
+                        };
+
+                        let can_skip = if is_wave {
+                            failures <= 4
+                        } else if audio_playing {
+                            failures <= 4 && failures < queue_len
+                        } else {
+                            false
+                        };
+
+                        if can_skip {
+                            if is_wave {
+                                eprintln!(
+                                    "[wave] трек {} ({}) недоступен ({}), пропускаем...",
+                                    track_id, track_title, e
+                                );
+                            } else {
+                                eprintln!(
+                                    "[play] трек {} ({}) недоступен ({}), пропускаем...",
+                                    track_id, track_title, e
+                                );
+                            }
+                            emit_clear_loading(&senders);
+                            mgr_clone.next_track_inner(true);
                             return;
                         }
 
-                        emit_all(&senders, PlayerUiEvent::LoadingState(false));
-                        emit_all(&senders, PlayerUiEvent::StreamQuality(label));
-
-                        if crossfade && was_playing {
-                            audio_clone.crossfade_to_url(&url, fade_ms);
-                        } else {
-                            audio_clone.stop();
-                            audio_clone.play_url(&url);
-                        }
-
                         if let Ok(mut state) = state_arc.lock() {
-                            state.is_transitioning = false;
+                            state.consecutive_resolve_failures = 0;
                         }
-
-                        emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-
-                        // Фоновое сохранение играющего трека в audio_cache
-                        let cache_tid = track_id.clone();
-                        let cache_url = url.clone();
-                        let is_hls = (track_source == TrackSource::Vk && crate::player::audio::is_hls_url(&cache_url)) || cache_url.contains(".m3u8");
-                        let cache_ext = audio_cache_ext_for_url(&cache_url, is_hls, is_yt);
-                        if !cache_url.starts_with("file://") && !is_hls {
-                            tokio::spawn(async move {
-                                // Даем 4 секунды конвейеру GStreamer спокойно наполнить буфер звука без конкуренции за сеть
-                                tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                                download_audio_to_cache(&cache_url, &cache_tid, cache_ext).await;
-                            });
+                        mgr_clone.rollback_track_if_playing(audio_playing);
+                        emit_clear_loading(&senders);
+                        if !audio_playing {
+                            emit_all(&senders, PlayerUiEvent::PlaybackToggled(false));
                         }
-
-                        // Предзагрузка следующего трека
-                        mgr_clone.prefetch_next_track();
-                        match track_source {
-                            TrackSource::YouTubeMusic | TrackSource::Vk => {
-                                if let Some(provider) = providers_clone.get(match track_source {
-                                    TrackSource::YouTubeMusic => ProviderId::YouTubeMusic,
-                                    TrackSource::Vk => ProviderId::Vk,
-                                    TrackSource::Yandex => unreachable!(),
-                                }) {
-                                    let _ = provider
-                                        .send_feedback(FeedbackEvent::TrackStarted {
-                                            track_id: track_id.clone(),
-                                            station_id: station_id.clone(),
-                                            batch_id: batch_id.clone(),
-                                        })
-                                        .await;
-                                }
-                            }
-                            TrackSource::Yandex => {
-                                let _ = client.feedback_track_started(&station_id, &track_id, batch_id).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if let Ok(mut state) = state_arc.lock() {
-                            state.is_transitioning = false;
-                        }
-                        emit_all(&senders, PlayerUiEvent::LoadingState(false));
                         if track_source == TrackSource::Vk && e.contains("Требуется повторный вход") {
                             emit_all(&senders, PlayerUiEvent::VkAuthRequired);
                         }
@@ -2707,7 +3583,6 @@ impl PlayerManager {
                 if (yt_active || yt_has_cookie) && yt_opt.is_some() {
                     let yt = yt_opt.unwrap();
                     let query = format!("{} {}", track_title, track_artists);
-                    emit_all(&senders, PlayerUiEvent::LoadingState(true));
                     emit_all(&senders, PlayerUiEvent::StatusMessage(
                         format!("Поиск студийного трека в YouTube Music: {}", query),
                     ));
@@ -2721,6 +3596,10 @@ impl PlayerManager {
                             .and_then(|r| r.tracks.map(|s| s.results))
                             .unwrap_or_default(),
                     };
+
+                    if is_stale() {
+                        return;
+                    }
 
                     let chosen = pick_best_yt_track(&candidates, &track_title, orig_duration);
 
@@ -2747,6 +3626,7 @@ impl PlayerManager {
                         crate::api::history::save_last_track(&track_to_play);
 
                         // Обновляем UI с новыми метаданными и обложкой YouTube Music
+                        emit_all(&senders, PlayerUiEvent::LoadingTrack(Some(track_to_play.clone())));
                         emit_all(&senders, PlayerUiEvent::TrackStarted {
                             track: track_to_play.clone(),
                             index: current_idx,
@@ -2760,59 +3640,50 @@ impl PlayerManager {
                         // Загружаем обложку и текст выбранного трека
                         spawn_cover_and_lyrics(&senders, providers_clone.clone(), client.clone(), &track_to_play, epoch, &stale_gen, &mgr_clone.clips);
 
+                        let started = std::time::Instant::now();
                         match yt.get_stream_url(&track_to_play.id).await {
                             Ok(url) => {
-                                if is_stale() {
-                                    eprintln!("[play] #{} устарел, поток YT не запускаем", epoch);
-                                    return;
-                                }
-                                emit_all(&senders, PlayerUiEvent::LoadingState(false));
-                                emit_all(&senders, PlayerUiEvent::StreamQuality("Opus 160 (YT)".to_string()));
-
-                                if crossfade {
-                                    if was_playing {
-                                        audio_clone.crossfade_to_url(&url, fade_ms);
-                                    } else {
-                                        audio_clone.stop();
-                                        audio_clone.play_url_fade_in(&url, fade_ms);
-                                    }
-                                } else {
-                                    audio_clone.stop();
-                                    audio_clone.play_url(&url);
-                                }
-
-                                if let Ok(mut state) = state_arc.lock() {
-                                    state.is_transitioning = false;
-                                }
-
-                                emit_all(&senders, PlayerUiEvent::PlaybackToggled(true));
-
-                                let cache_tid = track_to_play.id.clone();
-                                let cache_url = url.clone();
-                                tokio::spawn(async move {
-                                    download_audio_to_cache(&cache_url, &cache_tid, "opus").await;
-                                });
-                                mgr_clone.prefetch_next_track();
-
-                                let _ = yt.send_feedback(FeedbackEvent::TrackStarted {
-                                    track_id: track_to_play.id.clone(),
-                                    station_id: station_id.clone(),
-                                    batch_id: batch_id.clone(),
-                                }).await;
-
+                                let resolve_ms = started.elapsed().as_millis();
+                                mgr_clone
+                                    .prepare_and_dispatch_stream(
+                                        epoch,
+                                        &client,
+                                        track_to_play.id,
+                                        track_to_play.source,
+                                        url,
+                                        "Opus 160 (YT)".to_string(),
+                                        crossfade,
+                                        was_playing,
+                                        fade_ms,
+                                        true,
+                                        station_id,
+                                        batch_id,
+                                        "http(yt-fallback)",
+                                        resolve_ms,
+                                        false,
+                                    )
+                                    .await;
                                 return;
                             }
                             Err(e) => {
+                                if is_stale() {
+                                    return;
+                                }
                                 eprintln!("[play] Ошибка получения потока YT: {}", e);
                             }
                         }
                     }
                 }
 
-                if let Ok(mut state) = state_arc.lock() {
-                    state.is_transitioning = false;
+                if is_stale() {
+                    return;
                 }
-                emit_all(&senders, PlayerUiEvent::LoadingState(false));
+                let audio_playing = audio_clone.is_playing();
+                mgr_clone.rollback_track_if_playing(audio_playing);
+                emit_clear_loading(&senders);
+                if !audio_playing {
+                    emit_all(&senders, PlayerUiEvent::PlaybackToggled(false));
+                }
                 emit_all(&senders, PlayerUiEvent::AuthRequired);
                 emit_all(&senders, PlayerUiEvent::StatusMessage(
                     "Требуется авторизация для воспроизведения".to_string(),
@@ -3460,9 +4331,81 @@ pub(crate) fn audio_cache_ext_for_url(stream_url: &str, is_hls: bool, is_yt: boo
     }
 }
 
+/// Предел размера (16 МБ) для обязательной сегментированной предзагрузки в кэш до старта GStreamer.
+const AUDIO_PREDOWNLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Нужно ли предварительно скачать поток сегментами по 2 МБ до старта GStreamer.
+fn should_predownload_segmented(source: TrackSource, url: &str) -> bool {
+    !url.starts_with("file://")
+        && (source == TrackSource::YouTubeMusic || url.contains("googlevideo.com"))
+        && parse_clen_from_url(url).is_none_or(|c| c <= AUDIO_PREDOWNLOAD_MAX_BYTES)
+}
+
+/// Предварительно скачивает аудиопоток в кэш с однократным переключением GGC-ноды при сбое.
+async fn download_audio_to_cache_with_retry(
+    providers: &ProviderManager,
+    client: &YandexMusicClient,
+    track_id: &str,
+    track_source: TrackSource,
+    initial_url: String,
+    ext: &str,
+    is_stale: &(impl Fn() -> bool + Sync),
+) -> (String, Option<std::path::PathBuf>) {
+    let mut url = initial_url;
+    for attempt in 0..2 {
+        if is_stale() || url.starts_with("file://") {
+            return (url, None);
+        }
+        if parse_clen_from_url(&url).is_some_and(|c| c > AUDIO_PREDOWNLOAD_MAX_BYTES) {
+            return (url, None);
+        }
+        if let Some(path) = download_audio_to_cache_if_fresh(&url, track_id, ext, is_stale).await {
+            return (url, Some(path));
+        }
+        if is_stale() {
+            return (url, None);
+        }
+        if url.contains("googlevideo.com") || track_source == TrackSource::YouTubeMusic {
+            crate::api::ytmusic::remember_blocked_ggc_node_for_url(&url);
+        }
+        if attempt == 0 {
+            eprintln!(
+                "[play] Сегментированная предзагрузка для {} не удалась, пробуем другую ноду GGC...",
+                track_id
+            );
+            match resolve_stream_for_source(providers, client, track_id, track_source).await {
+                Ok((fresh_url, _)) => {
+                    if is_stale() {
+                        return (fresh_url, None);
+                    }
+                    url = fresh_url;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[play] Повторный резолв потока для {} не удался: {}",
+                        track_id, err
+                    );
+                    return (url, None);
+                }
+            }
+        }
+    }
+    (url, None)
+}
+
 /// Скачивает аудиопоток в дисковый кэш (~/.cache/volna/audio/) и очищает старые треки по LRU
 async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option<std::path::PathBuf> {
-    if url.starts_with("file://") {
+    download_audio_to_cache_if_fresh(url, track_id, ext, &|| false).await
+}
+
+/// Вариант `download_audio_to_cache` с проверкой отмены `should_cancel` между сегментами/чанками.
+async fn download_audio_to_cache_if_fresh(
+    url: &str,
+    track_id: &str,
+    ext: &str,
+    should_cancel: &(impl Fn() -> bool + Sync),
+) -> Option<std::path::PathBuf> {
+    if url.starts_with("file://") || should_cancel() {
         return None;
     }
     let final_path = crate::cache::final_audio_cache_path(track_id, ext);
@@ -3477,7 +4420,13 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
         let mut locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
         while locks.contains(track_id) {
             drop(locks);
+            if should_cancel() {
+                return None;
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if should_cancel() {
+                return None;
+            }
             // Если пока мы ждали, другой поток уже скачал файл:
             let final_path = crate::cache::final_audio_cache_path(track_id, ext);
             if final_path.exists() {
@@ -3489,20 +4438,33 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
             }
             locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
         }
+        if should_cancel() {
+            return None;
+        }
         locks.insert(track_id.to_string());
         // Возвращаем RAII guard, который при выходе из функции удалит track_id из locks
         struct DownloadGuard(String);
         impl Drop for DownloadGuard {
             fn drop(&mut self) {
+                if let Ok(mut locks) = AUDIO_DOWNLOAD_LOCKS.try_lock() {
+                    locks.remove(&self.0);
+                    return;
+                }
                 let id = self.0.clone();
-                tokio::spawn(async move {
-                    let mut locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
-                    locks.remove(&id);
-                });
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let mut locks = AUDIO_DOWNLOAD_LOCKS.lock().await;
+                        locks.remove(&id);
+                    });
+                }
             }
         }
         DownloadGuard(track_id.to_string())
     };
+
+    if should_cancel() {
+        return None;
+    }
 
     let tmp = crate::cache::temp_audio_cache_path(track_id, ext);
 
@@ -3529,6 +4491,10 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
         cmd.kill_on_drop(true);
 
         let output = cmd.output().await.ok()?;
+        if should_cancel() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
         if output.status.success() && tmp.exists() {
             if let Ok(meta) = tmp.metadata() {
                 if meta.len() > 128 * 1024 {
@@ -3547,7 +4513,14 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
     }
 
     if url.contains("googlevideo.com") || ext == "opus" {
-        if download_audio_range_segmented(url, &tmp).await.is_some() {
+        if download_audio_range_segmented_cancellable(url, &tmp, should_cancel)
+            .await
+            .is_some()
+        {
+            if should_cancel() {
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
             std::fs::rename(&tmp, &final_path).ok()?;
             crate::cache::clean_audio_cache_lru(600 * 1024 * 1024);
             return Some(final_path);
@@ -3556,25 +4529,54 @@ async fn download_audio_to_cache(url: &str, track_id: &str, ext: &str) -> Option
         return None;
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .ok()?;
-    let resp = client
+    let resp = crate::shared_http_client()
         .get(url)
+        .timeout(std::time::Duration::from_secs(60))
         .header("User-Agent", crate::api::ytmusic::UA_SAFARI_26)
         .send()
         .await
         .ok()?;
-    if !resp.status().is_success() {
+    if !resp.status().is_success() || should_cancel() {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
-    if bytes.len() <= 128 * 1024 {
+
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    struct TempFileGuard<'a>(&'a std::path::Path);
+    impl Drop for TempFileGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+
+    let tmp_guard = TempFileGuard(&tmp);
+    let mut file = tokio::fs::File::create(&tmp).await.ok()?;
+    let mut stream = resp.bytes_stream();
+    let mut total_written: u64 = 0;
+
+    while let Some(chunk_res) = stream.next().await {
+        if should_cancel() {
+            return None;
+        }
+        let chunk = chunk_res.ok()?;
+        if chunk.is_empty() {
+            continue;
+        }
+        total_written = total_written.saturating_add(chunk.len() as u64);
+        if total_written > AUDIO_RANGE_MAX_BYTES {
+            return None;
+        }
+        file.write_all(&chunk).await.ok()?;
+    }
+    file.flush().await.ok()?;
+    drop(file);
+
+    if should_cancel() || total_written <= 128 * 1024 {
         return None;
     }
-    std::fs::write(&tmp, &bytes).ok()?;
     std::fs::rename(&tmp, &final_path).ok()?;
+    std::mem::forget(tmp_guard);
     crate::cache::clean_audio_cache_lru(600 * 1024 * 1024);
     Some(final_path)
 }
@@ -3613,12 +4615,22 @@ fn parse_clen_from_url(url: &str) -> Option<u64> {
 /// Быстрая сегментированная докачка аудиопотока по `Range: bytes={start}-{end}` чанками по 2 МБ.
 /// На `googlevideo.com` (`c=VISIONOS`) поток без `Range` троттлится до ~20 КБ/с, а короткие
 /// `Range`-сегменты отдаются на полной скорости CDN.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -> Option<u64> {
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .timeout(AUDIO_RANGE_SEGMENT_TIMEOUT)
-        .build()
-        .ok()?;
+    download_audio_range_segmented_cancellable(url, tmp_path, &|| false).await
+}
+
+/// Отменяемая между Range-сегментами версия `download_audio_range_segmented`.
+async fn download_audio_range_segmented_cancellable(
+    url: &str,
+    tmp_path: &std::path::Path,
+    should_cancel: &(impl Fn() -> bool + Sync),
+) -> Option<u64> {
+    if should_cancel() {
+        let _ = std::fs::remove_file(tmp_path);
+        return None;
+    }
+    let client = crate::no_keepalive_http_client();
 
     let mut total: Option<u64> = parse_clen_from_url(url);
     if total.is_some_and(|t| t > AUDIO_RANGE_MAX_BYTES) {
@@ -3632,6 +4644,10 @@ async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -
     );
 
     loop {
+        if should_cancel() {
+            let _ = std::fs::remove_file(tmp_path);
+            return None;
+        }
         let start = out.len() as u64;
         if let Some(t) = total
             && start >= t
@@ -3651,8 +4667,13 @@ async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -
         let mut segment_bytes = None;
         let mut got_full_ok = false;
         for _attempt in 0..2 {
+            if should_cancel() {
+                let _ = std::fs::remove_file(tmp_path);
+                return None;
+            }
             let req = client
                 .get(url)
+                .timeout(AUDIO_RANGE_SEGMENT_TIMEOUT)
                 .header("User-Agent", crate::api::ytmusic::UA_SAFARI_26)
                 .header("Referer", "https://www.youtube.com/")
                 .header("Origin", "https://www.youtube.com")
@@ -3661,6 +4682,10 @@ async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -
             let Ok(resp) = tokio::time::timeout(AUDIO_RANGE_SEGMENT_TIMEOUT, req.send()).await else {
                 continue;
             };
+            if should_cancel() {
+                let _ = std::fs::remove_file(tmp_path);
+                return None;
+            }
             let Ok(resp) = resp else {
                 continue;
             };
@@ -3682,6 +4707,10 @@ async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -
             else {
                 continue;
             };
+            if should_cancel() {
+                let _ = std::fs::remove_file(tmp_path);
+                return None;
+            }
             let Ok(bytes) = bytes else {
                 continue;
             };
@@ -3718,6 +4747,10 @@ async fn download_audio_range_segmented(url: &str, tmp_path: &std::path::Path) -
         }
     }
 
+    if should_cancel() {
+        let _ = std::fs::remove_file(tmp_path);
+        return None;
+    }
     if let Some(t) = total
         && (out.len() as u64) < t
     {
@@ -3853,13 +4886,7 @@ fn spawn_cover_and_lyrics(
                 None => String::new(),
             }
         } else if is_yt {
-            static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-            let http = HTTP.get_or_init(|| {
-                reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_default()
-            });
+            let http = crate::shared_http_client();
 
             // 1. Проверяем кэш: если в кэше есть синхронизированное караоке с таймкодами — отдаем мгновенно!
             let cache_path = crate::cache::lyrics_cache_path(&track_id);
@@ -3887,99 +4914,142 @@ fn spawn_cover_and_lyrics(
                 }
             }
 
-            // 2. Сначала LRCLIB (синхронизированное караоке с таймкодами)
-            let lrclib_fut = crate::api::lrclib::fetch_lrclib_lyrics(http, &artist, &title, duration);
-            let lrclib_res = tokio::time::timeout(std::time::Duration::from_secs(8), lrclib_fut).await.ok().flatten();
-
-            let mut final_text = None;
-            if lrclib_res
-                .as_deref()
-                .is_some_and(|t| crate::api::lrclib::looks_like_foreign_song(t.trim(), duration))
-            {
-                println!("[lyrics] LRCLIB отдал текст другого трека — пропускаем");
-            } else if let Some(lr_text) = lrclib_res {
-                let trimmed = lr_text.trim();
-                if crate::api::lrclib::usable_synced_at(trimmed, duration) {
-                    let _ = std::fs::write(&cache_path, trimmed);
-                    crate::cache::clear_negative_lyrics_marker(&track_id);
-                    final_text = Some(trimmed.to_string());
-                } else if !trimmed.is_empty() {
-                    final_text = Some(crate::api::lrclib::demote_stale_synced(trimmed, duration));
+            // 2. Параллельно запрашиваем LRCLIB (синхронизированное караоке) и официальный текст YTM
+            let lyrics_timeout = std::time::Duration::from_secs(8);
+            let (lrclib_res, yt_res) = tokio::join!(
+                async {
+                    tokio::time::timeout(
+                        lyrics_timeout,
+                        crate::api::lrclib::fetch_lrclib_lyrics(http, &artist, &title, duration),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                },
+                async {
+                    tokio::time::timeout(lyrics_timeout, ytm.get_yt_lyrics(&track_id))
+                        .await
+                        .ok()
+                        .flatten()
                 }
-            }
+            );
+            let yt_text = yt_res
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
 
-            // 3. Если в LRCLIB нет синхронизированных таймкодов (или сервис временно недоступен) —
+            // При наличии официального текста YTM отсекаем отравленный ответ LRCLIB и переискиваем с эталоном
+            let verified_lrclib = match yt_text.as_deref() {
+                Some(yt) => {
+                    crate::api::lrclib::verify_or_refetch_lrclib(
+                        http,
+                        lrclib_res,
+                        &artist,
+                        &title,
+                        duration,
+                        yt,
+                        Some(std::time::Duration::from_secs(6)),
+                    )
+                    .await
+                }
+                None => lrclib_res,
+            };
+
+            let has_synced_lrclib = accept_synced_yt_candidate(
+                verified_lrclib.as_deref(),
+                yt_text.as_deref(),
+                duration,
+            )
+            .is_some();
+
+            // 3. Если в LRCLIB нет подтверждённых синхронизированных таймкодов —
             // пробуем найти караоке в каталоге Яндекс Музыки!
-            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration)) {
+            let mut yandex_lyrics: Option<String> = None;
+            if !has_synced_lrclib {
                 let clean_title = crate::api::lrclib::clean_title_for_lyrics(&title);
                 let query = format!("{} {}", artist, clean_title);
-                if let Ok(search_res) = client.search(&query).await {
-                    if let Some(tracks) = search_res.tracks {
-                        // Первый результат поиска вполне может быть другой песней того же
-                        // исполнителя — её текст нельзя выдавать за текст текущего трека
-                        let found = tracks.results.into_iter().next().filter(|t| {
-                            crate::api::lrclib::same_song_title(&t.title, &title)
-                                && crate::api::lrclib::same_artist_name(&t.artists_string(), &artist)
-                        });
-                        match found {
-                            Some(y_track) => {
+                if let Ok(search_res) = client.search(&query).await
+                    && let Some(tracks) = search_res.tracks
+                {
+                    // Первый результат поиска вполне может быть другой песней того же
+                    // исполнителя — её текст нельзя выдавать за текст текущего трека
+                    let found = tracks.results.into_iter().next().filter(|t| {
+                        crate::api::lrclib::same_song_title(&t.title, &title)
+                            && crate::api::lrclib::same_artist_name(&t.artists_string(), &artist)
+                    });
+                    match found {
+                        Some(y_track) => {
                             println!(
                                 "[lyrics] Яндекс: «{}» / {}",
                                 y_track.title,
                                 y_track.artists_string()
                             );
-                            if let Ok(Some(y_lyrics)) = client.get_track_lyrics(&y_track.id, &artist, &title, duration).await {
+                            if let Ok(Some(y_lyrics)) = client
+                                .get_track_lyrics_with_reference(
+                                    &y_track.id,
+                                    &artist,
+                                    &title,
+                                    duration,
+                                    yt_text.as_deref(),
+                                )
+                                .await
+                            {
                                 let trimmed = y_lyrics.trim();
                                 if crate::api::lrclib::looks_like_foreign_song(trimmed, duration) {
                                     println!("[lyrics] Яндекс: разметка не от этого трека — пропускаем");
-                                } else
-                                if crate::api::lrclib::usable_synced_at(trimmed, duration) {
-                                    let _ = std::fs::write(&cache_path, trimmed);
-                                    crate::cache::clear_negative_lyrics_marker(&track_id);
-                                    final_text = Some(trimmed.to_string());
+                                } else if yt_text.as_deref().is_some_and(|yt| {
+                                    !crate::api::lrclib::lyrics_match_reference(trimmed, yt)
+                                }) {
+                                    println!("[lyrics] Яндекс: текст не совпал с официальным текстом YTM — пропускаем");
+                                } else {
+                                    yandex_lyrics = Some(trimmed.to_string());
                                 }
                             }
-                            }
-                            None => println!(
-                                "[lyrics] Яндекс: подходящего трека не нашлось — фолбэк пропущен"
-                            ),
                         }
+                        None => println!(
+                            "[lyrics] Яндекс: подходящего трека не нашлось — фолбэк пропущен"
+                        ),
                     }
                 }
             }
 
-            // 4. Если караоке с таймкодами не нашлось — фолбэк на официальный текст YouTube Music
-            if final_text.as_ref().map_or(true, |t| !crate::api::lrclib::usable_synced_at(t, duration)) {
-                if let Some(yt_text) = ytm.get_yt_lyrics(&track_id).await {
-                    let trimmed = yt_text.trim();
-                    println!("[lyrics] YouTube Music: официальный текст, {} симв.", trimmed.chars().count());
-                    if !trimmed.is_empty() {
-                        // Отвергнутую разметку статикой не затираем: длительность могла быть неверной,
-                        // и при следующей проверке таймлайн ещё пригодится
-                        if !had_stale_synced {
-                            let _ = std::fs::write(&cache_path, trimmed);
-                            crate::cache::clear_negative_lyrics_marker(&track_id);
-                        }
-                        final_text = Some(trimmed.to_string());
+            // 4. Выбираем итоговый текст: подтверждённое караоке → официальный текст YTM → статика LRCLIB → старый кэш
+            match resolve_yt_lyrics_outcome(
+                verified_lrclib.as_deref(),
+                yandex_lyrics.as_deref(),
+                yt_text.as_deref(),
+                cached_plain.as_deref(),
+                had_stale_synced,
+                duration,
+            ) {
+                Some(resolved) => {
+                    if resolved.is_yt_official {
+                        println!(
+                            "[lyrics] YouTube Music: официальный текст, {} симв.",
+                            resolved.text.chars().count()
+                        );
                     }
+                    if resolved.cache_text {
+                        let _ = std::fs::write(&cache_path, &resolved.text);
+                        crate::cache::clear_negative_lyrics_marker(&track_id);
+                    }
+                    resolved.text
                 }
+                None => String::new(),
             }
-
-            final_text.or(cached_plain).unwrap_or_default()
         } else {
             // Трек из Яндекс Музыки
             let lookup = async {
                 if client.has_token() {
                     client.get_track_lyrics(&track_id, &artist, &title, duration).await.ok().flatten()
                 } else {
-                    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-                    let http = HTTP.get_or_init(|| {
-                        reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(10))
-                            .build()
-                            .unwrap_or_default()
-                    });
-                    crate::api::lrclib::get_cached_or_fetch_lrclib(http, &track_id, &artist, &title, duration).await
+                    crate::api::lrclib::get_cached_or_fetch_lrclib(
+                        crate::shared_http_client(),
+                        &track_id,
+                        &artist,
+                        &title,
+                        duration,
+                    )
+                    .await
                 }
             };
             tokio::time::timeout(std::time::Duration::from_secs(12), lookup)
@@ -3993,6 +5063,82 @@ fn spawn_cover_and_lyrics(
             emit_all(&senders, PlayerUiEvent::LyricsUpdated(text));
         }
     });
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResolvedYtLyrics {
+    text: String,
+    cache_text: bool,
+    is_yt_official: bool,
+}
+
+fn accept_synced_yt_candidate(
+    candidate: Option<&str>,
+    yt_text: Option<&str>,
+    duration: Option<u64>,
+) -> Option<String> {
+    let trimmed = candidate?.trim();
+    if trimmed.is_empty() || crate::api::lrclib::looks_like_foreign_song(trimmed, duration) {
+        return None;
+    }
+    if let Some(yt) = yt_text
+        && !crate::api::lrclib::lyrics_match_reference(trimmed, yt)
+    {
+        return None;
+    }
+    if crate::api::lrclib::usable_synced_at(trimmed, duration) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn resolve_yt_lyrics_outcome(
+    lrclib_text: Option<&str>,
+    yandex_text: Option<&str>,
+    yt_text: Option<&str>,
+    cached_plain: Option<&str>,
+    had_stale_synced: bool,
+    duration: Option<u64>,
+) -> Option<ResolvedYtLyrics> {
+    if let Some(synced) = accept_synced_yt_candidate(lrclib_text, yt_text, duration) {
+        return Some(ResolvedYtLyrics {
+            text: synced,
+            cache_text: true,
+            is_yt_official: false,
+        });
+    }
+    if let Some(synced) = accept_synced_yt_candidate(yandex_text, yt_text, duration) {
+        return Some(ResolvedYtLyrics {
+            text: synced,
+            cache_text: true,
+            is_yt_official: false,
+        });
+    }
+    if let Some(yt) = yt_text.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(ResolvedYtLyrics {
+            text: yt.to_string(),
+            cache_text: !had_stale_synced,
+            is_yt_official: true,
+        });
+    }
+    if let Some(lr) = lrclib_text
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !crate::api::lrclib::looks_like_foreign_song(s, duration))
+    {
+        return Some(ResolvedYtLyrics {
+            text: crate::api::lrclib::demote_stale_synced(lr, duration),
+            cache_text: false,
+            is_yt_official: false,
+        });
+    }
+    cached_plain
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| ResolvedYtLyrics {
+            text: s.to_string(),
+            cache_text: false,
+            is_yt_official: false,
+        })
 }
 
 /// Следующий режим повтора по кругу; «вся очередь» пропускается для Волны
@@ -4488,6 +5634,29 @@ fn emit_all(senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>, event: PlayerUiEve
         Err(e) => e.into_inner(),
     };
     senders.retain(|s| s.send_blocking(event.clone()).is_ok());
+}
+
+/// Полностью снимает состояние загрузки, активный загружаемый трек и процент буфера в UI.
+fn emit_clear_loading(senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>) {
+    emit_all(senders, PlayerUiEvent::LoadingState(false));
+    emit_all(senders, PlayerUiEvent::LoadingTrack(None));
+    emit_all(senders, PlayerUiEvent::BufferingProgress(None));
+}
+
+/// Дедуплицирует и рассылает процент буферизации (`Some(0..=99)` или `None` при 100%).
+fn emit_buffering_if_changed(
+    last_pct: &std::sync::atomic::AtomicU8,
+    senders: &Arc<Mutex<Vec<Sender<PlayerUiEvent>>>>,
+    pct: u8,
+) {
+    let clamped = pct.min(100);
+    if clamped >= 100 {
+        if last_pct.swap(255, Ordering::SeqCst) != 255 {
+            emit_all(senders, PlayerUiEvent::BufferingProgress(None));
+        }
+    } else if last_pct.swap(clamped, Ordering::SeqCst) != clamped {
+        emit_all(senders, PlayerUiEvent::BufferingProgress(Some(clamped)));
+    }
 }
 
 /// Выбирает лучший трек YouTube Music, соответствующий оригинальному треку:
@@ -5139,6 +6308,7 @@ mod like_tests {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
+            watchdog: Arc::new(Mutex::new(PlaybackWatchdog::new())),
             artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
@@ -5188,6 +6358,7 @@ mod like_tests {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
+            watchdog: Arc::new(Mutex::new(PlaybackWatchdog::new())),
             artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
@@ -5232,6 +6403,7 @@ mod like_tests {
             generation: Arc::new(AtomicU64::new(0)),
             tail_swap_epoch: Arc::new(AtomicU64::new(0)),
             crossfade: Arc::new(Mutex::new((false, 3))),
+            watchdog: Arc::new(Mutex::new(PlaybackWatchdog::new())),
             artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
@@ -5575,5 +6747,713 @@ mod audio_range_download_tests {
         assert!(ranges[1].contains("bytes=2097152-"));
 
         let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+#[cfg(test)]
+mod playback_watchdog_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn test_watchdog_resets_timer_on_pause_ineligible() {
+        let mut wd = PlaybackWatchdog::new();
+
+        assert_eq!(
+            wd.poll(1_000, true, 1, "t1", TrackSource::Yandex, Some(5_000), || false),
+            WatchdogAction::None
+        );
+        // Зависаем на 3000 мс (меньше порога 4000 мс)
+        assert_eq!(
+            wd.poll(4_000, true, 1, "t1", TrackSource::Yandex, Some(5_000), || true),
+            WatchdogAction::None
+        );
+
+        // Переходим на паузу (!eligible) — таймер сбрасывается
+        assert_eq!(
+            wd.poll(4_100, false, 1, "t1", TrackSource::Yandex, Some(5_000), || true),
+            WatchdogAction::None
+        );
+
+        // Снятие с паузы: отсчёт 4000 мс должен начаться заново с 4200, а не с 1000
+        assert_eq!(
+            wd.poll(4_200, true, 1, "t1", TrackSource::Yandex, Some(5_000), || true),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(8_100, true, 1, "t1", TrackSource::Yandex, Some(5_000), || true),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(8_200, true, 1, "t1", TrackSource::Yandex, Some(5_000), || true),
+            WatchdogAction::SwitchToCache {
+                track_id: "t1".to_string(),
+                resume_pos_ms: 5_000,
+                stalled_ms: 4_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_watchdog_ignores_non_http_uris() {
+        assert!(!PlaybackWatchdog::is_http_uri(None));
+        assert!(!PlaybackWatchdog::is_http_uri(Some("file:///home/user/cache/1.mp3")));
+        assert!(PlaybackWatchdog::is_http_uri(Some("http://example.com/a.mp3")));
+        assert!(PlaybackWatchdog::is_http_uri(Some("https://example.com/a.opus")));
+
+        let mut wd = PlaybackWatchdog::new();
+        for t in [0, 4_000, 12_000, 30_000] {
+            assert_eq!(
+                wd.poll(t, false, 1, "local_1", TrackSource::Vk, Some(1_000), || true),
+                WatchdogAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn test_watchdog_switches_to_cache_once_at_4000ms_and_skips_early_fs_check() {
+        let mut wd = PlaybackWatchdog::new();
+        let fs_checks = AtomicUsize::new(0);
+        let check_cache = || {
+            fs_checks.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        assert_eq!(
+            wd.poll(0, true, 7, "t_cache", TrackSource::Vk, Some(10_000), check_cache),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(3_999, true, 7, "t_cache", TrackSource::Vk, Some(10_000), check_cache),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            fs_checks.load(Ordering::SeqCst),
+            0,
+            "до порога 4000 мс проверка диска выполняться не должна"
+        );
+
+        assert_eq!(
+            wd.poll(4_000, true, 7, "t_cache", TrackSource::Vk, Some(10_000), check_cache),
+            WatchdogAction::SwitchToCache {
+                track_id: "t_cache".to_string(),
+                resume_pos_ms: 10_000,
+                stalled_ms: 4_000,
+            }
+        );
+        assert_eq!(fs_checks.load(Ordering::SeqCst), 1);
+
+        // Повторный тик в той же эпохе не должен повторно триггерить SwitchToCache
+        assert_eq!(
+            wd.poll(4_500, true, 7, "t_cache", TrackSource::Vk, Some(10_000), check_cache),
+            WatchdogAction::None
+        );
+        assert_eq!(fs_checks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_watchdog_retries_stream_once_at_12000ms_and_unlocks_after_1000ms_progress() {
+        let mut wd = PlaybackWatchdog::new();
+
+        // Старт и прогресс до 15_000 мс
+        assert_eq!(
+            wd.poll(1_000, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(14_000), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(2_000, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_000), || false),
+            WatchdogAction::None
+        );
+
+        // Первый тик без прогресса фиксирует stalled_since_ms = 2_100
+        assert_eq!(
+            wd.poll(2_100, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_000), || false),
+            WatchdogAction::None
+        );
+        // В 14_099 (11_999 мс простоя) ещё рано
+        assert_eq!(
+            wd.poll(14_099, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_000), || false),
+            WatchdogAction::None
+        );
+        // Ровно 12_000 мс простоя (14_100 - 2_100) -> RetryStream
+        assert_eq!(
+            wd.poll(14_100, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_000), || false),
+            WatchdogAction::RetryStream {
+                track_id: "yt_1".to_string(),
+                track_source: TrackSource::YouTubeMusic,
+                resume_pos_ms: 15_000,
+                stalled_ms: 12_000,
+            }
+        );
+
+        // Повторный retry без прогресса в той же эпохе заблокирован
+        assert_eq!(
+            wd.poll(20_000, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_000), || false),
+            WatchdogAction::None
+        );
+
+        // Прогресс +500 мс (<= 1000 мс от anchor 15_000) сбрасывает таймер, но ещё не снимает блокировку retry
+        assert_eq!(
+            wd.poll(21_000, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_500), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(21_100, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_500), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(34_000, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(15_500), || false),
+            WatchdogAction::None
+        );
+
+        // Прогресс +1050 мс (> 1000 мс от anchor 15_000) снимает блокировку retry
+        assert_eq!(
+            wd.poll(35_000, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(16_050), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(35_100, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(16_050), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(47_100, true, 3, "yt_1", TrackSource::YouTubeMusic, Some(16_050), || false),
+            WatchdogAction::RetryStream {
+                track_id: "yt_1".to_string(),
+                track_source: TrackSource::YouTubeMusic,
+                resume_pos_ms: 16_050,
+                stalled_ms: 12_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_watchdog_resets_on_epoch_change_and_handles_none_position() {
+        let mut wd = PlaybackWatchdog::new();
+
+        // Эпоха 1: набираем позицию 18_500, затем position_ms становится None (буферизация)
+        assert_eq!(
+            wd.poll(1_000, true, 1, "t1", TrackSource::Yandex, Some(18_500), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(13_000, true, 1, "t1", TrackSource::Yandex, None, || false),
+            WatchdogAction::RetryStream {
+                track_id: "t1".to_string(),
+                track_source: TrackSource::Yandex,
+                resume_pos_ms: 18_500,
+                stalled_ms: 12_000,
+            }
+        );
+
+        // Смена эпохи (новый трек) полностью сбрасывает таймер, позицию и блокировки
+        assert_eq!(
+            wd.poll(20_000, true, 2, "t2", TrackSource::Yandex, Some(0), || true),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(24_000, true, 2, "t2", TrackSource::Yandex, Some(0), || true),
+            WatchdogAction::SwitchToCache {
+                track_id: "t2".to_string(),
+                resume_pos_ms: 0,
+                stalled_ms: 4_000,
+            }
+        );
+    }
+
+    #[test]
+    fn test_watchdog_note_seek_backwards_prevents_false_stall() {
+        let mut wd = PlaybackWatchdog::new();
+
+        assert_eq!(
+            wd.poll(1_000, true, 1, "t1", TrackSource::Yandex, Some(90_000), || false),
+            WatchdogAction::None
+        );
+
+        // Пользователь перематывает назад на 10_000 мс
+        wd.note_seek(10_000);
+        assert_eq!(
+            wd.poll(1_100, true, 1, "t1", TrackSource::Yandex, Some(10_000), || false),
+            WatchdogAction::None
+        );
+        // Дальнейший прогресс (10_100 > 10_050) корректно сбрасывает таймер зависания
+        assert_eq!(
+            wd.poll(2_000, true, 1, "t1", TrackSource::Yandex, Some(10_100), || false),
+            WatchdogAction::None
+        );
+        assert_eq!(
+            wd.poll(13_500, true, 1, "t1", TrackSource::Yandex, Some(10_200), || false),
+            WatchdogAction::None
+        );
+    }
+
+    #[test]
+    fn test_on_playback_error_resets_loading_and_emits_error() {
+        let client = YandexMusicClient::new(None);
+        let audio = Arc::new(AudioBackend::new().unwrap());
+        let client_mutex = Arc::new(Mutex::new(client.clone()));
+        let state_arc = Arc::new(Mutex::new(PlayerState::default()));
+        {
+            let mut st = state_arc.lock().unwrap();
+            st.is_transitioning = true;
+        }
+        let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = Arc::new(YtMusicClient::new()) as Arc<dyn MusicProvider>;
+        let provider_manager =
+            ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+
+        let manager = PlayerManager {
+            audio,
+            client: client_mutex,
+            providers: Arc::new(provider_manager),
+            yt_client: Arc::new(YtMusicClient::new()),
+            clips: crate::player::clip::ClipBackground::new(
+                Arc::new(YtMusicClient::new()),
+                Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            state: state_arc.clone(),
+            wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
+            event_senders: Arc::new(Mutex::new(Vec::new())),
+            cast: Arc::default(),
+            prefetch: Arc::default(),
+            prefetch_inflight: Arc::default(),
+            generation: Arc::new(AtomicU64::new(0)),
+            tail_swap_epoch: Arc::new(AtomicU64::new(0)),
+            crossfade: Arc::new(Mutex::new((false, 3))),
+            watchdog: Arc::new(Mutex::new(PlaybackWatchdog::new())),
+            artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        };
+
+        let rx = manager.subscribe();
+        manager.on_playback_error("HTTP 403 Forbidden".to_string());
+
+        assert!(
+            !state_arc.lock().unwrap().is_transitioning,
+            "is_transitioning должен сбрасываться при ошибке воспроизведения"
+        );
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::LoadingState(false))),
+            "ожидалось LoadingState(false), получено: {:?}",
+            events
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::LoadingTrack(None))),
+            "ожидалось LoadingTrack(None), получено: {:?}",
+            events
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::BufferingProgress(None))),
+            "ожидалось BufferingProgress(None), получено: {:?}",
+            events
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::PlaybackToggled(false))),
+            "ожидалось PlaybackToggled(false) при неактивном аудио, получено: {:?}",
+            events
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, PlayerUiEvent::PlaybackToggled(true))),
+            "не должно быть ложного PlaybackToggled(true)"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::Error(msg) if msg.contains("HTTP 403 Forbidden"))),
+            "ожидалось PlayerUiEvent::Error с текстом ошибки, получено: {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_buffering_progress_dedup_and_reset() {
+        let senders: Arc<Mutex<Vec<Sender<PlayerUiEvent>>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = async_channel::unbounded();
+        senders.lock().unwrap().push(tx);
+        let last = std::sync::atomic::AtomicU8::new(255);
+
+        emit_buffering_if_changed(&last, &senders, 15);
+        emit_buffering_if_changed(&last, &senders, 15); // дубль не шлется
+        emit_buffering_if_changed(&last, &senders, 72);
+        emit_buffering_if_changed(&last, &senders, 100);
+        emit_buffering_if_changed(&last, &senders, 100); // повторный 100% не шлется
+        emit_buffering_if_changed(&last, &senders, 72); // после 100% то же значение снова шлется
+
+        let mut received = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let PlayerUiEvent::BufferingProgress(p) = ev {
+                received.push(p);
+            }
+        }
+        assert_eq!(received, vec![Some(15), Some(72), None, Some(72)]);
+    }
+
+    #[test]
+    fn test_resolve_yt_lyrics_rejects_poisoned_and_prefers_verified_or_yt() {
+        let yt_crosses = "\
+This is a trick of the mind\n\
+You have been watching me slide\n\
+Into the place where you hide\n\
+Tell me the things you decide";
+        let bts_lrc = "\
+[00:20.37] 매번 같은 하루들 중에 (들 중에)\n\
+[00:24.52] 너를 만날 때 가장 난 행복해 (행복해)\n\
+[00:29.89] 매번 다른 일상들 속에 (들 속에)\n\
+[00:34.34] 너란 사람은 내게 가장 특별해 (특별해)";
+        let crosses_lrc = "\
+[00:12.10] This is a trick of the mind\n\
+[00:16.40] You have been watching me slide\n\
+[00:20.80] Into the place where you hide\n\
+[00:25.10] Tell me the things you decide";
+
+        // 1. Отравленный BTS LRC отбрасывается, `stale_plain` не перебивает официальный `yt_text`
+        let res = resolve_yt_lyrics_outcome(
+            Some(bts_lrc),
+            None,
+            Some(yt_crosses),
+            Some("old stale cache text"),
+            false,
+            Some(185),
+        );
+        assert_eq!(
+            res,
+            Some(ResolvedYtLyrics {
+                text: yt_crosses.to_string(),
+                cache_text: true,
+                is_yt_official: true,
+            })
+        );
+
+        // При `had_stale_synced = true` возвращается `yt_text`, но без перезаписи кэша
+        let res_stale = resolve_yt_lyrics_outcome(
+            Some(bts_lrc),
+            None,
+            Some(yt_crosses),
+            Some("old stale cache text"),
+            true,
+            Some(185),
+        );
+        assert_eq!(
+            res_stale,
+            Some(ResolvedYtLyrics {
+                text: yt_crosses.to_string(),
+                cache_text: false,
+                is_yt_official: true,
+            })
+        );
+
+        // 2. Если LRCLIB отброшен (или даже передан отравленным), а Яндекс дал валидный Crosses LRC — берётся он
+        let res_yandex = resolve_yt_lyrics_outcome(
+            Some(bts_lrc),
+            Some(crosses_lrc),
+            Some(yt_crosses),
+            None,
+            false,
+            Some(185),
+        );
+        assert_eq!(
+            res_yandex,
+            Some(ResolvedYtLyrics {
+                text: crosses_lrc.to_string(),
+                cache_text: true,
+                is_yt_official: false,
+            })
+        );
+
+        // 3. Отравлены оба источника — оба отбрасываются в пользу официального `yt_text`
+        let res_both_poisoned = resolve_yt_lyrics_outcome(
+            Some(bts_lrc),
+            Some(bts_lrc),
+            Some(yt_crosses),
+            None,
+            false,
+            Some(185),
+        );
+        assert_eq!(
+            res_both_poisoned,
+            Some(ResolvedYtLyrics {
+                text: yt_crosses.to_string(),
+                cache_text: true,
+                is_yt_official: true,
+            })
+        );
+
+        // 4. Подтверждённый Crosses LRC от LRCLIB имеет приоритет над статическим `yt_text`
+        let res_lrclib = resolve_yt_lyrics_outcome(
+            Some(crosses_lrc),
+            None,
+            Some(yt_crosses),
+            None,
+            true,
+            Some(185),
+        );
+        assert_eq!(
+            res_lrclib,
+            Some(ResolvedYtLyrics {
+                text: crosses_lrc.to_string(),
+                cache_text: true,
+                is_yt_official: false,
+            })
+        );
+    }
+
+    fn build_test_manager_with_state(state: PlayerState) -> PlayerManager {
+        let client = YandexMusicClient::new(None);
+        let audio = Arc::new(AudioBackend::new().unwrap());
+        let client_mutex = Arc::new(Mutex::new(client.clone()));
+        let state_arc = Arc::new(Mutex::new(state));
+        let yandex_provider = Arc::new(client) as Arc<dyn MusicProvider>;
+        let ytmusic_provider = Arc::new(YtMusicClient::new()) as Arc<dyn MusicProvider>;
+        let provider_manager =
+            ProviderManager::with_yandex_and_ytmusic(yandex_provider, ytmusic_provider);
+
+        PlayerManager {
+            audio,
+            client: client_mutex,
+            providers: Arc::new(provider_manager),
+            yt_client: Arc::new(YtMusicClient::new()),
+            clips: crate::player::clip::ClipBackground::new(
+                Arc::new(YtMusicClient::new()),
+                Arc::new(crate::player::clip_telemetry::ClipTelemetry::new()),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            state: state_arc,
+            wave_engine: Arc::new(Mutex::new(WaveEngine::new())),
+            event_senders: Arc::new(Mutex::new(Vec::new())),
+            cast: Arc::default(),
+            prefetch: Arc::default(),
+            prefetch_inflight: Arc::default(),
+            generation: Arc::new(AtomicU64::new(0)),
+            tail_swap_epoch: Arc::new(AtomicU64::new(0)),
+            crossfade: Arc::new(Mutex::new((false, 3))),
+            watchdog: Arc::new(Mutex::new(PlaybackWatchdog::new())),
+            artist_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn test_on_playback_error_rolls_back_index_when_audio_still_playing() {
+        let t0 = Track {
+            id: "t0".to_string(),
+            title: "Playing Track".to_string(),
+            source: TrackSource::YouTubeMusic,
+            ..Default::default()
+        };
+        let t1 = Track {
+            id: "t1".to_string(),
+            title: "Failed Next Track".to_string(),
+            source: TrackSource::YouTubeMusic,
+            ..Default::default()
+        };
+        let t2 = Track {
+            id: "t2".to_string(),
+            title: "Third Track".to_string(),
+            source: TrackSource::YouTubeMusic,
+            ..Default::default()
+        };
+
+        let mut state = PlayerState::default();
+        state.wave = true;
+        state.queue = vec![t0.clone(), t1.clone(), t2];
+        state.current_index = 1;
+        state.current_track = Some(t1);
+        state.liked_track_ids.insert("t0".to_string());
+        state.is_liked = false;
+        state.is_transitioning = true;
+        state.rollback_track = Some((0, t0));
+
+        let manager = build_test_manager_with_state(state);
+        // Имитируем живой активный слот (например, слот 0 продолжает играть во время failed crossfade)
+        manager.audio.play_url("file:///tmp/active_slot_volna_test.mp3");
+        assert!(manager.audio.is_playing());
+
+        let rx = manager.subscribe();
+        manager.on_playback_error("GstSoupHTTPSrc timeout".to_string());
+
+        {
+            let st = manager.state.lock().unwrap();
+            assert_eq!(st.current_index, 0, "индекс должен откатиться к реально играющему треку");
+            assert_eq!(
+                st.current_track.as_ref().map(|t| t.id.as_str()),
+                Some("t0"),
+                "current_track должен восстановиться на t0"
+            );
+            assert!(st.is_liked, "is_liked должен пересчитаться для t0");
+            assert!(st.rollback_track.is_none(), "rollback_track должен очиститься");
+            assert!(!st.is_transitioning, "is_transitioning должен сброситься");
+        }
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::LikeStateChanged(true))),
+            "ожидалось LikeStateChanged(true), получено: {:?}",
+            events
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, PlayerUiEvent::TrackStarted { .. })),
+            "TrackStarted не должен отправляться при откате, чтобы не сбрасывать активный клип/позицию"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, PlayerUiEvent::PlaybackToggled(false))),
+            "PlaybackToggled(false) не должен отправляться, пока аудио продолжает играть"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, PlayerUiEvent::Error(msg) if msg.contains("GstSoupHTTPSrc timeout"))),
+            "ожидалось PlayerUiEvent::Error, получено: {:?}",
+            events
+        );
+
+        std::mem::forget(manager);
+    }
+
+    #[test]
+    fn test_save_rollback_preserves_initial_playing_track_on_rapid_double_skip() {
+        let t0 = Track {
+            id: "t0".to_string(),
+            title: "Initial".to_string(),
+            ..Default::default()
+        };
+        let t1 = Track {
+            id: "t1".to_string(),
+            title: "Skipped".to_string(),
+            ..Default::default()
+        };
+
+        let mut state = PlayerState::default();
+        state.queue = vec![t0.clone(), t1.clone()];
+        state.current_index = 0;
+        state.current_track = Some(t0);
+
+        // При остановленном аудио откат не сохраняется
+        state.save_rollback_if_needed(false);
+        assert!(state.rollback_track.is_none());
+
+        // Первый переход при живом аудио сохраняет (0, t0)
+        state.save_rollback_if_needed(true);
+        state.current_index = 1;
+        state.current_track = Some(t1);
+        state.is_transitioning = true;
+
+        // Быстрый второй переход до старта t1 НЕ перезаписывает rollback_track на t1
+        state.save_rollback_if_needed(true);
+        let (idx, tr) = state.rollback_track.expect("rollback должен сохраниться");
+        assert_eq!(idx, 0);
+        assert_eq!(tr.id, "t0");
+    }
+
+    #[test]
+    fn test_should_predownload_segmented_predicate() {
+        assert!(should_predownload_segmented(
+            TrackSource::YouTubeMusic,
+            "https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251&clen=4000000"
+        ));
+        assert!(should_predownload_segmented(
+            TrackSource::YouTubeMusic,
+            "https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251"
+        ));
+        assert!(!should_predownload_segmented(
+            TrackSource::YouTubeMusic,
+            "https://rr2---sn-u15hn5-cc.googlevideo.com/videoplayback?itag=251&clen=20000000"
+        ));
+        assert!(!should_predownload_segmented(
+            TrackSource::YouTubeMusic,
+            "file:///tmp/cached.opus"
+        ));
+        assert!(!should_predownload_segmented(
+            TrackSource::Yandex,
+            "https://storage.yandex.net/track.mp3"
+        ));
+        assert!(should_predownload_segmented(
+            TrackSource::Yandex,
+            "https://rr1---sn-u15hn5-cc.googlevideo.com/videoplayback?clen=3000000"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_download_audio_range_segmented_cancels_between_segments() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local test server");
+        let addr = listener.local_addr().unwrap();
+
+        let total_size: usize = 2 * 1024 * 1024 + 512 * 1024;
+        let payload: Vec<u8> = vec![0x5Au8; total_size];
+        let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count_srv = request_count.clone();
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_flag_srv = cancel_flag.clone();
+
+        let server_task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let Ok(n) = socket.read(&mut buf).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                request_count_srv.fetch_add(1, Ordering::SeqCst);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                let range_line = req_str
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                    .unwrap_or("");
+                let (start, end) = range_line
+                    .split_once("bytes=")
+                    .and_then(|(_, r)| r.split_once('-'))
+                    .map(|(s, e)| {
+                        (
+                            s.trim().parse::<usize>().unwrap_or(0),
+                            e.trim().parse::<usize>().unwrap_or(total_size - 1),
+                        )
+                    })
+                    .unwrap_or((0, total_size - 1));
+                let actual_end = end.min(total_size - 1);
+                let slice = &payload[start..=actual_end];
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/webm\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                    slice.len(),
+                    start,
+                    actual_end,
+                    total_size
+                );
+                let _ = socket.write_all(header.as_bytes()).await;
+                let _ = socket.write_all(slice).await;
+                let _ = socket.shutdown().await;
+                // После первого сегмента имитируем переключение трека (stale epoch)
+                cancel_flag_srv.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let tmp_path = std::env::temp_dir().join(format!(
+            "volna_range_cancel_test_{}.opus.part",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&tmp_path, b"stale-partial");
+        let url = format!("http://{addr}/videoplayback?itag=251");
+        let res = download_audio_range_segmented_cancellable(&url, &tmp_path, &|| {
+            cancel_flag.load(Ordering::SeqCst)
+        })
+        .await;
+
+        assert!(res.is_none(), "отменённая загрузка должна вернуть None");
+        assert!(
+            !tmp_path.exists(),
+            "временный файл должен удаляться при отмене"
+        );
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "второй сегмент не должен запрашиваться после отмены"
+        );
+        server_task.abort();
     }
 }

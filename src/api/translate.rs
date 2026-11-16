@@ -59,7 +59,13 @@ async fn translate_chunk(client: &reqwest::Client, chunk: &str) -> Option<String
         "https://api.mymemory.translated.net/get?langpair=en%7Cru&q={}",
         urlencoding_encode(chunk)
     );
-    let resp = client.get(&url).send().await.ok()?;
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -76,14 +82,10 @@ async fn translate_chunk(client: &reqwest::Client, chunk: &str) -> Option<String
 
 /// Переводит английский текст на русский; `None`, если сервис недоступен или лимит исчерпан
 pub async fn to_russian(text: &str) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
+    let client = crate::shared_http_client();
     let mut parts = Vec::new();
     for chunk in split_chunks(text) {
-        parts.push(translate_chunk(&client, &chunk).await?);
+        parts.push(translate_chunk(client, &chunk).await?);
     }
     (!parts.is_empty()).then(|| parts.join(" "))
 }

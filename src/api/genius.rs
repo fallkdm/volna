@@ -33,7 +33,14 @@ pub(crate) fn clean_genius_html(html: &str) -> String {
 }
 
 async fn get_json(client: &reqwest::Client, token: &str, url: &str) -> Option<Value> {
-    let resp = client.get(url).bearer_auth(token).send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(std::time::Duration::from_secs(8))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -43,20 +50,16 @@ async fn get_json(client: &reqwest::Client, token: &str, url: &str) -> Option<Va
 /// Ищет справку об исполнителе в Genius; без токена ничего не делает
 pub async fn artist_summary(name: &str) -> Option<ArtistSummary> {
     let token = super::auth::load_genius_token()?;
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .ok()?;
+    let client = crate::shared_http_client();
 
     let search = format!("https://api.genius.com/search?q={}", urlencoding_encode(name));
-    let found = get_json(&client, &token, &search).await?;
+    let found = get_json(client, &token, &search).await?;
     let artist_id = found["response"]["hits"].as_array()?.iter().find_map(|h| {
         let a = &h["result"]["primary_artist"];
         same_artist(a["name"].as_str()?, name).then(|| a["id"].as_u64()).flatten()
     })?;
 
-    let page = get_json(&client, &token, &format!("https://api.genius.com/artists/{artist_id}?text_format=html")).await?;
+    let page = get_json(client, &token, &format!("https://api.genius.com/artists/{artist_id}?text_format=html")).await?;
     let artist = &page["response"]["artist"];
     let raw = page["response"]["artist"]["description"]["html"].as_str().unwrap_or_default();
     let description = clean_genius_html(raw);
